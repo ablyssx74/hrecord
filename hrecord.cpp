@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
     
    {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.0.1"; 
+	    const char* localVersion = "v1.0.2"; 
 	
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -127,6 +127,9 @@ int main(int argc, char* argv[]) {
 	        targetUrl, localVersion);	
 	    system(updateCmd);
 	}
+
+    // --- TWEAK 1: Allocate the AVPacket structure ONCE outside the loop ---
+    AVPacket* pkt = av_packet_alloc();
 
     // 7. Main Core Recording Loop
     while (g_running) {
@@ -148,14 +151,13 @@ int main(int argc, char* argv[]) {
             encodingFrame->pts = currentPresentationTime;
 
             if (avcodec_send_frame(codecCtx, encodingFrame) == 0) {
-                AVPacket* pkt = av_packet_alloc();
+                // --- TWEAK 2: Re-use the existing allocated packet wrapper ---
                 while (avcodec_receive_packet(codecCtx, pkt) == 0) {
                     av_packet_rescale_ts(pkt, codecCtx->time_base, stream->time_base);
                     pkt->stream_index = stream->index;
                     av_interleaved_write_frame(fmtCtx, pkt);
-                    av_packet_unref(pkt);
+                    av_packet_unref(pkt); // Wipes internal data buffer payloads, keeps structural layout allocated
                 }
-                av_packet_free(&pkt);
             }
             
             delete screenBitmap;
@@ -165,7 +167,8 @@ int main(int argc, char* argv[]) {
         // Calculate time delta, account for system lag, and sleep accurately
         bigtime_t loopIterationElapsed = system_time() - loopIterationStart;
         if (loopIterationElapsed < FRAME_DELAY) {
-            usleep(FRAME_DELAY - loopIterationElapsed);
+            // --- TWEAK 3: Replaced usleep with snooze() for native Haiku scheduling accuracy ---
+            snooze(FRAME_DELAY - loopIterationElapsed);
         } else {
             // If the CPU is severely choked up, yield this execution cycle 
             // so the Haiku App Server can draw mouse movements and inputs
@@ -175,7 +178,19 @@ int main(int argc, char* argv[]) {
 
     // 8. Stream Finalization & Clean Up
     std::cout << "\n[+] Clean shutdown initiated. Finalizing video file container..." << std::endl;
+    
+    // --- TWEAK 4: Flush any trailing video frames sitting inside the encoder pipeline cache ---
+    avcodec_send_frame(codecCtx, nullptr);
+    while (avcodec_receive_packet(codecCtx, pkt) == 0) {
+        av_packet_rescale_ts(pkt, codecCtx->time_base, stream->time_base);
+        av_interleaved_write_frame(fmtCtx, pkt);
+        av_packet_unref(pkt);
+    }
+
     av_write_trailer(fmtCtx);
+
+    // --- TWEAK 5: Cleanly free our reusable packet allocation wrapper ---
+    av_packet_free(&pkt);
 
     av_freep(&encodingFrame->data);
     av_frame_free(&encodingFrame);
