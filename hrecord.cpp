@@ -2,8 +2,10 @@
 #include <StorageKit.h>
 #include <SupportKit.h>   // Pulls in system_time()
 #include <iostream>
+#include <string>
 #include <signal.h>
 #include <unistd.h>
+#include <string.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -24,11 +26,64 @@ void signalHandler(int signum) {
 }
 
 int main(int argc, char* argv[]) {
+    // ========================================================================
+    // FIXED SIGNAL CONTROLLER: Uses absolute kernel execution paths
+    // ========================================================================
+    if (argc > 1 && argv != nullptr) {
+        if (strcmp(argv[1], "stop") == 0) {
+            int32 cookie = 0;
+            team_info info;
+            pid_t myPid = getpid();
+            bool found = false;
+
+            // Determine our own absolute binary path layout dynamically from the OS kernel
+            std::string myPath = "";
+            team_info myInfo;
+            if (get_team_info(myPid, &myInfo) == B_OK) {
+                myPath = myInfo.args;
+                // Trim trailing parameters if present to isolate the raw path token
+                size_t spacePos = myPath.find(' ');
+                if (spacePos != std::string::npos) {
+                    myPath = myPath.substr(0, spacePos);
+                }
+            }
+
+            while (get_next_team_info(&cookie, &info) == B_OK) {
+                if (info.team == myPid) continue;
+
+                std::string targetArgs = info.args;
+                size_t spacePos = targetArgs.find(' ');
+                std::string targetBinary = (spacePos != std::string::npos) ? targetArgs.substr(0, spacePos) : targetArgs;
+
+                // Absolute verification: Only signal if the binary images match exactly
+                // and the target process does NOT contain our transient shutdown command flag.
+                if (targetBinary == myPath || (targetBinary.find("hrecord") != std::string::npos && targetBinary != argv[1])) {
+                    if (targetArgs.find("stop") == std::string::npos) {
+                        kill(info.team, SIGINT); // Fire clean Ctrl+C directly into the recorder
+                        found = true;
+                    }
+                }
+            }
+            if (found) {
+                std::cout << "[+] Sent stop signal to recording instance." << std::endl;
+                return 0;
+            } else {
+                std::cerr << "[-] Error: No active hrecord recording session found." << std::endl;
+                return -1;
+            }
+        } else if (strcmp(argv[1], "start") != 0) {
+            std::cout << "Usage: hrecord [start|stop]" << std::endl;
+            return 0;
+        }
+    }
+    // ========================================================================
+
     // 1. Silence FFmpeg logging noise completely
     av_log_set_level(AV_LOG_QUIET);
 
     // 2. Register terminal Ctrl+C intercept hook
     signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
 
     // 3. Initialize Haiku Application Context
     BApplication haikuApp("application/x-vnd.hrecord");
@@ -45,7 +100,7 @@ int main(int argc, char* argv[]) {
     int height = screenFrame.IntegerHeight() + 1;
 
     // 5. Build FFmpeg Container and Muxing Pipeline (.mkv)
-    const char* output_filename = "hrecord_capture.mkv";
+    const char* output_filename = "/boot/home/hrecord_capture.mkv";
     AVFormatContext* fmtCtx = nullptr;
     if (avformat_alloc_output_context2(&fmtCtx, nullptr, nullptr, output_filename) < 0) {
         std::cerr << "[-] Error: Failed to allocate FFmpeg output context." << std::endl;
@@ -84,6 +139,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!(fmtCtx->oformat->flags & AVFMT_NOFILE)) {
+        // FIX: Pointed directly to your local variable fmtCtx
         if (avio_open(&fmtCtx->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
             std::cerr << "[-] Error: Failed to open output capture file." << std::endl;
             return -1;
@@ -108,15 +164,15 @@ int main(int argc, char* argv[]) {
     BBitmap* screenBitmap = nullptr; 
     struct SwsContext* swsCtx = nullptr;
 
-    std::cout << "[+] Headless Real-Time Recording Started!" << std::endl;
-    std::cout << "[+] Press Ctrl+C in this terminal window to stop recording..." << std::endl;
+    std::cout << "[+] Screen Recording Started!" << std::endl;
 
     // Track recording epoch base start time in microseconds
     bigtime_t recordingStartTime = system_time();
-    
-   {
+    AVPacket* pkt = av_packet_alloc();
+
+    {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.0.2"; 
+	    const char* localVersion = "v1.0.3"; 
 	
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -128,8 +184,6 @@ int main(int argc, char* argv[]) {
 	    system(updateCmd);
 	}
 
-    // --- TWEAK 1: Allocate the AVPacket structure ONCE outside the loop ---
-    AVPacket* pkt = av_packet_alloc();
 
     // 7. Main Core Recording Loop
     while (g_running) {
@@ -142,21 +196,20 @@ int main(int argc, char* argv[]) {
                                           width, height, codecCtx->pix_fmt,
                                           SWS_BICUBIC, nullptr, nullptr, nullptr);
             
-            uint8_t* srcData[4] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-            int srcLinesize[4] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+            uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
+            int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
             sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
 
-            // WALL-CLOCK FIX: PTS is determined by actual elapsed real-world microseconds
+            // PTS is determined by actual elapsed real-world microseconds
             bigtime_t currentPresentationTime = system_time() - recordingStartTime;
             encodingFrame->pts = currentPresentationTime;
 
             if (avcodec_send_frame(codecCtx, encodingFrame) == 0) {
-                // --- TWEAK 2: Re-use the existing allocated packet wrapper ---
                 while (avcodec_receive_packet(codecCtx, pkt) == 0) {
                     av_packet_rescale_ts(pkt, codecCtx->time_base, stream->time_base);
                     pkt->stream_index = stream->index;
                     av_interleaved_write_frame(fmtCtx, pkt);
-                    av_packet_unref(pkt); // Wipes internal data buffer payloads, keeps structural layout allocated
+                    av_packet_unref(pkt); 
                 }
             }
             
@@ -164,14 +217,10 @@ int main(int argc, char* argv[]) {
             screenBitmap = nullptr;
         }
 
-        // Calculate time delta, account for system lag, and sleep accurately
         bigtime_t loopIterationElapsed = system_time() - loopIterationStart;
         if (loopIterationElapsed < FRAME_DELAY) {
-            // --- TWEAK 3: Replaced usleep with snooze() for native Haiku scheduling accuracy ---
             snooze(FRAME_DELAY - loopIterationElapsed);
         } else {
-            // If the CPU is severely choked up, yield this execution cycle 
-            // so the Haiku App Server can draw mouse movements and inputs
             snooze(1000); 
         }
     }
@@ -179,7 +228,6 @@ int main(int argc, char* argv[]) {
     // 8. Stream Finalization & Clean Up
     std::cout << "\n[+] Clean shutdown initiated. Finalizing video file container..." << std::endl;
     
-    // --- TWEAK 4: Flush any trailing video frames sitting inside the encoder pipeline cache ---
     avcodec_send_frame(codecCtx, nullptr);
     while (avcodec_receive_packet(codecCtx, pkt) == 0) {
         av_packet_rescale_ts(pkt, codecCtx->time_base, stream->time_base);
@@ -188,8 +236,6 @@ int main(int argc, char* argv[]) {
     }
 
     av_write_trailer(fmtCtx);
-
-    // --- TWEAK 5: Cleanly free our reusable packet allocation wrapper ---
     av_packet_free(&pkt);
 
     av_freep(&encodingFrame->data);

@@ -3,14 +3,15 @@ resource app_signature "application/x-vnd.hrecord";
 resource app_version {
     major  = 1,   
     minor  = 0,   
-    middle = 2,   
+    middle = 3,   
     variety = B_APPV_DEVELOPMENT, 
     internal = 0,
-    short_info = "hrecord v1.0.2",
+    short_info = "hrecord v1.0.3",
     long_info = "hrecord - Haiku Screen Recorder Terminal App."
 };
 
-resource app_flags B_SINGLE_LAUNCH;
+
+resource app_flags B_SINGLE_LAUNCH | B_ARGV_ONLY;
 
 resource vector_icon {
 	$"6E6369660C0500040162020016033BA4183C4D91BF23523E7B044AED1246F2E8"
