@@ -19,7 +19,7 @@ endif
 
 # --- Architecture & Path Setup ---
 UNAME_M := $(shell uname -p)
-ifeq ($(UNAME_M), x86)
+ifeq ($(UNAME_M), BePC)
     CXX = g++-x86
     ARCH = x86_gcc2
     LIB_ARCH_DIR = /x86
