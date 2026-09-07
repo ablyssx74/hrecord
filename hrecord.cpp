@@ -82,6 +82,27 @@ AVSampleFormat HaikuAudioFormatToAV(uint32 format) {
     }
 }
 
+// Name substrings, all lower-case, that suggest a physical audio input is a
+// desktop-audio loopback ("Stereo Mix", "What U Hear", ...) rather than a
+// microphone/line-in. Shared between the actual lookup and --list-audio-inputs
+// so the two never drift apart.
+static const char* kLoopbackHints[] = {
+    "stereo mix", "loopback", "loop back", "what u hear",
+    "wave out", "monitor", "mix output", "mixed output", nullptr
+};
+
+bool NameLooksLikeLoopback(const char* rawName) {
+    std::string name(rawName);
+    for (char& c : name)
+        c = (char)tolower((unsigned char)c);
+
+    for (int h = 0; kLoopbackHints[h] != nullptr; h++) {
+        if (name.find(kLoopbackHints[h]) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 // Looks for a physical audio input whose name suggests it is a desktop-audio
 // loopback ("Stereo Mix", "What U Hear", ...) rather than a microphone/line-in.
 bool FindDesktopAudioLoopback(BMediaRoster* roster, dormant_node_info* outInfo) {
@@ -100,24 +121,50 @@ bool FindDesktopAudioLoopback(BMediaRoster* roster, dormant_node_info* outInfo) 
     if (count > kMaxInputs)
         count = kMaxInputs;
 
-    static const char* kLoopbackHints[] = {
-        "stereo mix", "loopback", "loop back", "what u hear",
-        "wave out", "monitor", "mix output", "mixed output", nullptr
-    };
-
     for (int32 i = 0; i < count; i++) {
-        std::string name(infos[i].name);
-        for (char& c : name)
-            c = (char)tolower((unsigned char)c);
-
-        for (int h = 0; kLoopbackHints[h] != nullptr; h++) {
-            if (name.find(kLoopbackHints[h]) != std::string::npos) {
-                *outInfo = infos[i];
-                return true;
-            }
+        if (NameLooksLikeLoopback(infos[i].name)) {
+            *outInfo = infos[i];
+            return true;
         }
     }
     return false;
+}
+
+// Diagnostic dump for `hrecord --list-audio-inputs`: shows every dormant
+// audio-producing node the media_server knows about (not just ones flagged
+// B_PHYSICAL_INPUT), so a loopback device that hrecord's heuristic doesn't
+// recognize -- or that Haiku's driver exposes under an unexpected kind/name
+// -- is still visible instead of just silently failing to record.
+void ListAudioInputs(BMediaRoster* roster) {
+    const int32 kMax = 128;
+    dormant_node_info infos[kMax];
+    int32 count = kMax;
+
+    media_format outputFormat;
+    outputFormat.type = B_MEDIA_RAW_AUDIO;
+    outputFormat.u.raw_audio = media_raw_audio_format::wildcard;
+
+    if (roster->GetDormantNodes(infos, &count, nullptr, &outputFormat, nullptr, 0) != B_OK) {
+        std::cerr << "[-] Error: Failed to query audio nodes from the media_server." << std::endl;
+        return;
+    }
+    if (count > kMax)
+        count = kMax;
+
+    if (count == 0) {
+        std::cout << "[!] No audio-producing nodes were reported by the media_server." << std::endl;
+        return;
+    }
+
+    std::cout << "[+] Audio-producing nodes visible to hrecord:" << std::endl;
+    for (int32 i = 0; i < count; i++) {
+        std::cout << "    - \"" << infos[i].name << "\""
+            << (NameLooksLikeLoopback(infos[i].name) ? "  [matches loopback heuristic]" : "")
+            << std::endl;
+    }
+    std::cout << "[+] hrecord treats a node as desktop-audio loopback only if its name "
+        "matches one of: stereo mix, loopback, loop back, what u hear, wave out, "
+        "monitor, mix output, mixed output." << std::endl;
 }
 
 // Adds a Vorbis audio stream to fmtCtx and wires up the resampler/FIFO used
@@ -285,6 +332,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     bool audioOnly = false;
     bool stopRequested = false;
+    bool listAudioInputs = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "stop") == 0) {
@@ -293,8 +341,10 @@ int main(int argc, char* argv[]) {
             // default behavior, nothing to flag
         } else if (strcmp(argv[i], "--audioonly") == 0 || strcmp(argv[i], "--audoonly") == 0) {
             audioOnly = true;
+        } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
+            listAudioInputs = true;
         } else {
-            std::cout << "Usage: hrecord [start|stop] [--audioonly]" << std::endl;
+            std::cout << "Usage: hrecord [start|stop] [--audioonly] [--list-audio-inputs]" << std::endl;
             return 0;
         }
     }
@@ -355,6 +405,16 @@ int main(int argc, char* argv[]) {
 
     // 3. Initialize Haiku Application Context
     BApplication haikuApp("application/x-vnd.hrecord");
+
+    if (listAudioInputs) {
+        BMediaRoster* roster = BMediaRoster::Roster();
+        if (!roster) {
+            std::cerr << "[-] Error: Could not reach the media_server." << std::endl;
+            return -1;
+        }
+        ListAudioInputs(roster);
+        return 0;
+    }
 
     // 4. Query Desktop Size (skipped entirely in --audioonly mode)
     BScreen screen(B_MAIN_SCREEN_ID);
