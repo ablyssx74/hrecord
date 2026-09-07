@@ -2,9 +2,14 @@
 #include <StorageKit.h>
 #include <SupportKit.h>   // Pulls in system_time()
 #include <MediaRoster.h>
-#include <MediaRecorder.h>
 #include <MediaAddOn.h>
 #include <MediaDefs.h>
+#include <MediaNode.h>
+#include <BufferConsumer.h>
+#include <BufferProducer.h>
+#include <MediaEventLooper.h>
+#include <TimeSource.h>
+#include <Buffer.h>
 #include <iostream>
 #include <string>
 #include <mutex>
@@ -34,8 +39,8 @@ bool g_running = true;
 
 // Guards every write to the shared AVFormatContext (avformat_write_header,
 // av_interleaved_write_frame, av_write_trailer) since the video frames are
-// muxed from main() while audio packets are muxed from the Media Kit's
-// recorder-node thread (see AudioRecordHook below).
+// muxed from main() while audio packets are muxed from the audio tee node's
+// own control thread (see AudioTeeNode::BufferReceived below).
 std::mutex g_muxMutex;
 
 void signalHandler(int signum) {
@@ -43,20 +48,7 @@ void signalHandler(int signum) {
 }
 
 // ============================================================================
-// Desktop audio (loopback) capture
-//
-// Haiku's System Mixer only ever advertises a single output (see
-// AudioMixer::GetNextOutput() in the Haiku sources), and in a normal desktop
-// that output is already wired to the sound card - so a second consumer
-// can't simply "tap" it the way a Cortex tee filter would. Instead, hrecord
-// looks for a genuine hardware/driver loopback *input* - the same mechanism
-// behind "Stereo Mix" / "What U Hear" on other platforms - which some audio
-// chips/drivers expose as an ordinary physical capture input alongside the
-// microphone. Recording through it just reads a capture device the driver
-// legitimately offers (nothing is intercepted off another process or user),
-// which is why this stays free of the legal issues a real audio tap would
-// raise. If no such input is present on the machine's hardware, hrecord says
-// so plainly instead of pretending to capture audio that isn't there.
+// Desktop audio capture: Vorbis encoding pipeline
 // ============================================================================
 
 struct AudioEncoder {
@@ -82,59 +74,10 @@ AVSampleFormat HaikuAudioFormatToAV(uint32 format) {
     }
 }
 
-// Name substrings, all lower-case, that suggest a physical audio input is a
-// desktop-audio loopback ("Stereo Mix", "What U Hear", ...) rather than a
-// microphone/line-in. Shared between the actual lookup and --list-audio-inputs
-// so the two never drift apart.
-static const char* kLoopbackHints[] = {
-    "stereo mix", "loopback", "loop back", "what u hear",
-    "wave out", "monitor", "mix output", "mixed output", nullptr
-};
-
-bool NameLooksLikeLoopback(const char* rawName) {
-    std::string name(rawName);
-    for (char& c : name)
-        c = (char)tolower((unsigned char)c);
-
-    for (int h = 0; kLoopbackHints[h] != nullptr; h++) {
-        if (name.find(kLoopbackHints[h]) != std::string::npos)
-            return true;
-    }
-    return false;
-}
-
-// Looks for a physical audio input whose name suggests it is a desktop-audio
-// loopback ("Stereo Mix", "What U Hear", ...) rather than a microphone/line-in.
-bool FindDesktopAudioLoopback(BMediaRoster* roster, dormant_node_info* outInfo) {
-    const int32 kMaxInputs = 64;
-    dormant_node_info infos[kMaxInputs];
-    int32 count = kMaxInputs;
-
-    media_format outputFormat;
-    outputFormat.type = B_MEDIA_RAW_AUDIO;
-    outputFormat.u.raw_audio = media_raw_audio_format::wildcard;
-
-    if (roster->GetDormantNodes(infos, &count, nullptr, &outputFormat, nullptr,
-            B_BUFFER_PRODUCER | B_PHYSICAL_INPUT) != B_OK) {
-        return false;
-    }
-    if (count > kMaxInputs)
-        count = kMaxInputs;
-
-    for (int32 i = 0; i < count; i++) {
-        if (NameLooksLikeLoopback(infos[i].name)) {
-            *outInfo = infos[i];
-            return true;
-        }
-    }
-    return false;
-}
-
 // Diagnostic dump for `hrecord --list-audio-inputs`: shows every dormant
-// audio-producing node the media_server knows about (not just ones flagged
-// B_PHYSICAL_INPUT), so a loopback device that hrecord's heuristic doesn't
-// recognize -- or that Haiku's driver exposes under an unexpected kind/name
-// -- is still visible instead of just silently failing to record.
+// audio-producing node the media_server knows about. Mostly useful for
+// sanity-checking that the System Mixer and a sound card are actually
+// present before hrecord tries to splice its audio tee between them.
 void ListAudioInputs(BMediaRoster* roster) {
     const int32 kMax = 128;
     dormant_node_info infos[kMax];
@@ -157,21 +100,15 @@ void ListAudioInputs(BMediaRoster* roster) {
     }
 
     std::cout << "[+] Audio-producing nodes visible to hrecord:" << std::endl;
-    for (int32 i = 0; i < count; i++) {
-        std::cout << "    - \"" << infos[i].name << "\""
-            << (NameLooksLikeLoopback(infos[i].name) ? "  [matches loopback heuristic]" : "")
-            << std::endl;
-    }
-    std::cout << "[+] hrecord treats a node as desktop-audio loopback only if its name "
-        "matches one of: stereo mix, loopback, loop back, what u hear, wave out, "
-        "monitor, mix output, mixed output." << std::endl;
+    for (int32 i = 0; i < count; i++)
+        std::cout << "    - \"" << infos[i].name << "\"" << std::endl;
 }
 
 // Adds a Vorbis audio stream to fmtCtx and wires up the resampler/FIFO used
-// to buffer the recorder's raw callbacks into fixed-size encoder frames.
-// Vorbis (Ogg's native audio codec) is royalty-free and unencumbered, which
-// is why it's used here regardless of whether the output container is
-// standalone Ogg (--audioonly) or the Matroska file shared with the video.
+// to buffer raw audio into fixed-size encoder frames. Vorbis (Ogg's native
+// audio codec) is royalty-free and unencumbered, which is why it's used here
+// regardless of whether the output container is standalone Ogg (--audioonly)
+// or the Matroska file shared with the video.
 bool SetupAudioEncoder(AVFormatContext* fmtCtx, const media_raw_audio_format& raw,
         AudioEncoder* enc) {
     const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_VORBIS);
@@ -287,18 +224,17 @@ void DrainAudioFifo(AudioEncoder* enc, bool flushShortFrame) {
     }
 }
 
-// BMediaRecorder::ProcessFunc hook - invoked on the recorder node's own
-// thread every time a fresh chunk of raw audio arrives from the loopback
-// input. Resamples into planar float, buffers it, and hands complete
-// encoder-sized frames off to the Vorbis encoder as they become available.
-void AudioRecordHook(void* cookie, bigtime_t timestamp, void* data, size_t size,
-        const media_format& format) {
-    AudioEncoder* enc = (AudioEncoder*)cookie;
+// Resamples a chunk of raw PCM into planar float, buffers it, and hands
+// complete encoder-sized frames off to the Vorbis encoder as they become
+// available. Called from AudioTeeNode::BufferReceived, on the tee's own
+// control thread.
+void EncodeAudioSamples(AudioEncoder* enc, const void* data, size_t size,
+        const media_raw_audio_format& format) {
     if (!enc->codecCtx || !g_running)
         return;
 
-    int sampleSize = format.u.raw_audio.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
-    int bytesPerFrame = sampleSize * (int)format.u.raw_audio.channel_count;
+    int sampleSize = format.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
+    int bytesPerFrame = sampleSize * (int)format.channel_count;
     if (bytesPerFrame <= 0)
         return;
     int nbSamples = (int)(size / bytesPerFrame);
@@ -321,8 +257,412 @@ void AudioRecordHook(void* cookie, bigtime_t timestamp, void* data, size_t size,
     DrainAudioFifo(enc, false);
 }
 
-void AudioNotifyHook(void* cookie, BMediaRecorder::notification code, ...) {
-    // Nothing to react to here today; present so SetHooks() has a target.
+// ============================================================================
+// Desktop audio capture: the tee node itself
+//
+// Haiku's System Mixer only ever advertises a single output (see
+// AudioMixer::GetNextOutput() in the Haiku sources), and on a normal desktop
+// that output is already wired directly to the sound card. To actually
+// capture "what you hear", hrecord disconnects that direct wire and splices
+// itself in between: Mixer -> AudioTeeNode -> sound card. The node forwards
+// every buffer it receives from the Mixer downstream completely unchanged
+// (so playback keeps working exactly as before) while also handing a copy
+// to hrecord's own Vorbis encoder. On a clean shutdown hrecord tears the tee
+// back out and reconnects the Mixer directly to the sound card, leaving the
+// system exactly as it found it.
+//
+// This only touches hrecord's own local audio pipeline -- the very same
+// signal already being sent to the speakers -- so there's nothing here that
+// intercepts audio you wouldn't otherwise be able to hear yourself.
+//
+// Caveat: the restore-on-exit step only runs on a normal shutdown (Ctrl+C /
+// `hrecord stop`). If hrecord is killed with SIGKILL or crashes while the
+// tee is spliced in, the Mixer is left connected to hrecord instead of the
+// sound card and system audio will go silent until something reconnects it
+// (Haiku's Media preferences "Restart Media Services" does this).
+// ============================================================================
+
+class AudioTeeNode : public BBufferConsumer, public BBufferProducer, public BMediaEventLooper {
+public:
+    AudioTeeNode()
+        : BMediaNode("hrecord Audio Tee"),
+          BBufferConsumer(B_MEDIA_RAW_AUDIO),
+          BBufferProducer(B_MEDIA_RAW_AUDIO),
+          BMediaEventLooper()
+    {
+        AddNodeKind(B_BUFFER_CONSUMER | B_BUFFER_PRODUCER);
+    }
+
+    virtual ~AudioTeeNode() {
+        BMediaEventLooper::Quit();
+    }
+
+    void SetFormat(const media_format& format) { fFormat = format; }
+    void SetEncoder(AudioEncoder* encoder) { fEncoder = encoder; }
+
+    // --- BMediaNode ---
+    virtual BMediaAddOn* AddOn(int32* internalID) const { return nullptr; }
+
+    virtual void NodeRegistered() {
+        Run();
+        set_thread_priority(ControlThread(), B_REAL_TIME_PRIORITY);
+    }
+
+    virtual status_t HandleMessage(int32 code, const void* data, size_t size) {
+        if (BBufferConsumer::HandleMessage(code, data, size) == B_OK) return B_OK;
+        if (BBufferProducer::HandleMessage(code, data, size) == B_OK) return B_OK;
+        if (BMediaEventLooper::HandleMessage(code, data, size) == B_OK) return B_OK;
+        return BMediaNode::HandleMessage(code, data, size);
+    }
+
+    virtual void HandleEvent(const media_timed_event* event, bigtime_t lateness,
+            bool realTimeEvent = false) {
+        // Buffers flow straight through BufferReceived()/SendBuffer() below;
+        // this node never schedules timed events of its own.
+    }
+
+    // --- BBufferConsumer: input side, connected from the System Mixer ---
+    virtual status_t AcceptFormat(const media_destination& dest, media_format* format) {
+        if (dest.port != ControlPort() || dest.id != 0)
+            return B_MEDIA_BAD_DESTINATION;
+        if (format->type != B_MEDIA_RAW_AUDIO && format->type != B_MEDIA_UNKNOWN_TYPE)
+            return B_MEDIA_BAD_FORMAT;
+        format->type = B_MEDIA_RAW_AUDIO;
+        return B_OK;
+    }
+
+    virtual status_t GetNextInput(int32* cookie, media_input* out_input) {
+        if (*cookie != 0)
+            return B_BAD_INDEX;
+        out_input->node = Node();
+        out_input->destination = media_destination(ControlPort(), 0);
+        out_input->source = media_source::null;
+        out_input->format = fFormat;
+        strcpy(out_input->name, "hrecord Tee In");
+        *cookie = 1;
+        return B_OK;
+    }
+
+    virtual void DisposeInputCookie(int32 cookie) {}
+
+    virtual void BufferReceived(BBuffer* buffer) {
+        if (!buffer)
+            return;
+
+        if (fEncoder != nullptr && g_running)
+            EncodeAudioSamples(fEncoder, buffer->Data(), buffer->SizeUsed(), fFormat.u.raw_audio);
+
+        if (fOutputEnabled && fOutputDestination != media_destination::null) {
+            if (SendBuffer(buffer, fOutputSource, fOutputDestination) != B_OK)
+                buffer->Recycle();
+        } else {
+            buffer->Recycle();
+        }
+    }
+
+    virtual void ProducerDataStatus(const media_destination& forWhom, int32 status,
+            bigtime_t atPerformanceTime) {}
+
+    virtual status_t GetLatencyFor(const media_destination& forWhom, bigtime_t* _latency,
+            media_node_id* _timesource) {
+        *_latency = 2000;
+        *_timesource = TimeSource() ? TimeSource()->ID() : 0;
+        return B_OK;
+    }
+
+    virtual status_t Connected(const media_source& producer, const media_destination& where,
+            const media_format& format, media_input* out_input) {
+        fInputSource = producer;
+        fFormat = format;
+        out_input->node = Node();
+        out_input->source = producer;
+        out_input->destination = where;
+        out_input->format = format;
+        strcpy(out_input->name, "hrecord Tee In");
+        return B_OK;
+    }
+
+    virtual void Disconnected(const media_source& producer, const media_destination& where) {
+        fInputSource = media_source::null;
+    }
+
+    virtual status_t FormatChanged(const media_source& producer, const media_destination& consumer,
+            int32 changeTag, const media_format& format) {
+        fFormat = format;
+        return B_OK;
+    }
+
+    // --- BBufferProducer: output side, connected to the sound card ---
+    virtual status_t FormatSuggestionRequested(media_type type, int32 quality, media_format* format) {
+        if (type != B_MEDIA_RAW_AUDIO && type != B_MEDIA_UNKNOWN_TYPE)
+            return B_MEDIA_BAD_FORMAT;
+        *format = fFormat;
+        return B_OK;
+    }
+
+    virtual status_t FormatProposal(const media_source& output, media_format* ioFormat) {
+        if (output.port != ControlPort() || output.id != 0)
+            return B_MEDIA_BAD_SOURCE;
+        if (ioFormat->type != B_MEDIA_RAW_AUDIO && ioFormat->type != B_MEDIA_UNKNOWN_TYPE)
+            return B_MEDIA_BAD_FORMAT;
+        *ioFormat = fFormat;
+        return B_OK;
+    }
+
+    virtual status_t FormatChangeRequested(const media_source& source,
+            const media_destination& destination, media_format* ioFormat, int32* _deprecated_) {
+        // The pass-through format is fixed for the life of the tee -- it was
+        // chosen up front to match what the Mixer and sound card already
+        // agreed on before hrecord spliced in.
+        *ioFormat = fFormat;
+        return B_ERROR;
+    }
+
+    virtual status_t GetNextOutput(int32* cookie, media_output* out_output) {
+        if (*cookie != 0)
+            return B_BAD_INDEX;
+        out_output->node = Node();
+        out_output->source = media_source(ControlPort(), 0);
+        out_output->destination = media_destination::null;
+        out_output->format = fFormat;
+        strcpy(out_output->name, "hrecord Tee Out");
+        *cookie = 1;
+        return B_OK;
+    }
+
+    virtual status_t DisposeOutputCookie(int32 cookie) { return B_OK; }
+
+    virtual status_t SetBufferGroup(const media_source& forSource, BBufferGroup* group) {
+        // We only ever forward the exact BBuffer instances the Mixer handed
+        // us (see BufferReceived) rather than allocating our own, so there's
+        // nothing for a downstream-supplied buffer group to do here.
+        return B_OK;
+    }
+
+    virtual status_t PrepareToConnect(const media_source& what, const media_destination& where,
+            media_format* format, media_source* _source, char* _name) {
+        if (what.port != ControlPort() || what.id != 0)
+            return B_MEDIA_BAD_SOURCE;
+        if (format->type != B_MEDIA_RAW_AUDIO && format->type != B_MEDIA_UNKNOWN_TYPE)
+            return B_MEDIA_BAD_FORMAT;
+        *format = fFormat;
+        *_source = what;
+        strcpy(_name, "hrecord Tee Out");
+        return B_OK;
+    }
+
+    virtual void Connect(status_t error, const media_source& source,
+            const media_destination& destination, const media_format& format, char* ioName) {
+        strcpy(ioName, "hrecord Tee Out");
+        if (error != B_OK)
+            return;
+        fOutputSource = source;
+        fOutputDestination = destination;
+        fFormat = format;
+    }
+
+    virtual void Disconnect(const media_source& what, const media_destination& where) {
+        fOutputDestination = media_destination::null;
+    }
+
+    virtual void LateNoticeReceived(const media_source& what, bigtime_t howMuch,
+            bigtime_t performanceTime) {}
+
+    virtual void EnableOutput(const media_source& what, bool enabled, int32* _deprecated_) {
+        fOutputEnabled = enabled;
+    }
+
+    virtual void AdditionalBufferRequested(const media_source& source,
+            media_buffer_id previousBuffer, bigtime_t previousTime,
+            const media_seek_tag* previousTag) {
+        // We never manufacture buffers of our own -- only forward what the
+        // Mixer already sent us -- so there's nothing to do here.
+    }
+
+    virtual void LatencyChanged(const media_source& source, const media_destination& destination,
+            bigtime_t newLatency, uint32 flags) {}
+
+private:
+    media_format fFormat;
+    media_source fInputSource = media_source::null;
+    media_source fOutputSource = media_source::null;
+    media_destination fOutputDestination = media_destination::null;
+    AudioEncoder* fEncoder = nullptr;
+    bool fOutputEnabled = true;
+};
+
+// Bundles everything SetupDesktopAudioTee() needs to remember so
+// TeardownDesktopAudioTee() can put the system back exactly as it found it.
+struct AudioTeeHandles {
+    AudioTeeNode* node = nullptr;
+    media_node mixerNode;
+    media_node audioOutputNode;
+    media_output originalOutput; // Mixer's output as connected before hrecord touched it
+    media_input originalInput;   // sound card's input as connected before hrecord touched it
+    bool active = false;
+};
+
+// Splices an AudioTeeNode in between the System Mixer and the sound card, so
+// the tee sees (and can hand a copy of) every buffer already flowing to the
+// speakers. On success, handles->active is true and *outFormat carries the
+// negotiated raw audio format. On failure, any pre-existing Mixer <-> sound
+// card connection is left completely untouched.
+bool SetupDesktopAudioTee(BMediaRoster* roster, AudioTeeHandles* handles,
+        media_raw_audio_format* outFormat) {
+    if (roster->GetAudioMixer(&handles->mixerNode) != B_OK) {
+        std::cerr << "[-] Error: Could not reach the System Mixer." << std::endl;
+        return false;
+    }
+    if (roster->GetAudioOutput(&handles->audioOutputNode) != B_OK) {
+        std::cerr << "[-] Error: Could not reach the system's audio output node." << std::endl;
+        return false;
+    }
+
+    int32 outCount = 0, inCount = 0;
+    bool haveExisting =
+        roster->GetConnectedOutputsFor(handles->mixerNode, &handles->originalOutput, 1, &outCount) == B_OK
+        && outCount >= 1
+        && roster->GetConnectedInputsFor(handles->audioOutputNode, &handles->originalInput, 1, &inCount) == B_OK
+        && inCount >= 1;
+
+    media_format sharedFormat;
+    if (haveExisting) {
+        sharedFormat = handles->originalOutput.format;
+    } else {
+        // Nothing is currently flowing between the Mixer and the sound card
+        // (e.g. audio idle) -- wire a fresh connection instead of splicing
+        // into an existing one.
+        media_output freeOutput;
+        media_input freeInput;
+        int32 c1 = 0, c2 = 0;
+        if (roster->GetFreeOutputsFor(handles->mixerNode, &freeOutput, 1, &c1, B_MEDIA_RAW_AUDIO) != B_OK
+                || c1 < 1
+                || roster->GetFreeInputsFor(handles->audioOutputNode, &freeInput, 1, &c2,
+                    B_MEDIA_RAW_AUDIO) != B_OK
+                || c2 < 1) {
+            std::cerr << "[-] Error: Could not find a free Mixer output / sound card input to "
+                "splice the audio tee into." << std::endl;
+            return false;
+        }
+        handles->originalOutput = freeOutput;
+        handles->originalInput = freeInput;
+        sharedFormat.type = B_MEDIA_RAW_AUDIO;
+        sharedFormat.u.raw_audio = media_raw_audio_format::wildcard;
+    }
+
+    AudioTeeNode* tee = new AudioTeeNode();
+    tee->SetFormat(sharedFormat);
+    if (roster->RegisterNode(tee) != B_OK) {
+        std::cerr << "[-] Error: Failed to register the audio tee node." << std::endl;
+        delete tee;
+        return false;
+    }
+
+    if (haveExisting && roster->Disconnect(handles->originalOutput, handles->originalInput) != B_OK) {
+        std::cerr << "[-] Error: Failed to detach the Mixer from the sound card." << std::endl;
+        roster->ReleaseNode(tee->Node());
+        return false;
+    }
+
+    media_destination teeInputDest(tee->ControlPort(), 0);
+    media_source teeOutputSrc(tee->ControlPort(), 0);
+
+    media_format fmt1 = sharedFormat;
+    media_output newMixerOutput;
+    media_input newTeeInput;
+    status_t err = roster->Connect(handles->originalOutput.source, teeInputDest, &fmt1,
+        &newMixerOutput, &newTeeInput);
+    if (err != B_OK) {
+        std::cerr << "[-] Error: Failed to connect the Mixer to the audio tee (error " << err
+            << ")." << std::endl;
+        if (haveExisting) {
+            media_format restoreFmt = sharedFormat;
+            media_output restoredOutput;
+            media_input restoredInput;
+            roster->Connect(handles->originalOutput.source, handles->originalInput.destination,
+                &restoreFmt, &restoredOutput, &restoredInput);
+        }
+        roster->ReleaseNode(tee->Node());
+        return false;
+    }
+
+    media_format fmt2 = newMixerOutput.format;
+    media_output newTeeOutput;
+    media_input newHwInput;
+    err = roster->Connect(teeOutputSrc, handles->originalInput.destination, &fmt2,
+        &newTeeOutput, &newHwInput);
+    if (err != B_OK) {
+        std::cerr << "[-] Error: Failed to connect the audio tee to the sound card (error " << err
+            << ")." << std::endl;
+        roster->Disconnect(newMixerOutput, newTeeInput);
+        if (haveExisting) {
+            media_format restoreFmt = sharedFormat;
+            media_output restoredOutput;
+            media_input restoredInput;
+            roster->Connect(handles->originalOutput.source, handles->originalInput.destination,
+                &restoreFmt, &restoredOutput, &restoredInput);
+        }
+        roster->ReleaseNode(tee->Node());
+        return false;
+    }
+
+    tee->SetFormat(newTeeOutput.format);
+    *outFormat = newTeeOutput.format.u.raw_audio;
+
+    BTimeSource* timeSource = roster->MakeTimeSourceFor(tee->Node());
+    if (timeSource) {
+        if (!timeSource->IsRunning())
+            roster->StartTimeSource(timeSource->Node(), system_time());
+        timeSource->Release();
+    }
+    roster->StartNode(tee->Node(), 0);
+
+    handles->node = tee;
+    handles->active = true;
+    return true;
+}
+
+// Tears the tee back out and restores the Mixer's original direct connection
+// to the sound card, so system audio is left exactly as hrecord found it.
+void TeardownDesktopAudioTee(BMediaRoster* roster, AudioTeeHandles* handles) {
+    if (!handles->active || !handles->node)
+        return;
+
+    roster->StopNode(handles->node->Node(), 0, true);
+
+    media_output teeOutput;
+    media_input hwInput;
+    int32 c1 = 0, c2 = 0;
+    if (roster->GetConnectedOutputsFor(handles->node->Node(), &teeOutput, 1, &c1) == B_OK && c1 >= 1
+            && roster->GetConnectedInputsFor(handles->audioOutputNode, &hwInput, 1, &c2) == B_OK
+            && c2 >= 1) {
+        roster->Disconnect(teeOutput, hwInput);
+    }
+
+    media_output mixerOutput;
+    media_input teeInput;
+    int32 c3 = 0, c4 = 0;
+    if (roster->GetConnectedOutputsFor(handles->mixerNode, &mixerOutput, 1, &c3) == B_OK && c3 >= 1
+            && roster->GetConnectedInputsFor(handles->node->Node(), &teeInput, 1, &c4) == B_OK
+            && c4 >= 1) {
+        roster->Disconnect(mixerOutput, teeInput);
+    }
+
+    roster->ReleaseNode(handles->node->Node());
+    handles->node = nullptr;
+
+    media_format restoreFormat = handles->originalOutput.format;
+    media_output restoredOutput;
+    media_input restoredInput;
+    status_t err = roster->Connect(handles->originalOutput.source, handles->originalInput.destination,
+        &restoreFormat, &restoredOutput, &restoredInput);
+    if (err != B_OK) {
+        std::cerr << "[!] Warning: Could not automatically restore the Mixer's direct connection "
+            "to the sound card (error " << err << "). If system audio has gone silent, use Media "
+            "preferences to restart the media server." << std::endl;
+    }
+
+    handles->active = false;
 }
 
 int main(int argc, char* argv[]) {
@@ -433,9 +773,9 @@ int main(int argc, char* argv[]) {
     // 5. Build FFmpeg Container and Muxing Pipeline
     //    --audioonly  -> standalone Ogg/Vorbis file (no legal baggage: open,
     //                    royalty-free codec and container)
-    //    default      -> Matroska file carrying MJPEG video plus, when a
-    //                    desktop-audio loopback input is available, a Vorbis
-    //                    audio track alongside it
+    //    default      -> Matroska file carrying MJPEG video plus, when the
+    //                    desktop-audio tee could be set up, a Vorbis audio
+    //                    track alongside it
     const char* output_filename = audioOnly
         ? "/boot/home/hrecord_capture.ogg"
         : "/boot/home/hrecord_capture.mkv";
@@ -447,23 +787,39 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // 5a. Locate a desktop-audio loopback input, if the hardware/driver offers one.
+    // 5a. Splice the desktop-audio tee between the System Mixer and the
+    // sound card, then set up the Vorbis encoder using whatever format that
+    // negotiated. If either step fails, the tee (if any) is torn back down
+    // immediately so system audio is never left mid-rewire.
     BMediaRoster* mediaRoster = BMediaRoster::Roster();
-    dormant_node_info loopbackInfo;
-    bool haveAudioSource = mediaRoster != nullptr
-        && FindDesktopAudioLoopback(mediaRoster, &loopbackInfo);
+    AudioTeeHandles audioTee;
+    bool audioConnected = false;
 
-    if (!haveAudioSource) {
-        if (audioOnly) {
-            std::cerr << "[-] Error: No desktop-audio loopback input (e.g. \"Stereo Mix\"/"
-                "\"What U Hear\") was found on this system's audio hardware. "
-                "hrecord can only capture desktop audio where the driver exposes one." << std::endl;
-            avformat_free_context(fmtCtx);
-            return -1;
+    if (mediaRoster == nullptr) {
+        std::cerr << "[!] Warning: Could not reach the media_server; recording without audio."
+            << std::endl;
+    } else {
+        media_raw_audio_format negotiated;
+        if (SetupDesktopAudioTee(mediaRoster, &audioTee, &negotiated)) {
+            audioTee.node->SetEncoder(&g_audioEnc);
+            if (SetupAudioEncoder(fmtCtx, negotiated, &g_audioEnc)) {
+                audioConnected = true;
+            } else {
+                std::cerr << "[-] Error: Desktop-audio tee connected, but the Vorbis encoder "
+                    "failed to start; recording without audio." << std::endl;
+                TeardownDesktopAudioTee(mediaRoster, &audioTee);
+            }
         } else {
-            std::cerr << "[!] Warning: No desktop-audio loopback input found; "
-                "recording video only (no audio track)." << std::endl;
+            std::cerr << "[!] Warning: Could not set up desktop-audio capture; recording without "
+                "audio." << std::endl;
         }
+    }
+
+    if (!audioConnected && audioOnly) {
+        std::cerr << "[-] Error: --audioonly requires desktop-audio capture, which could not be "
+            "set up on this machine." << std::endl;
+        avformat_free_context(fmtCtx);
+        return -1;
     }
 
     // 6. Video encoder setup (skipped in --audioonly mode)
@@ -506,76 +862,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 6a. Audio encoder + BMediaRecorder connection setup
-    BMediaRecorder* audioRecorder = nullptr;
-    media_node audioSourceNode;
-    bool audioConnected = false;
-
-    if (haveAudioSource) {
-        media_node instantiated;
-        if (mediaRoster->InstantiateDormantNode(loopbackInfo, &instantiated) != B_OK) {
-            std::cerr << "[-] Error: Failed to instantiate desktop-audio loopback input \""
-                << loopbackInfo.name << "\"." << std::endl;
-            haveAudioSource = false;
-        } else {
-            audioSourceNode = instantiated;
-
-            audioRecorder = new BMediaRecorder("hrecord audio", B_MEDIA_RAW_AUDIO);
-            media_format acceptFormat;
-            acceptFormat.type = B_MEDIA_RAW_AUDIO;
-            acceptFormat.u.raw_audio = media_raw_audio_format::wildcard;
-            audioRecorder->SetAcceptedFormat(acceptFormat);
-
-            media_output audioOutput;
-            int32 outCount = 0;
-            status_t err = mediaRoster->GetFreeOutputsFor(audioSourceNode, &audioOutput, 1,
-                &outCount, B_MEDIA_RAW_AUDIO);
-
-            if (err != B_OK || outCount < 1) {
-                std::cerr << "[-] Error: Desktop-audio loopback input \"" << loopbackInfo.name
-                    << "\" has no free output to record from." << std::endl;
-                delete audioRecorder;
-                audioRecorder = nullptr;
-                mediaRoster->ReleaseNode(audioSourceNode);
-                haveAudioSource = false;
-            } else {
-                media_format connectFormat;
-                connectFormat.type = B_MEDIA_RAW_AUDIO;
-                connectFormat.u.raw_audio = audioOutput.format.u.raw_audio;
-
-                audioRecorder->SetHooks(AudioRecordHook, AudioNotifyHook, &g_audioEnc);
-
-                if (audioRecorder->Connect(audioSourceNode, &audioOutput, &connectFormat) != B_OK) {
-                    std::cerr << "[-] Error: Failed to connect to desktop-audio loopback input \""
-                        << loopbackInfo.name << "\"." << std::endl;
-                    audioRecorder->SetHooks(nullptr, nullptr, nullptr);
-                    delete audioRecorder;
-                    audioRecorder = nullptr;
-                    mediaRoster->ReleaseNode(audioSourceNode);
-                    haveAudioSource = false;
-                } else {
-                    media_raw_audio_format negotiated = audioRecorder->Format().u.raw_audio;
-                    if (!SetupAudioEncoder(fmtCtx, negotiated, &g_audioEnc)) {
-                        audioRecorder->Disconnect();
-                        audioRecorder->SetHooks(nullptr, nullptr, nullptr);
-                        delete audioRecorder;
-                        audioRecorder = nullptr;
-                        mediaRoster->ReleaseNode(audioSourceNode);
-                        haveAudioSource = false;
-                    } else {
-                        audioConnected = true;
-                    }
-                }
-            }
-        }
-
-        if (!haveAudioSource && audioOnly) {
-            std::cerr << "[-] Error: Could not set up desktop-audio recording." << std::endl;
-            avformat_free_context(fmtCtx);
-            return -1;
-        }
-    }
-
     if (!(fmtCtx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&fmtCtx->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
             std::cerr << "[-] Error: Failed to open output capture file." << std::endl;
@@ -587,9 +873,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "[-] Error: Failed writing file container headers." << std::endl;
         return -1;
     }
-
-    if (audioConnected)
-        audioRecorder->Start();
 
     // 6b. Setup Video Framing Allocations (skipped in --audioonly mode)
     if (!audioOnly) {
@@ -618,7 +901,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.1.0";
+	    const char* localVersion = "v1.2.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -633,8 +916,8 @@ int main(int argc, char* argv[]) {
 
     // 7. Main Core Recording Loop
     if (audioOnly) {
-        // Nothing to poll here - the recorder node's own thread drives
-        // AudioRecordHook() as buffers arrive. Just idle until asked to stop.
+        // Nothing to poll here - the tee node's own control thread drives
+        // BufferReceived() as buffers arrive. Just idle until asked to stop.
         while (g_running) {
             snooze(200000);
         }
@@ -686,13 +969,11 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[+] Clean shutdown initiated. Finalizing output file container..." << std::endl;
 
     if (audioConnected) {
-        audioRecorder->Stop(true);
-        audioRecorder->Disconnect();
-        audioRecorder->SetHooks(nullptr, nullptr, nullptr);
-        delete audioRecorder;
-        mediaRoster->ReleaseNode(audioSourceNode);
+        // Stop the tee and restore the Mixer's direct connection to the
+        // sound card *before* flushing the encoder, so no BufferReceived()
+        // call can race the final flush below.
+        TeardownDesktopAudioTee(mediaRoster, &audioTee);
 
-        // Flush anything still sitting in the FIFO, then drain the encoder itself.
         DrainAudioFifo(&g_audioEnc, true);
         {
             std::lock_guard<std::mutex> lock(g_muxMutex);
