@@ -650,12 +650,14 @@ bool SetupDesktopAudioTee(BMediaRoster* roster, AudioTeeHandles* handles,
     handles->teeToHwOutput = newTeeOutput;
     handles->hwInputFromTee = newHwInput;
 
-    BTimeSource* timeSource = roster->MakeTimeSourceFor(tee->Node());
-    if (timeSource) {
-        if (!timeSource->IsRunning())
-            roster->StartTimeSource(timeSource->Node(), system_time());
-        timeSource->Release();
-    }
+    // Deliberately not touching the time source here: the Mixer and sound
+    // card are already running live on the system's shared default time
+    // source, and forcibly restarting a time source other nodes are actively
+    // using corrupts its real-time/performance-time mapping for all of them
+    // -- exactly what crashed the Mixer's own control thread in testing. The
+    // tee inherits that same already-running default automatically, so
+    // there's nothing to set up. Passing 0 ("start now") to StartNode lets
+    // the roster pick the actual performance time itself.
     roster->StartNode(tee->Node(), 0);
 
     handles->node = tee;
@@ -765,8 +767,10 @@ int main(int argc, char* argv[]) {
     }
     // ========================================================================
 
-    // 1. Silence FFmpeg logging noise completely
-    av_log_set_level(AV_LOG_QUIET);
+    // 1. Keep FFmpeg's per-frame chatter quiet, but let real errors through --
+    // codecs like libvorbis log a specific reason via av_log before handing
+    // back a bare AVERROR, and AV_LOG_QUIET was swallowing that detail.
+    av_log_set_level(AV_LOG_ERROR);
 
     // 2. Register terminal Ctrl+C intercept hook
     signal(SIGINT, signalHandler);
@@ -930,7 +934,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.2.0";
+	    const char* localVersion = "v1.2.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
