@@ -462,10 +462,20 @@ public:
     virtual status_t DisposeOutputCookie(int32 cookie) { return B_OK; }
 
     virtual status_t SetBufferGroup(const media_source& forSource, BBufferGroup* group) {
-        // We only ever forward the exact BBuffer instances the Mixer handed
-        // us (see BufferReceived) rather than allocating our own, so there's
-        // nothing for a downstream-supplied buffer group to do here.
-        return B_OK;
+        if (forSource.port != ControlPort() || forSource.id != 0)
+            return B_MEDIA_BAD_SOURCE;
+        if (fInputSource == media_source::null)
+            return B_OK; // nothing upstream connected yet to forward this to
+        // We forward the Mixer's own buffers unchanged (see BufferReceived)
+        // rather than allocating our own, so a buffer group the sound card
+        // hands us here is useless to us directly. Per the BBufferProducer
+        // contract, pass it upstream to the Mixer instead, so the buffers we
+        // actually forward come from the group our real consumer asked for
+        // -- a mismatch here would desync buffer/latency bookkeeping across
+        // the whole chain instead of just being a missed optimization.
+        int32 changeTag = 0;
+        return SetOutputBuffersFor(fInputSource, media_destination(ControlPort(), 0), group,
+            nullptr, &changeTag, false);
     }
 
     virtual status_t PrepareToConnect(const media_source& what, const media_destination& where,
@@ -591,6 +601,17 @@ bool SetupDesktopAudioTee(BMediaRoster* roster, AudioTeeHandles* handles,
         return false;
     }
 
+    // Assign (never restart) the same time source the Mixer and sound card
+    // are already running on, before any connection negotiation happens --
+    // the roster can call our GetLatencyFor() as part of that handshake, and
+    // it needs TimeSource() to already be valid rather than null at that
+    // point. Restarting a time source other live nodes depend on would
+    // corrupt its real-time/performance-time mapping for all of them, so
+    // this only ever attaches to it -- it never calls StartTimeSource().
+    media_node systemTimeSource;
+    if (roster->GetTimeSource(&systemTimeSource) == B_OK)
+        roster->SetTimeSourceFor(tee->Node().node, systemTimeSource.node);
+
     if (haveExisting && roster->Disconnect(handles->originalOutput, handles->originalInput) != B_OK) {
         std::cerr << "[-] Error: Failed to detach the Mixer from the sound card." << std::endl;
         roster->ReleaseNode(tee->Node());
@@ -650,14 +671,8 @@ bool SetupDesktopAudioTee(BMediaRoster* roster, AudioTeeHandles* handles,
     handles->teeToHwOutput = newTeeOutput;
     handles->hwInputFromTee = newHwInput;
 
-    // Deliberately not touching the time source here: the Mixer and sound
-    // card are already running live on the system's shared default time
-    // source, and forcibly restarting a time source other nodes are actively
-    // using corrupts its real-time/performance-time mapping for all of them
-    // -- exactly what crashed the Mixer's own control thread in testing. The
-    // tee inherits that same already-running default automatically, so
-    // there's nothing to set up. Passing 0 ("start now") to StartNode lets
-    // the roster pick the actual performance time itself.
+    // Passing 0 ("start now") lets the roster pick the actual performance
+    // time itself rather than hrecord guessing one.
     roster->StartNode(tee->Node(), 0);
 
     handles->node = tee;
@@ -934,7 +949,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.2.1";
+	    const char* localVersion = "v1.2.2";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),

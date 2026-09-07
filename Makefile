@@ -1,7 +1,7 @@
 # hTV Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
-VERSION = 1.2.1
+VERSION = 1.2.2
 PACKAGE_DIR := build/package
 DUMMY_PC_PATH := $(shell pwd)/build/pkgconfig
 
