@@ -24,6 +24,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/audio_fifo.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
 #include <libavutil/samplefmt.h>
@@ -45,6 +46,15 @@ std::mutex g_muxMutex;
 
 void signalHandler(int signum) {
     g_running = false;
+}
+
+// Renders an FFmpeg AVERROR code as text, so failures name what actually
+// went wrong instead of just "it failed" -- useful since av_log is kept
+// quiet (see AV_LOG_QUIET below) and would otherwise swallow the detail.
+std::string AvErr(int errnum) {
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+    av_strerror(errnum, buf, sizeof(buf));
+    return std::string(buf);
 }
 
 // ============================================================================
@@ -111,9 +121,19 @@ void ListAudioInputs(BMediaRoster* roster) {
 // or the Matroska file shared with the video.
 bool SetupAudioEncoder(AVFormatContext* fmtCtx, const media_raw_audio_format& raw,
         AudioEncoder* enc) {
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_VORBIS);
+    // Prefer the real libvorbis encoder when this FFmpeg build has it -- it's
+    // far more complete than FFmpeg's own long-experimental native "vorbis"
+    // encoder. No extra linking is needed here even when it's available:
+    // libavcodec.so already carries its own dependency on libvorbisenc.
+    const AVCodec* codec = avcodec_find_encoder_by_name("libvorbis");
+    bool usingNativeVorbis = false;
     if (!codec) {
-        std::cerr << "[-] Error: Vorbis encoder subsystem not found." << std::endl;
+        codec = avcodec_find_encoder(AV_CODEC_ID_VORBIS);
+        usingNativeVorbis = true;
+    }
+    if (!codec) {
+        std::cerr << "[-] Error: No Vorbis encoder (libvorbis or built-in) is available in this "
+            "FFmpeg build." << std::endl;
         return false;
     }
 
@@ -126,13 +146,17 @@ bool SetupAudioEncoder(AVFormatContext* fmtCtx, const media_raw_audio_format& ra
     codecCtx->sample_fmt = AV_SAMPLE_FMT_FLTP;
     codecCtx->bit_rate = 160000;
     codecCtx->time_base = {1, sampleRate};
-    // FFmpeg's built-in Vorbis encoder is still flagged experimental.
-    codecCtx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
+    if (usingNativeVorbis) {
+        // FFmpeg's built-in Vorbis encoder is still flagged experimental.
+        codecCtx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
+    }
 
     // Open (and validate) the encoder before touching fmtCtx at all, so a
     // failure here never leaves a half-configured stream behind in the output.
-    if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
-        std::cerr << "[-] Error: Cannot open audio encoder." << std::endl;
+    int openErr = avcodec_open2(codecCtx, codec, nullptr);
+    if (openErr < 0) {
+        std::cerr << "[-] Error: Cannot open audio encoder \"" << codec->name << "\" ("
+            << AvErr(openErr) << ")." << std::endl;
         avcodec_free_context(&codecCtx);
         return false;
     }
@@ -144,8 +168,10 @@ bool SetupAudioEncoder(AVFormatContext* fmtCtx, const media_raw_audio_format& ra
         return false;
     }
 
-    if (avcodec_parameters_from_context(stream->codecpar, codecCtx) < 0) {
-        std::cerr << "[-] Error: Failed to transfer audio codec parameters." << std::endl;
+    int paramErr = avcodec_parameters_from_context(stream->codecpar, codecCtx);
+    if (paramErr < 0) {
+        std::cerr << "[-] Error: Failed to transfer audio codec parameters (" << AvErr(paramErr)
+            << ")." << std::endl;
         avcodec_free_context(&codecCtx);
         return false;
     }
@@ -157,9 +183,12 @@ bool SetupAudioEncoder(AVFormatContext* fmtCtx, const media_raw_audio_format& ra
     SwrContext* swr = nullptr;
     int swrErr = swr_alloc_set_opts2(&swr, &codecCtx->ch_layout, AV_SAMPLE_FMT_FLTP,
         sampleRate, &inLayout, HaikuAudioFormatToAV(raw.format), sampleRate, 0, nullptr);
+    if (swrErr >= 0 && swr)
+        swrErr = swr_init(swr);
     av_channel_layout_uninit(&inLayout);
-    if (swrErr < 0 || !swr || swr_init(swr) < 0) {
-        std::cerr << "[-] Error: Failed to initialize audio resampler." << std::endl;
+    if (swrErr < 0 || !swr) {
+        std::cerr << "[-] Error: Failed to initialize audio resampler (" << AvErr(swrErr)
+            << ")." << std::endl;
         avcodec_free_context(&codecCtx);
         if (swr) swr_free(&swr);
         return false;
@@ -499,6 +528,10 @@ struct AudioTeeHandles {
     media_node audioOutputNode;
     media_output originalOutput; // Mixer's output as connected before hrecord touched it
     media_input originalInput;   // sound card's input as connected before hrecord touched it
+    media_output mixerToTeeOutput; // Mixer's output as connected to the tee (for teardown)
+    media_input teeInputFromMixer; // tee's input as connected from the Mixer (for teardown)
+    media_output teeToHwOutput;    // tee's output as connected to the sound card (for teardown)
+    media_input hwInputFromTee;    // sound card's input as connected from the tee (for teardown)
     bool active = false;
 };
 
@@ -609,6 +642,14 @@ bool SetupDesktopAudioTee(BMediaRoster* roster, AudioTeeHandles* handles,
     tee->SetFormat(newTeeOutput.format);
     *outFormat = newTeeOutput.format.u.raw_audio;
 
+    // Remember exactly what got connected (rather than re-querying it later)
+    // so TeardownDesktopAudioTee() can disconnect precisely these, with no
+    // risk of a query racing the node's StopNode() and coming back empty.
+    handles->mixerToTeeOutput = newMixerOutput;
+    handles->teeInputFromMixer = newTeeInput;
+    handles->teeToHwOutput = newTeeOutput;
+    handles->hwInputFromTee = newHwInput;
+
     BTimeSource* timeSource = roster->MakeTimeSourceFor(tee->Node());
     if (timeSource) {
         if (!timeSource->IsRunning())
@@ -630,23 +671,11 @@ void TeardownDesktopAudioTee(BMediaRoster* roster, AudioTeeHandles* handles) {
 
     roster->StopNode(handles->node->Node(), 0, true);
 
-    media_output teeOutput;
-    media_input hwInput;
-    int32 c1 = 0, c2 = 0;
-    if (roster->GetConnectedOutputsFor(handles->node->Node(), &teeOutput, 1, &c1) == B_OK && c1 >= 1
-            && roster->GetConnectedInputsFor(handles->audioOutputNode, &hwInput, 1, &c2) == B_OK
-            && c2 >= 1) {
-        roster->Disconnect(teeOutput, hwInput);
-    }
-
-    media_output mixerOutput;
-    media_input teeInput;
-    int32 c3 = 0, c4 = 0;
-    if (roster->GetConnectedOutputsFor(handles->mixerNode, &mixerOutput, 1, &c3) == B_OK && c3 >= 1
-            && roster->GetConnectedInputsFor(handles->node->Node(), &teeInput, 1, &c4) == B_OK
-            && c4 >= 1) {
-        roster->Disconnect(mixerOutput, teeInput);
-    }
+    // Disconnect precisely what SetupDesktopAudioTee() connected -- no
+    // re-querying, so there's no window where a stale/empty query result
+    // skips a Disconnect() and leaves the tee's side of the graph wired.
+    roster->Disconnect(handles->teeToHwOutput, handles->hwInputFromTee);
+    roster->Disconnect(handles->mixerToTeeOutput, handles->teeInputFromMixer);
 
     roster->ReleaseNode(handles->node->Node());
     handles->node = nullptr;
