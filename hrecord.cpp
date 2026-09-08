@@ -998,6 +998,12 @@ void TeardownDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles) {
 // (producer) and MixEncodeWorkerLoop (consumer) -- see both below.
 AudioRingBuffer g_mixEncodeQueue;
 
+// Set at the very start of SetupAllAudioTaps; read back by
+// MixedPlaybackCallback's one-time startup diagnostic below, so a report
+// of "N seconds before anything is heard" can be pinned down to an actual
+// measured elapsed time rather than a stopwatch guess.
+bigtime_t g_allAudioSetupStartTime = 0;
+
 // BSoundPlayer::BufferPlayerFunc used only in --allaudio mode. Unlike
 // PlaybackCallback (which just drains one ring for one hijacked app), this
 // pulls an equal-size chunk from every tapped source's own ring buffer
@@ -1025,6 +1031,34 @@ AudioRingBuffer g_mixEncodeQueue;
 void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
         const media_raw_audio_format& format) {
     std::vector<AudioRingBuffer*>* sources = (std::vector<AudioRingBuffer*>*)cookie;
+
+    // One-time startup diagnostic: how long after tap setup began did this
+    // callback actually start running, and how much real (non-silence)
+    // audio had already piled up in each source's own ring by that point?
+    // Distinguishes "BSoundPlayer itself took a long time to start calling
+    // back at all" from "it started quickly, but a backlog built up before
+    // it did and takes a while to drain at real-time speed" -- both would
+    // sound identical to a listener (a long wait, then clean audio), but
+    // point at completely different places to fix.
+    static bool firstCall = true;
+    if (firstCall) {
+        firstCall = false;
+        bigtime_t elapsedUs = system_time() - g_allAudioSetupStartTime;
+        std::cout << "[i] Mixed playback: first callback " << (elapsedUs / 1000)
+            << "ms after tap setup began." << std::endl;
+        if (sources != nullptr) {
+            int idx = 0;
+            for (AudioRingBuffer* ring : *sources) {
+                idx++;
+                size_t avail = ring->Available();
+                double seconds = g_mixBusRate > 0
+                    ? (double)avail / (kMixBusChannels * sizeof(float) * g_mixBusRate) : 0.0;
+                std::cout << "    source #" << idx << " backlog already queued: " << avail
+                    << " bytes (~" << seconds << "s)" << std::endl;
+            }
+        }
+    }
+
     float* out = (float*)buffer;
     size_t sampleCount = size / sizeof(float);
     std::fill(out, out + sampleCount, 0.0f);
@@ -1089,6 +1123,7 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles);
 // if *no* source could be tapped at all.
 bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         media_raw_audio_format* outFormat) {
+    g_allAudioSetupStartTime = system_time();
     media_node mixerNode;
     if (roster->GetAudioMixer(&mixerNode) != B_OK) {
         std::cerr << "[-] Error: Could not reach the System Mixer." << std::endl;
@@ -1204,6 +1239,8 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
     }
     player->SetHasData(true);
     player->Start();
+    std::cout << "[i] BSoundPlayer::Start() returned " << ((system_time() - g_allAudioSetupStartTime) / 1000)
+        << "ms after tap setup began." << std::endl;
 
     handles->player = player;
     handles->active = true;
@@ -1580,7 +1617,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.6.4";
+	    const char* localVersion = "v1.6.5";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
