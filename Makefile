@@ -24,7 +24,10 @@ ifeq ($(UNAME_M), BePC)
     ARCH = x86_gcc2
     LIB_ARCH_DIR = /x86
     DEFINES += -DIS_HAIKU_32BIT
-    PKG_CONFIG_CMD = x86-pkg-config
+    # The secondary-architecture pkg-config wrapper is named pkg-config-x86
+    # (not x86-pkg-config); it's a separate package from the primary
+    # pkg-config and needs to be installed if a 32-bit build says it's missing.
+    PKG_CONFIG_CMD = pkg-config-x86
 else
     CXX = g++
     ARCH = x86_64
