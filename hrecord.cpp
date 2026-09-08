@@ -469,9 +469,21 @@ void MixAndBuffer(SwrContext* swr, const void* data, size_t size,
     if (nbSamples <= 0)
         return;
 
-    // A generous margin over nbSamples covers any rate-conversion growth
-    // (e.g. 44.1kHz -> 48kHz) without needing to query swr's exact ratio.
-    int maxOutSamples = nbSamples * 2 + 256;
+    // Size the output buffer for the *actual* rate ratio, not a flat
+    // guess. A source with a native rate well below the 48kHz bus rate
+    // (e.g. a synth running its own engine at 8kHz or 11kHz) needs several
+    // times as many output samples as input to upsample -- a flat "roughly
+    // double" margin (sized for something like 44.1kHz -> 48kHz) silently
+    // undersizes that badly. swr_convert doesn't fail loudly when that
+    // happens: whatever doesn't fit in the output buffer stays buffered
+    // inside swr's own internal state and only comes out on a *later*
+    // call. That reads first as growing startup latency (real audio
+    // piling up before any of it reaches the ring buffer) and then as
+    // chopping once the ring runs dry between those delayed, bursty
+    // catch-ups -- exactly what looks like "sample mismatch" but is
+    // actually just an undersized buffer here.
+    double ratio = (format.frame_rate > 0) ? ((double)kMixBusRate / format.frame_rate) : 1.0;
+    int maxOutSamples = (int)(nbSamples * ratio * 1.2) + 256;
 
     uint8_t* converted[1] = { nullptr };
     if (av_samples_alloc(converted, nullptr, kMixBusChannels, maxOutSamples,
@@ -482,8 +494,29 @@ void MixAndBuffer(SwrContext* swr, const void* data, size_t size,
     int produced = swr_convert(swr, converted, maxOutSamples, inData, nbSamples);
     if (produced > 0)
         ring->Write(converted[0], (size_t)produced * kMixBusChannels * sizeof(float));
-
     av_freep(&converted[0]);
+
+    // Belt-and-suspenders: drain anything swr still had buffered from a
+    // previous call (in case the ratio above ever underestimates in
+    // practice) rather than letting a backlog silently compound across
+    // calls. Bounded so a persistently wrong ratio can't spin this forever.
+    for (int guard = 0; guard < 4; guard++) {
+        int pending = swr_get_out_samples(swr, 0);
+        if (pending <= 0)
+            break;
+
+        uint8_t* flushed[1] = { nullptr };
+        if (av_samples_alloc(flushed, nullptr, kMixBusChannels, pending,
+                AV_SAMPLE_FMT_FLT, 0) < 0)
+            break;
+        int flushedCount = swr_convert(swr, flushed, pending, nullptr, 0);
+        if (flushedCount > 0)
+            ring->Write(flushed[0], (size_t)flushedCount * kMixBusChannels * sizeof(float));
+        av_freep(&flushed[0]);
+
+        if (flushedCount <= 0)
+            break;
+    }
 }
 
 class AudioTapNode : public BBufferConsumer, public BMediaEventLooper {
@@ -1410,7 +1443,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.6.0";
+	    const char* localVersion = "v1.6.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
