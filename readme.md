@@ -28,28 +28,33 @@ hrecord [start|stop] [--audioonly] [--list-audio-inputs]
 
 ## How desktop-audio capture works
 
-An earlier version of hrecord spliced a Media Kit node between the System
-Mixer's *output* and the sound card — the single, shared connection
-everything downstream depends on. That reproducibly crashed Haiku's own
-Mixer control thread on real hardware, so it's been replaced with a
-structurally different, lower-risk approach:
+Two earlier approaches tried to put hrecord's own Media Kit node back into
+the playback graph as a genuine producer — first spliced between the System
+Mixer's *output* and the sound card (crashed Haiku's own Mixer control
+thread, reproducibly, three times), then between one app's output and a
+fresh Mixer input (didn't crash, but the audio never became audible despite
+being delivered without error — consistent with something in the Mixer's
+own internal buffer routing not fully recognizing hrecord's connection,
+which isn't fixable from outside Haiku's own Mixer source).
+
+The current approach doesn't try to be a producer at all:
 
 1. Find one app currently playing sound (i.e. connected to the Mixer).
-2. Briefly stop it, redirect its connection through hrecord's own Media Kit
-   node instead of straight to the Mixer, then reconnect hrecord's node to a
-   *fresh* Mixer input and restart the app.
-3. From then on, every buffer the app produces is copied to hrecord's Vorbis
-   encoder and immediately forwarded on to the Mixer unchanged — so what you
-   hear doesn't change, aside from the one extra hop.
-4. On a clean shutdown (Ctrl+C or `hrecord stop`), the tap is torn out and
-   the app is reconnected directly to the Mixer, exactly as it was found.
+2. Briefly stop it, redirect its connection through hrecord's own capture
+   node instead of straight to the Mixer, then restart the app.
+3. Every buffer the app produces is handed to hrecord's Vorbis encoder *and*
+   copied into a small ring buffer.
+4. A `BSoundPlayer` drains that ring buffer to actually produce sound,
+   connecting to the System Mixer through Haiku's own well-tested playback
+   path — the same one every ordinary sound-playing app already uses
+   successfully — instead of hrecord's own connection code.
+5. On a clean shutdown (Ctrl+C or `hrecord stop`), playback stops, the tap
+   is torn out, and the app is reconnected directly to the Mixer, exactly as
+   it was found.
 
-The Mixer's input side is inherently dynamic — apps connect and disconnect
-from it constantly as they start and stop playing sound — so it's built to
-handle this kind of churn, unlike its single, rarely-touched output
-connection to hardware. This only ever touches hrecord's own local audio
-pipeline — the same signal already being sent to your speakers — so there's
-nothing here that intercepts audio you couldn't otherwise hear yourself.
+This only ever touches hrecord's own local audio pipeline — the same signal
+already being sent to your speakers — so there's nothing here that
+intercepts audio you couldn't otherwise hear yourself.
 
 **Caveat:** the restore-on-exit step only runs on a normal shutdown. If
 hrecord is killed with `kill -9` or crashes while the tap is spliced in, the

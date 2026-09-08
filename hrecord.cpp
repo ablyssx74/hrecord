@@ -6,15 +6,17 @@
 #include <MediaDefs.h>
 #include <MediaNode.h>
 #include <BufferConsumer.h>
-#include <BufferProducer.h>
-#include <BufferGroup.h>
 #include <MediaEventLooper.h>
 #include <TimeSource.h>
 #include <Buffer.h>
+#include <SoundPlayer.h>
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <mutex>
+#include <vector>
 #include <cstdint>
+#include <cstring>
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
@@ -297,71 +299,135 @@ void EncodeAudioSamples(AudioEncoder* enc, const void* data, size_t size,
 }
 
 // ============================================================================
-// Desktop audio capture: the tap node itself
+// Desktop audio capture: live playback while recording
 //
-// Earlier attempts spliced between the System Mixer's OUTPUT and the sound
-// card -- the single, shared connection everything downstream depends on.
-// That reproducibly crashed Haiku's own Mixer control thread (a
-// BTimeSource::RealTimeFor "performance time too large" assertion), three
-// times in a row, unaffected by two different targeted fixes: enough
-// evidence that live-disrupting that specific connection hits a real Media
-// Kit fragility, not just a bug in this node.
+// Two earlier approaches tried to put hrecord's own Media Kit node back into
+// the playback graph as a genuine producer -- first spliced between the
+// System Mixer's output and the sound card (crashed Haiku's own Mixer
+// control thread, reproducibly, three times), then between one app's output
+// and a fresh Mixer input (didn't crash, but the forwarded audio never
+// became audible despite delivering without any error at the Media Kit
+// level -- consistent with something in the Mixer's own internal per-buffer
+// routing silently not recognizing hrecord's connection, which isn't
+// something fixable from outside Haiku's own Mixer source).
 //
-// This version splices in a structurally different, much lower-risk place:
-// between ONE currently-playing app's output and the Mixer's INPUT side.
-// The Mixer's input side is inherently dynamic -- apps connect and
-// disconnect from it constantly as they start and stop playing sound -- so
-// it's built to handle exactly this kind of churn, unlike its single,
-// rarely-touched output connection to hardware. hrecord becomes, from the
-// Mixer's point of view, just another ordinary app feeding it audio -- the
-// hijacked app's audio is redirected through this node and immediately
-// forwarded on to a fresh Mixer input, so nothing about what you hear
-// changes, while a copy is handed to the Vorbis encoder.
-//
-// Two more differences from the crashed attempt, both matching a working
-// reference implementation of this same "insert into an app's connection"
-// technique for Haiku's Media Kit: this node runs in B_RECORDING mode with
-// no time source of its own (buffers are never precisely real-time
-// scheduled, sidestepping the exact code path that crashed), and it
-// forwards audio using freshly allocated buffers from its own buffer pool
-// rather than re-sending the exact BBuffer instance it received.
+// This version doesn't try to be a producer at all. AudioTapNode only
+// *captures* -- every buffer it receives from the hijacked app is handed to
+// the Vorbis encoder and copied into a small ring buffer. A BSoundPlayer
+// drains that ring buffer to actually produce sound, connecting to the
+// System Mixer via Haiku's own well-tested playback path -- the same one
+// every ordinary sound-playing app already uses successfully -- rather than
+// hrecord's own hand-rolled producer connection.
 // ============================================================================
 
-class AudioTapNode : public BBufferConsumer, public BBufferProducer, public BMediaEventLooper {
+// A small lock-protected circular byte buffer bridging the tap's own
+// control thread (writer, paced by the hijacked app's buffer cadence) and
+// the BSoundPlayer callback thread (reader, paced by the Mixer's own
+// cadence). On overflow, the oldest bytes are dropped rather than blocking
+// either side or growing unbounded; on underrun, playback is zero-filled
+// (silence) rather than reading stale or garbage data.
+class AudioRingBuffer {
+public:
+    void Init(size_t capacityBytes) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        fBuffer.assign(capacityBytes, 0);
+        fWritePos = fReadPos = fAvailable = 0;
+    }
+
+    void Write(const void* data, size_t size) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        size_t capacity = fBuffer.size();
+        if (capacity == 0)
+            return;
+
+        const uint8_t* src = (const uint8_t*)data;
+        if (size > capacity) {
+            // Only the most recent `capacity` bytes can possibly fit.
+            src += (size - capacity);
+            size = capacity;
+        }
+
+        size_t firstChunk = std::min(size, capacity - fWritePos);
+        memcpy(&fBuffer[fWritePos], src, firstChunk);
+        if (firstChunk < size)
+            memcpy(&fBuffer[0], src + firstChunk, size - firstChunk);
+        fWritePos = (fWritePos + size) % capacity;
+
+        if (fAvailable + size > capacity) {
+            size_t overflow = fAvailable + size - capacity;
+            fReadPos = (fReadPos + overflow) % capacity;
+            fAvailable = capacity;
+        } else {
+            fAvailable += size;
+        }
+    }
+
+    void Read(void* data, size_t size) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        uint8_t* dst = (uint8_t*)data;
+        size_t capacity = fBuffer.size();
+        size_t toCopy = std::min(size, fAvailable);
+
+        if (toCopy > 0 && capacity > 0) {
+            size_t firstChunk = std::min(toCopy, capacity - fReadPos);
+            memcpy(dst, &fBuffer[fReadPos], firstChunk);
+            if (firstChunk < toCopy)
+                memcpy(dst + firstChunk, &fBuffer[0], toCopy - firstChunk);
+            fReadPos = (fReadPos + toCopy) % capacity;
+            fAvailable -= toCopy;
+        }
+        if (toCopy < size)
+            memset(dst + toCopy, 0, size - toCopy);
+    }
+
+private:
+    std::mutex fMutex;
+    std::vector<uint8_t> fBuffer;
+    size_t fWritePos = 0, fReadPos = 0, fAvailable = 0;
+};
+
+AudioRingBuffer g_playbackRing;
+
+// BSoundPlayer::BufferPlayerFunc: called on BSoundPlayer's own thread
+// whenever it needs more audio to send to the Mixer.
+void PlaybackCallback(void* cookie, void* buffer, size_t size,
+        const media_raw_audio_format& format) {
+    AudioRingBuffer* ring = (AudioRingBuffer*)cookie;
+    if (ring)
+        ring->Read(buffer, size);
+    else
+        memset(buffer, 0, size);
+}
+
+class AudioTapNode : public BBufferConsumer, public BMediaEventLooper {
 public:
     media_input fInput;
-    media_output fOutput;
 
     AudioTapNode()
         : BMediaNode("hrecord Audio Tap"),
           BBufferConsumer(B_MEDIA_RAW_AUDIO),
-          BBufferProducer(B_MEDIA_RAW_AUDIO),
           BMediaEventLooper()
     {
-        AddNodeKind(B_BUFFER_CONSUMER | B_BUFFER_PRODUCER);
+        AddNodeKind(B_BUFFER_CONSUMER);
 
-        fInput.node = fOutput.node = Node();
+        fInput.node = Node();
         fInput.destination = media_destination(ControlPort(), 0);
         fInput.source = media_source::null;
-        fOutput.source = media_source(ControlPort(), 0);
-        fOutput.destination = media_destination::null;
         strcpy(fInput.name, "hrecord Tap In");
-        strcpy(fOutput.name, "hrecord Tap Out");
 
-        // Buffers are relayed synchronously and never precisely scheduled --
-        // see the block comment above for why this run mode and time source
-        // matter here, not just as a style choice.
+        // This node never precisely schedules anything -- it just hands off
+        // every buffer it receives, synchronously, to the encoder and the
+        // playback ring buffer.
         SetRunMode(BMediaNode::B_RECORDING);
         SetTimeSource(nullptr);
     }
 
     virtual ~AudioTapNode() {
-        if (fBufferGroup)
-            delete fBufferGroup;
         BMediaEventLooper::Quit();
     }
 
     void SetEncoder(AudioEncoder* encoder) { fEncoder = encoder; }
+    void SetPlaybackRing(AudioRingBuffer* ring) { fRing = ring; }
 
     // --- BMediaNode ---
     virtual BMediaAddOn* AddOn(int32* internalID) const { return nullptr; }
@@ -374,7 +440,6 @@ public:
 
     virtual status_t HandleMessage(int32 code, const void* data, size_t size) {
         if (BBufferConsumer::HandleMessage(code, data, size) == B_OK) return B_OK;
-        if (BBufferProducer::HandleMessage(code, data, size) == B_OK) return B_OK;
         if (BMediaEventLooper::HandleMessage(code, data, size) == B_OK) return B_OK;
         return BMediaNode::HandleMessage(code, data, size);
     }
@@ -385,7 +450,7 @@ public:
             BufferReceived((BBuffer*)event->pointer);
     }
 
-    // --- BBufferConsumer: input side, connected from the hijacked app ---
+    // --- BBufferConsumer: connected from the hijacked app ---
     virtual status_t AcceptFormat(const media_destination& dest, media_format* format) {
         if (dest.port != ControlPort() || dest.id != 0)
             return B_MEDIA_BAD_DESTINATION;
@@ -414,62 +479,15 @@ public:
     virtual void BufferReceived(BBuffer* buffer) {
         if (!buffer)
             return;
-        media_header* inHeader = buffer->Header();
-        if (!inHeader) {
-            buffer->Recycle();
-            return;
-        }
+
+        void* data = buffer->Data();
+        size_t size = buffer->SizeUsed();
 
         if (fEncoder != nullptr && g_running)
-            EncodeAudioSamples(fEncoder, buffer->Data(), buffer->SizeUsed(), fInput.format.u.raw_audio);
+            EncodeAudioSamples(fEncoder, data, size, fInput.format.u.raw_audio);
 
-        if (!fOutputEnabled) {
-            LogForwardIssue("output disabled by the Mixer (EnableOutput(false))");
-        } else if (fOutput.destination == media_destination::null) {
-            LogForwardIssue("not connected to the Mixer");
-        } else if (!fBufferGroup) {
-            LogForwardIssue("no buffer pool available");
-        } else {
-            size_t sizeUsed = buffer->SizeUsed();
-            BBuffer* outBuffer = fBufferGroup->RequestBuffer(sizeUsed, 20000);
-            if (outBuffer) {
-                memcpy(outBuffer->Data(), buffer->Data(), sizeUsed);
-                outBuffer->SetSizeUsed(sizeUsed);
-
-                media_header* outHeader = outBuffer->Header();
-                outHeader->type = B_MEDIA_RAW_AUDIO;
-                outHeader->size_used = sizeUsed;
-                // Forward the app's own timestamp unchanged -- we don't
-                // resample or otherwise alter this audio, so it's already
-                // the correct performance time for this exact data. The
-                // Mixer places incoming audio into its output ring buffer
-                // by this timestamp (frames_for_duration(...) %
-                // ringBufferFrameCount in its own source), so a synthesized
-                // timestamp that doesn't line up with the app's real timeline
-                // lands the audio at the wrong offset -- silently, with no
-                // error back to us. That was true of an earlier version of
-                // this method that tried to build its own schedule.
-                outHeader->start_time = inHeader->start_time;
-
-                status_t sendErr = SendBuffer(outBuffer, fOutput.source, fOutput.destination);
-                if (sendErr != B_OK) {
-                    outBuffer->Recycle();
-                    LogForwardIssue("SendBuffer to the Mixer failed");
-                } else {
-                    if (fForwardedCount == 0) {
-                        // Confirms the tap -> Mixer pipe is actually delivering
-                        // buffers. If audio is still inaudible after this
-                        // prints, the buffers are arriving but the Mixer's new
-                        // input channel itself is muted or at zero gain --
-                        // not a forwarding bug.
-                        std::cerr << "[+] First buffer forwarded to the Mixer successfully." << std::endl;
-                    }
-                    fForwardedCount++;
-                }
-            } else {
-                LogForwardIssue("RequestBuffer timed out (buffer pool exhausted?)");
-            }
-        }
+        if (fRing != nullptr)
+            fRing->Write(data, size);
 
         buffer->Recycle();
     }
@@ -488,21 +506,6 @@ public:
             const media_format& format, media_input* out_input) {
         fInput.source = producer;
         fInput.format = format;
-
-        // This is for OUR OWN output leg (see BufferReceived below) -- we
-        // only ever read from whatever buffer the hijacked app hands us
-        // here, never write into it, so there's no need to tell it which
-        // pool to draw from.
-        if (!fBufferGroup) {
-            fBufferGroup = new BBufferGroup(format.u.raw_audio.buffer_size > 0
-                ? format.u.raw_audio.buffer_size : 65536, 16);
-            if (fBufferGroup->InitCheck() != B_OK) {
-                delete fBufferGroup;
-                fBufferGroup = nullptr;
-                return B_ERROR;
-            }
-        }
-
         *out_input = fInput;
         return B_OK;
     }
@@ -517,112 +520,9 @@ public:
         return B_OK;
     }
 
-    // --- BBufferProducer: output side, connected to a fresh Mixer input ---
-    virtual status_t FormatSuggestionRequested(media_type type, int32 quality, media_format* format) {
-        if (type != B_MEDIA_RAW_AUDIO && type != B_MEDIA_UNKNOWN_TYPE)
-            return B_MEDIA_BAD_FORMAT;
-        *format = fOutput.format;
-        return B_OK;
-    }
-
-    virtual status_t FormatProposal(const media_source& output, media_format* ioFormat) {
-        if (output.port != ControlPort() || output.id != 0)
-            return B_MEDIA_BAD_SOURCE;
-        if (ioFormat->type != B_MEDIA_RAW_AUDIO && ioFormat->type != B_MEDIA_UNKNOWN_TYPE)
-            return B_MEDIA_BAD_FORMAT;
-        *ioFormat = fOutput.format;
-        return B_OK;
-    }
-
-    virtual status_t FormatChangeRequested(const media_source& source,
-            const media_destination& destination, media_format* ioFormat, int32* _deprecated_) {
-        // The pass-through format is fixed for the life of this connection --
-        // it was chosen up front to match the hijacked app's own format.
-        *ioFormat = fOutput.format;
-        return B_ERROR;
-    }
-
-    virtual status_t GetNextOutput(int32* cookie, media_output* out_output) {
-        if (*cookie != 0)
-            return B_BAD_INDEX;
-        *out_output = fOutput;
-        *cookie = 1;
-        return B_OK;
-    }
-
-    virtual status_t DisposeOutputCookie(int32 cookie) { return B_OK; }
-
-    virtual status_t SetBufferGroup(const media_source& forSource, BBufferGroup* group) {
-        if (group == nullptr)
-            return B_OK; // caller is fine with whatever pool we already use
-        if (fBufferGroup && fBufferGroup != group)
-            delete fBufferGroup;
-        fBufferGroup = group;
-        return B_OK;
-    }
-
-    virtual status_t PrepareToConnect(const media_source& what, const media_destination& where,
-            media_format* format, media_source* _source, char* _name) {
-        if (what.port != ControlPort() || what.id != 0)
-            return B_MEDIA_BAD_SOURCE;
-        if (format->type != B_MEDIA_RAW_AUDIO && format->type != B_MEDIA_UNKNOWN_TYPE)
-            return B_MEDIA_BAD_FORMAT;
-        *format = fOutput.format;
-        *_source = what;
-        strcpy(_name, fOutput.name);
-        return B_OK;
-    }
-
-    virtual void Connect(status_t error, const media_source& source,
-            const media_destination& destination, const media_format& format, char* ioName) {
-        strcpy(ioName, fOutput.name);
-        if (error != B_OK)
-            return;
-        fOutput.source = source;
-        fOutput.destination = destination;
-        fOutput.format = format;
-    }
-
-    virtual void Disconnect(const media_source& what, const media_destination& where) {
-        fOutput.destination = media_destination::null;
-    }
-
-    virtual void LateNoticeReceived(const media_source& what, bigtime_t howMuch,
-            bigtime_t performanceTime) {}
-
-    virtual void EnableOutput(const media_source& what, bool enabled, int32* _deprecated_) {
-        fOutputEnabled = enabled;
-    }
-
-    virtual void AdditionalBufferRequested(const media_source& source,
-            media_buffer_id previousBuffer, bigtime_t previousTime,
-            const media_seek_tag* previousTag) {
-        // We only ever produce a buffer in direct response to one we just
-        // received (see BufferReceived), never speculatively on request.
-    }
-
-    virtual void LatencyChanged(const media_source& source, const media_destination& destination,
-            bigtime_t newLatency, uint32 flags) {}
-
 private:
-    // Rate-limited stderr diagnostics for the forwarding leg (tap -> Mixer),
-    // so a silent-but-not-crashing recording says exactly where the audio
-    // is being lost instead of just not being audible. Capped to once a
-    // second per distinct reason so a persistent failure doesn't flood the
-    // terminal.
-    void LogForwardIssue(const char* reason) {
-        bigtime_t now = system_time();
-        if (now - fLastForwardLogTime < 1000000)
-            return;
-        fLastForwardLogTime = now;
-        std::cerr << "[!] Desktop-audio forwarding to the Mixer: " << reason << std::endl;
-    }
-
-    BBufferGroup* fBufferGroup = nullptr;
     AudioEncoder* fEncoder = nullptr;
-    bigtime_t fLastForwardLogTime = 0;
-    uint64_t fForwardedCount = 0;
-    bool fOutputEnabled = true;
+    AudioRingBuffer* fRing = nullptr;
 };
 
 // Everything SetupDesktopAudioTap() needs to remember so
@@ -630,15 +530,15 @@ private:
 // found it.
 struct AudioTapHandles {
     AudioTapNode* node = nullptr;
+    BSoundPlayer* player = nullptr;
     media_node appNode;
     media_output originalAppOutput; // the app's output as connected before hrecord touched it
     bool active = false;
 };
 
-// Finds one currently-playing app, redirects its connection to the System
-// Mixer through a new AudioTapNode, and reconnects the tap's own output to a
-// fresh Mixer input -- so the app's audio keeps reaching the Mixer exactly
-// as before, just via an extra hop that also hands hrecord a copy. On
+// Finds one currently-playing app and redirects its connection to the
+// System Mixer through a new AudioTapNode, then starts a BSoundPlayer to
+// keep its audio actually audible (see the block comment above). On
 // failure, the app's original connection (if any was touched) is left
 // exactly as it was found.
 bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
@@ -678,7 +578,6 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
 
     AudioTapNode* tap = new AudioTapNode();
     tap->fInput.format = appOutput.format;
-    tap->fOutput.format = appOutput.format;
     if (roster->RegisterNode(tap) != B_OK) {
         std::cerr << "[-] Error: Failed to register the audio tap node." << std::endl;
         delete tap;
@@ -698,10 +597,10 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     }
     snooze(20000);
 
-    media_format fmt1 = appOutput.format;
+    media_format fmt = appOutput.format;
     media_output newAppOutput;
     media_input newTapInput;
-    status_t err = roster->Connect(appOutput.source, tap->fInput.destination, &fmt1,
+    status_t err = roster->Connect(appOutput.source, tap->fInput.destination, &fmt,
         &newAppOutput, &newTapInput);
     if (err != B_OK) {
         std::cerr << "[-] Error: Failed to connect the playing app to the audio tap (error "
@@ -716,12 +615,25 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
         return false;
     }
 
-    media_input freeMixerInput;
-    int32 freeCount = 0;
-    if (roster->GetFreeInputsFor(mixerNode, &freeMixerInput, 1, &freeCount, B_MEDIA_RAW_AUDIO) != B_OK
-            || freeCount < 1) {
-        std::cerr << "[-] Error: The Mixer has no free input for the audio tap to feed into."
-            << std::endl;
+    media_raw_audio_format negotiated = newTapInput.format.u.raw_audio;
+
+    // Size the ring buffer to hold roughly half a second of audio -- enough
+    // to smooth out the difference in cadence between the app's own buffer
+    // delivery and the Mixer's, without adding excessive playback latency.
+    int bytesPerFrame = (negotiated.format & media_raw_audio_format::B_AUDIO_SIZE_MASK)
+        * (int)(negotiated.channel_count > 0 ? negotiated.channel_count : 2);
+    float rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100.0f;
+    size_t ringCapacity = bytesPerFrame > 0
+        ? (size_t)(bytesPerFrame * rate * 0.5) : 65536;
+    g_playbackRing.Init(ringCapacity);
+    tap->SetPlaybackRing(&g_playbackRing);
+
+    BSoundPlayer* player = new BSoundPlayer(&negotiated, "hrecord Playback", PlaybackCallback,
+        nullptr, &g_playbackRing);
+    if (player->InitCheck() != B_OK) {
+        std::cerr << "[-] Error: Could not start local audio playback (error "
+            << player->InitCheck() << ")." << std::endl;
+        delete player;
         roster->Disconnect(newAppOutput, newTapInput);
         media_format restoreFmt = appOutput.format;
         media_output restoredOutput;
@@ -732,38 +644,23 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
         roster->ReleaseNode(tap->Node());
         return false;
     }
-
-    media_format fmt2 = newAppOutput.format;
-    media_output newTapOutput;
-    media_input newMixerInput;
-    err = roster->Connect(tap->fOutput.source, freeMixerInput.destination, &fmt2,
-        &newTapOutput, &newMixerInput);
-    if (err != B_OK) {
-        std::cerr << "[-] Error: Failed to connect the audio tap to the Mixer (error " << err
-            << ")." << std::endl;
-        roster->Disconnect(newAppOutput, newTapInput);
-        media_format restoreFmt = appOutput.format;
-        media_output restoredOutput;
-        media_input restoredInput;
-        roster->Connect(appOutput.source, mixerInput.destination, &restoreFmt, &restoredOutput,
-            &restoredInput);
-        roster->StartNode(appNode, 0);
-        roster->ReleaseNode(tap->Node());
-        return false;
-    }
-
-    *outFormat = newTapOutput.format.u.raw_audio;
+    player->SetHasData(true);
+    player->Start();
 
     roster->StartNode(tap->Node(), 0);
     roster->StartNode(appNode, 0);
 
+    *outFormat = negotiated;
+
     handles->node = tap;
+    handles->player = player;
     handles->active = true;
     return true;
 }
 
-// Disconnects the tap and reconnects the hijacked app directly back to the
-// System Mixer, exactly where it was before hrecord touched it.
+// Stops playback, disconnects the tap, and reconnects the hijacked app
+// directly back to the System Mixer, exactly where it was before hrecord
+// touched it.
 void TeardownDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles) {
     if (!handles->active || !handles->node)
         return;
@@ -772,21 +669,13 @@ void TeardownDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles) {
     roster->StopNode(handles->node->Node(), 0, true);
     snooze(50000);
 
-    media_node mixerNode;
-    bool haveMixer = roster->GetAudioMixer(&mixerNode) == B_OK;
-
-    // Disconnect our output leg (tap -> Mixer), using the roster's live view
-    // of what we're actually connected to rather than anything remembered
-    // from setup, which may have gone stale.
-    media_output tapOutput;
-    int32 c1 = 0;
-    if (haveMixer && roster->GetConnectedOutputsFor(handles->node->Node(), &tapOutput, 1, &c1) == B_OK
-            && c1 >= 1) {
-        roster->Disconnect(handles->node->Node().node, tapOutput.source, mixerNode.node,
-            tapOutput.destination);
+    if (handles->player) {
+        handles->player->Stop();
+        delete handles->player;
+        handles->player = nullptr;
     }
 
-    // Disconnect our input leg (the hijacked app -> tap).
+    // Disconnect the hijacked app from the tap.
     media_input tapInput;
     int32 c2 = 0;
     if (roster->GetConnectedInputsFor(handles->node->Node(), &tapInput, 1, &c2) == B_OK && c2 >= 1) {
@@ -801,7 +690,8 @@ void TeardownDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles) {
     // input -- we didn't retain the app's original destination.id, and the
     // Mixer treats any of its free inputs identically.
     status_t err = B_ERROR;
-    if (haveMixer) {
+    media_node mixerNode;
+    if (roster->GetAudioMixer(&mixerNode) == B_OK) {
         media_input freeInput;
         int32 freeCount = 0;
         if (roster->GetFreeInputsFor(mixerNode, &freeInput, 1, &freeCount, B_MEDIA_RAW_AUDIO) == B_OK
@@ -1061,7 +951,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.3.2";
+	    const char* localVersion = "v1.4.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -1129,9 +1019,9 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[+] Clean shutdown initiated. Finalizing output file container..." << std::endl;
 
     if (audioConnected) {
-        // Stop the tap and restore the app's direct connection to the Mixer
-        // *before* flushing the encoder, so no BufferReceived() call can
-        // race the final flush below.
+        // Stop the tap/playback and restore the app's direct connection to
+        // the Mixer *before* flushing the encoder, so no BufferReceived()
+        // call can race the final flush below.
         TeardownDesktopAudioTap(mediaRoster, &audioTap);
 
         DrainAudioFifo(&g_audioEnc, true);
