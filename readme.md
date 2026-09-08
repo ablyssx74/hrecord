@@ -188,6 +188,35 @@ concrete confirmation of a burstiness mismatch for that specific source
 (rather than something to keep guessing about from the recorded audio
 alone) and the ring size is the next thing to tune upward.
 
+**Encoding used to happen directly on the mixed-playback callback's own
+thread**, which runs under a hard deadline set by the sound driver's own
+hardware buffer depth -- e.g. Haiku's HDA driver defaults to buffers deep
+enough for tens of milliseconds of slack, but a driver tuned for low
+latency (a `play_buffer_frames`/`play_buffer_count` override in
+`hda.settings`, the kind serious real-time audio work like rakarrack
+already depends on) can bring that down to single-digit milliseconds.
+Vorbis encoding is variable-latency work (FFmpeg resampling, FIFO
+buffering, the actual codec call) with no business running under a
+deadline that tight; missing it is audible as clicking, independent of
+anything upstream, and was a real, confirmed contributor to `--allaudio`
+popping under exactly that kind of driver tuning. Encoding now happens on
+its own dedicated thread instead: the playback callback only mixes and
+hands the result to a queue (same overflow/underrun-tracked ring buffer as
+above), and a separate worker drains that queue and does the actual encode
+work with no comparable timing pressure.
+
+**A several-second-plus delay before a tapped source is first heard** is a
+separate, still-open question -- not something the fixes above address.
+The leading theory is that `--allaudio` (like the single-tap path) briefly
+stops an app's Media Kit node as part of redirecting its connection, and a
+source that's itself streaming over the network (e.g. an internet radio
+player) may treat that stop/restart as a cue to rebuffer from scratch --
+an app-side delay outside hrecord's own pipeline entirely, rather than
+anything in the mixing/encoding path. Testing that source alone (no other
+apps playing, `--audioonly` without `--allaudio`) would help confirm
+whether the delay is inherent to that app/stream rather than specific to
+tapping multiple sources at once.
+
 ## Known issue: "stale" Mixer connection
 
 Occasionally (usually after repeatedly closing and reopening whatever app is

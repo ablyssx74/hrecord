@@ -14,6 +14,7 @@
 #include <iostream>
 #include <string>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <cstdint>
 #include <cstring>
@@ -423,6 +424,15 @@ public:
     size_t UnderrunBytes() {
         std::lock_guard<std::mutex> lock(fMutex);
         return fUnderrunBytes;
+    }
+
+    // How many bytes are currently ready to Read() without zero-filling.
+    // Lets a puller drain exactly what's genuinely available on its own
+    // schedule (see MixEncodeWorkerLoop) instead of requesting a fixed
+    // chunk size and having any shortfall silently counted as underrun.
+    size_t Available() {
+        std::lock_guard<std::mutex> lock(fMutex);
+        return fAvailable;
     }
 
 private:
@@ -972,20 +982,34 @@ void TeardownDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles) {
     handles->active = false;
 }
 
+// Holds mixed-but-not-yet-encoded audio between MixedPlaybackCallback
+// (producer) and MixEncodeWorkerLoop (consumer) -- see both below.
+AudioRingBuffer g_mixEncodeQueue;
+
 // BSoundPlayer::BufferPlayerFunc used only in --allaudio mode. Unlike
 // PlaybackCallback (which just drains one ring for one hijacked app), this
 // pulls an equal-size chunk from every tapped source's own ring buffer
 // (each already resampled to the shared mix bus format by MixAndBuffer,
-// called from that source's own AudioTapNode::BufferReceived), sums them
-// into one combined chunk, and both plays that back *and* hands it to the
-// Vorbis encoder -- this single callback, on one thread, is where "all the
-// currently-playing apps" actually becomes "one mixed stream."
+// called from that source's own AudioTapNode::BufferReceived) and sums
+// them into one combined chunk -- this single callback, on one thread, is
+// where "all the currently-playing apps" actually becomes "one mixed
+// stream."
 //
 // The sum is scaled by 1/N (a plain average) rather than added outright:
 // since every individual source is itself already within [-1, 1], an
 // average of N such sources can never clip, at the cost of the mix getting
 // quieter as more sources join in. A fixed, guaranteed-safe tradeoff beats
 // a louder mix that occasionally distorts.
+//
+// This callback runs under a hard deadline set by the sound driver's own
+// hardware buffer depth -- as little as ~20ms under a low-latency driver
+// configuration (the kind serious audio work, e.g. rakarrack, already
+// tunes for). Actually encoding here used to be able to miss that
+// deadline under exactly that tuning, which is audible as clicking
+// independent of anything upstream. So this only mixes and hands the
+// result off to g_mixEncodeQueue -- fast, fixed-cost work with no
+// comparable timing risk. The actual Vorbis encode happens on its own
+// thread instead; see MixEncodeWorkerLoop.
 void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
         const media_raw_audio_format& format) {
     std::vector<AudioRingBuffer*>* sources = (std::vector<AudioRingBuffer*>*)cookie;
@@ -1008,7 +1032,37 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
     }
 
     if (g_running)
-        EncodeAudioSamples(&g_audioEnc, buffer, size, MixBusFormat());
+        g_mixEncodeQueue.Write(buffer, size);
+}
+
+// Runs on its own thread for the lifetime of an --allaudio recording,
+// draining g_mixEncodeQueue and doing the actual (variable-latency) Vorbis
+// encode work here instead of on MixedPlaybackCallback's real-time thread
+// -- see the comment there for why that matters. Reads exactly what's
+// currently available each pass (via AudioRingBuffer::Available()) rather
+// than a fixed chunk size, so catching up faster than audio arrives never
+// encodes manufactured silence into the file. Keeps draining after
+// g_running goes false for one final pass, so nothing written to the
+// queue right before shutdown is lost before main()'s own final
+// DrainAudioFifo(..., true) flush.
+void MixEncodeWorkerLoop(AudioRingBuffer* queue, AudioEncoder* enc,
+        media_raw_audio_format format) {
+    std::vector<uint8_t> chunk;
+    auto drainOnce = [&]() {
+        size_t avail = queue->Available();
+        if (avail == 0)
+            return;
+        chunk.resize(avail);
+        queue->Read(chunk.data(), chunk.size());
+        EncodeAudioSamples(enc, chunk.data(), chunk.size(), format);
+    };
+
+    while (g_running) {
+        drainOnce();
+        snooze(5000); // 5ms: frequent enough to stay well ahead of the
+                       // queue filling, with no real-time deadline to meet
+    }
+    drainOnce(); // final catch-up pass
 }
 
 // Forward-declared: SetupAllAudioTaps' own failure path below reuses this
@@ -1345,6 +1399,7 @@ int main(int argc, char* argv[]) {
     BMediaRoster* mediaRoster = BMediaRoster::Roster();
     AudioTapHandles audioTap;
     AllAudioHandles allAudioTap;
+    std::thread mixEncoderThread;
     bool audioConnected = false;
 
     if (mediaRoster == nullptr) {
@@ -1355,6 +1410,14 @@ int main(int argc, char* argv[]) {
         if (SetupAllAudioTaps(mediaRoster, &allAudioTap, &negotiated)) {
             if (SetupAudioEncoder(fmtCtx, negotiated, &g_audioEnc)) {
                 audioConnected = true;
+                // Two seconds, matching the per-tap mix ring sizing
+                // rationale (SetupAllAudioTaps) -- slack for the encode
+                // worker's own scheduling, not a real-time deadline.
+                size_t queueCapacity =
+                    (size_t)(kMixBusChannels * sizeof(float) * negotiated.frame_rate * 2.0);
+                g_mixEncodeQueue.Init(queueCapacity);
+                mixEncoderThread = std::thread(MixEncodeWorkerLoop, &g_mixEncodeQueue,
+                    &g_audioEnc, negotiated);
             } else {
                 std::cerr << "[-] Error: Audio sources tapped, but the Vorbis encoder failed to "
                     "start; recording without audio." << std::endl;
@@ -1494,7 +1557,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.6.2";
+	    const char* localVersion = "v1.6.3";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -1564,10 +1627,24 @@ int main(int argc, char* argv[]) {
         // connection to the Mixer *before* flushing the encoder, so no
         // BufferReceived()/MixedPlaybackCallback call can race the final
         // flush below.
-        if (allAudio)
+        if (allAudio) {
             TeardownAllAudioTaps(mediaRoster, &allAudioTap);
-        else
+            // No more writes into g_mixEncodeQueue past this point (the
+            // BSoundPlayer that fed it is already stopped) -- join so the
+            // worker's final catch-up pass has definitely happened before
+            // DrainAudioFifo's own flush below.
+            if (mixEncoderThread.joinable())
+                mixEncoderThread.join();
+            size_t qOverflow = g_mixEncodeQueue.OverflowBytes();
+            size_t qUnderrun = g_mixEncodeQueue.UnderrunBytes();
+            if (qOverflow > 0 || qUnderrun > 0) {
+                std::cout << "[i] Mix-to-encode queue: " << qOverflow << " bytes dropped, "
+                    << qUnderrun << " bytes silence-filled -- the encode worker fell behind or "
+                    "ran dry at some point." << std::endl;
+            }
+        } else {
             TeardownDesktopAudioTap(mediaRoster, &audioTap);
+        }
 
         DrainAudioFifo(&g_audioEnc, true);
         {
