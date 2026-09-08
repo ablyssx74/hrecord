@@ -62,6 +62,17 @@ that part isn't something the flags affect, it's on for every recording.
 `--audioonly` recordings aren't affected by these flags — there's no video
 being captured to scale or encode.
 
+**Practical ceiling:** even with the per-frame `BBitmap` allocation removed,
+some mouse-cursor lag remains while recording, at any profile. Haiku's
+`app_server` is a non-compositing window server — it draws windows and the
+cursor directly, rather than compositing pre-rendered layers the way most
+modern desktops do — so a `BScreen::ReadBitmap()` capture request still has
+to be serviced by the same code path doing that drawing, and briefly
+contends with it every time hrecord asks for a frame. That's an
+architectural property of `app_server` itself, not something fixable from
+outside it. The profiles get you the rest of the way there by controlling
+how often and how expensively that contention happens.
+
 ## How desktop-audio capture works
 
 Two earlier approaches tried to put hrecord's own Media Kit node back into
