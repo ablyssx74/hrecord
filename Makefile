@@ -1,7 +1,7 @@
 # hTV Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
-VERSION = 1.2.2
+VERSION = 1.0.3
 PACKAGE_DIR := build/package
 DUMMY_PC_PATH := $(shell pwd)/build/pkgconfig
 
@@ -41,7 +41,7 @@ LIB_PATH = -L/boot/system/lib$(LIB_ARCH_DIR) -L/boot/system/develop/lib$(LIB_ARC
 EXTRA_LIBS = $(shell $(PKG_CONFIG_CMD) --libs libavformat libavcodec libavutil libswscale libswresample) \
              -lcurl -lnetwork
 
-HAIKU_LIBS = -lbe -lmedia -ltranslation -ltracker -lshared -lroot -lpthread
+HAIKU_LIBS = -lbe -ltranslation -ltracker -lshared -lroot -lpthread
 
 CXXFLAGS += $(shell $(PKG_CONFIG_CMD) --cflags libavformat libavcodec libavutil libswscale libswresample)
 
