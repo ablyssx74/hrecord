@@ -423,9 +423,15 @@ public:
         if (fEncoder != nullptr && g_running)
             EncodeAudioSamples(fEncoder, buffer->Data(), buffer->SizeUsed(), fInput.format.u.raw_audio);
 
-        if (fOutputEnabled && fOutput.destination != media_destination::null && fBufferGroup) {
+        if (!fOutputEnabled) {
+            LogForwardIssue("output disabled by the Mixer (EnableOutput(false))");
+        } else if (fOutput.destination == media_destination::null) {
+            LogForwardIssue("not connected to the Mixer");
+        } else if (!fBufferGroup) {
+            LogForwardIssue("no buffer pool available");
+        } else {
             size_t sizeUsed = buffer->SizeUsed();
-            BBuffer* outBuffer = fBufferGroup->RequestBuffer(sizeUsed, 5000);
+            BBuffer* outBuffer = fBufferGroup->RequestBuffer(sizeUsed, 20000);
             if (outBuffer) {
                 memcpy(outBuffer->Data(), buffer->Data(), sizeUsed);
                 outBuffer->SetSizeUsed(sizeUsed);
@@ -435,8 +441,23 @@ public:
                 outHeader->size_used = sizeUsed;
                 outHeader->start_time = NextScheduleTime(inHeader->start_time, sizeUsed);
 
-                if (SendBuffer(outBuffer, fOutput.source, fOutput.destination) != B_OK)
+                status_t sendErr = SendBuffer(outBuffer, fOutput.source, fOutput.destination);
+                if (sendErr != B_OK) {
                     outBuffer->Recycle();
+                    LogForwardIssue("SendBuffer to the Mixer failed");
+                } else {
+                    if (fForwardedCount == 0) {
+                        // Confirms the tap -> Mixer pipe is actually delivering
+                        // buffers. If audio is still inaudible after this
+                        // prints, the buffers are arriving but the Mixer's new
+                        // input channel itself is muted or at zero gain --
+                        // not a forwarding bug.
+                        std::cerr << "[+] First buffer forwarded to the Mixer successfully." << std::endl;
+                    }
+                    fForwardedCount++;
+                }
+            } else {
+                LogForwardIssue("RequestBuffer timed out (buffer pool exhausted?)");
             }
         }
 
@@ -600,9 +621,24 @@ private:
         return scheduled;
     }
 
+    // Rate-limited stderr diagnostics for the forwarding leg (tap -> Mixer),
+    // so a silent-but-not-crashing recording says exactly where the audio
+    // is being lost instead of just not being audible. Capped to once a
+    // second per distinct reason so a persistent failure doesn't flood the
+    // terminal.
+    void LogForwardIssue(const char* reason) {
+        bigtime_t now = system_time();
+        if (now - fLastForwardLogTime < 1000000)
+            return;
+        fLastForwardLogTime = now;
+        std::cerr << "[!] Desktop-audio forwarding to the Mixer: " << reason << std::endl;
+    }
+
     BBufferGroup* fBufferGroup = nullptr;
     AudioEncoder* fEncoder = nullptr;
     bigtime_t fNextScheduleTime = 0;
+    bigtime_t fLastForwardLogTime = 0;
+    uint64_t fForwardedCount = 0;
     bool fOutputEnabled = true;
 };
 
@@ -1042,7 +1078,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.3.0";
+	    const char* localVersion = "v1.3.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
