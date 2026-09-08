@@ -161,6 +161,33 @@ from each source's real rate ratio instead of a flat guess, with a bounded
 drain loop as a second line of defense against any backlog compounding
 across calls.
 
+**A source whose own producer delivers audio in bursts, not a steady
+drip** -- a network radio stream doing its own internal buffering or
+rebuffering being the clearest example -- can run into a *different*
+problem than a rate mismatch: overflowing (dropping audio, heard as a pop
+at the seam) or underrunning (zero-filled gaps, heard as a blip) a per-tap
+ring buffer that's too small to absorb the burstiness, independent of
+whether the sample rate itself needed converting. hrecord can't do
+anything about jitter in how a source's own app delivers audio -- but it
+can absorb more of it: each tapped source's ring buffer is now sized for 2
+seconds of audio (up from half a second), trading a bit more live-
+monitoring lag for a lot more headroom. Each source's ring also now
+tracks how many bytes it's ever had to drop (overflow) or silence-fill
+(underrun); if either is non-zero when a session ends, hrecord prints
+which tapped app it happened to and how much, e.g.:
+
+```
+[i] Audio source "SomaFM Player": 4032 bytes dropped (arrived faster than
+the mix could take them), 0 bytes silence-filled (arrived slower, or with
+gaps, than the mix needed them) -- a likely cause of any popping or
+dropouts heard for this source.
+```
+
+If that still shows up with real numbers after the larger buffer, it's
+concrete confirmation of a burstiness mismatch for that specific source
+(rather than something to keep guessing about from the recorded audio
+alone) and the ring size is the next thing to tune upward.
+
 ## Known issue: "stale" Mixer connection
 
 Occasionally (usually after repeatedly closing and reopening whatever app is

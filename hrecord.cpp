@@ -355,6 +355,8 @@ public:
         std::lock_guard<std::mutex> lock(fMutex);
         fBuffer.assign(capacityBytes, 0);
         fWritePos = fReadPos = fAvailable = 0;
+        fOverflowBytes = 0;
+        fUnderrunBytes = 0;
     }
 
     void Write(const void* data, size_t size) {
@@ -367,6 +369,7 @@ public:
         if (size > capacity) {
             // Only the most recent `capacity` bytes can possibly fit.
             src += (size - capacity);
+            fOverflowBytes += (size - capacity);
             size = capacity;
         }
 
@@ -380,6 +383,7 @@ public:
             size_t overflow = fAvailable + size - capacity;
             fReadPos = (fReadPos + overflow) % capacity;
             fAvailable = capacity;
+            fOverflowBytes += overflow;
         } else {
             fAvailable += size;
         }
@@ -399,14 +403,34 @@ public:
             fReadPos = (fReadPos + toCopy) % capacity;
             fAvailable -= toCopy;
         }
-        if (toCopy < size)
+        if (toCopy < size) {
             memset(dst + toCopy, 0, size - toCopy);
+            fUnderrunBytes += (size - toCopy);
+        }
+    }
+
+    // Diagnostic counters: how many bytes have ever been dropped on
+    // overflow (this source producing faster than it's being drained) or
+    // zero-filled on underrun (producing slower, or with gaps, than it's
+    // being drained). Either one climbing during a session points directly
+    // at a buffering/timing mismatch as the cause of any audible
+    // pops/dropouts for that source, instead of requiring another guess
+    // from the recorded waveform alone.
+    size_t OverflowBytes() {
+        std::lock_guard<std::mutex> lock(fMutex);
+        return fOverflowBytes;
+    }
+    size_t UnderrunBytes() {
+        std::lock_guard<std::mutex> lock(fMutex);
+        return fUnderrunBytes;
     }
 
 private:
     std::mutex fMutex;
     std::vector<uint8_t> fBuffer;
     size_t fWritePos = 0, fReadPos = 0, fAvailable = 0;
+    size_t fOverflowBytes = 0;
+    size_t fUnderrunBytes = 0;
 };
 
 AudioRingBuffer g_playbackRing;
@@ -685,6 +709,7 @@ struct AllAudioTapEntry {
     AudioRingBuffer* ring = nullptr;
     media_node appNode;
     media_output originalAppOutput;
+    std::string appName = "(unknown)"; // for diagnostics only, e.g. overflow/underrun reports
 };
 
 // Everything SetupAllAudioTaps() needs to remember so TeardownAllAudioTaps()
@@ -1050,15 +1075,29 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         entry.node = tap;
         entry.resampler = resampler;
         entry.ring = new AudioRingBuffer();
-        // Same half-second sizing rationale as the single-tap ring in
-        // SetupDesktopAudioTap, just measured in bus-format bytes.
+        // Deliberately more generous than the single-tap ring's half
+        // second (see SetupDesktopAudioTap): a source whose own producer
+        // delivers audio in bursts rather than a steady drip -- a network
+        // stream doing its own internal buffering/rebuffering being the
+        // clearest example -- can overflow (dropping audio -> a pop at the
+        // seam) or underrun (zero-filled gaps -> a blip) a too-small ring
+        // well before any rate mismatch is even in play. Two seconds costs
+        // only ~1.5MB per tapped source and trades a bit more live-
+        // monitoring lag for a lot more headroom against exactly that.
         size_t ringCapacity =
-            (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * 0.5);
+            (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * 2.0);
         entry.ring->Init(ringCapacity);
         entry.appNode = appNode;
         entry.originalAppOutput = originalAppOutput;
+        {
+            live_node_info info;
+            if (roster->GetLiveNodeInfo(appNode, &info) == B_OK)
+                entry.appName = info.name;
+        }
         tap->SetMixOutput(resampler, entry.ring);
         handles->taps.push_back(entry);
+        std::cout << "[+] Tapped source #" << handles->taps.size() << ": \"" << entry.appName
+            << "\"" << std::endl;
 
         roster->StartNode(tap->Node(), 0);
         roster->StartNode(appNode, 0);
@@ -1117,6 +1156,18 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
     }
 
     for (auto& entry : handles->taps) {
+        if (entry.ring) {
+            size_t overflow = entry.ring->OverflowBytes();
+            size_t underrun = entry.ring->UnderrunBytes();
+            if (overflow > 0 || underrun > 0) {
+                std::cout << "[i] Audio source \"" << entry.appName << "\": " << overflow
+                    << " bytes dropped (arrived faster than the mix could take them), "
+                    << underrun << " bytes silence-filled (arrived slower, or with gaps, than "
+                    "the mix needed them) -- a likely cause of any popping or dropouts heard "
+                    "for this source." << std::endl;
+            }
+        }
+
         if (entry.node)
             RestoreHijackedApp(roster, entry.node, entry.appNode, entry.originalAppOutput);
         if (entry.resampler)
@@ -1443,7 +1494,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.6.1";
+	    const char* localVersion = "v1.6.2";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
