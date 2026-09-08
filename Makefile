@@ -24,7 +24,7 @@ ifeq ($(UNAME_M), BePC)
     ARCH = x86_gcc2
     LIB_ARCH_DIR = /x86
     DEFINES += -DIS_HAIKU_32BIT
-    PKG_CONFIG_CMD = x86-pkg-config
+    PKG_CONFIG_CMD = pkg-config-x86
 else
     CXX = g++
     ARCH = x86_64
