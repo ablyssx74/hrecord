@@ -205,31 +205,57 @@ hands the result to a queue (same overflow/underrun-tracked ring buffer as
 above), and a separate worker drains that queue and does the actual encode
 work with no comparable timing pressure.
 
-**A several-second-plus delay before any tapped source is first heard is
-still an open problem**, and not a small one -- on one system running at
-192kHz, deriving the mix bus rate from an already-negotiated source
-(rather than a fixed 48kHz, on the theory that requesting an unfamiliar
-rate might force a slow hardware reconfiguration) made it *worse*
-(measured at 63s, up from an earlier 10-20s), which means that theory was
-wrong or at least incomplete. Rather than guess a third time, the actual
-first-callback timing and each source's already-queued backlog are now
-logged:
+**The actual root cause of both the popping and the multi-second delay,
+found from real timing/overflow diagnostics rather than more guessing:**
+`AudioTapNode` was built untimed on purpose (`SetTimeSource(nullptr)`,
+`B_RECORDING` run mode) -- it just hands off whatever the hijacked app
+gives it, whenever, with no pacing of its own. That's fine in single-tap
+mode: nothing downstream cares about wall-clock timing, the encoder just
+processes whatever arrives. But `--allaudio` puts something real-time-paced
+downstream of it for the first time -- `MixedPlaybackCallback`, tied to
+the hardware's own clock -- and diagnostics confirmed some tapped apps
+(rakarrack running with tight, low-latency buffers was the clearest case)
+push audio to the Mixer *faster than real time*: one session showed
+**~18 million bytes (≈47 seconds of audio) continuously dropped**, not a
+one-time startup burst. With nothing pushing back on that, it just piled
+up in the per-source ring buffer -- either overflowing continuously (heard
+as popping) or, with a big enough ring to absorb it, settling into a
+fixed, ever-present backlog instead (heard as a long delay before
+anything's heard, staying exactly that far behind afterward). Widening the
+ring earlier didn't fix either -- it just traded one symptom for the
+other, which is why it measured *worse*, not better, in some tests.
+
+The real fix is backpressure: each tap now paces its own consumption of
+incoming buffers to match real time, snoozing briefly whenever it's
+running ahead. That delays `Recycle()`-ing the buffer back, which is
+exactly the signal Media Kit uses to let a producer know it can send more
+-- so an over-fast producer now gets throttled the same way it naturally
+would be if it were still connected straight to the Mixer, instead of
+being allowed to run ahead unchecked. (This intentionally doesn't just
+give the node a real time source instead, which is the more "normal" way
+Media Kit nodes stay paced -- `SetTimeSource(nullptr)` was chosen earlier
+in this project specifically to dodge a reproducible
+`BTimeSource::RealTimeFor` crash in a different, abandoned approach, and
+revisiting that wasn't worth the risk here.)
+
+The timing/backlog diagnostics that found this are still logged on every
+`--allaudio` run:
 
 ```
-[i] BSoundPlayer::Start() returned 42ms after tap setup began.
-[i] Mixed playback: first callback 58ms after tap setup began.
-    source #1 backlog already queued: 12288 bytes (~0.03s)
-    source #2 backlog already queued: 1536000 bytes (~4.00s)
+[i] BSoundPlayer::Start() returned 83ms after tap setup began.
+[i] Mixed playback: first callback 88ms after tap setup began.
+    source #1 backlog already queued: 16384 bytes (~0.0106667s)
 ```
 
-Compare the first two lines to distinguish two different problems that
-would otherwise sound identical (a long wait, then clean audio): a large
-gap between `Start()` returning and the first callback firing points at
-BSoundPlayer/Mixer/driver startup itself being slow; a *small* gap there
-but a large backlog already queued per source points at real audio piling
-up somewhere before playback ever engages, which then just takes real
-time to drain through. The per-source backlog numbers say which of the
-tapped apps (if either) is responsible.
+**A caveat for genuinely real-time use** (monitoring a live instrument
+through effects, e.g. rakarrack, while playing): pacing fixes runaway
+backlog, but the hijack-and-relay path itself (tap -> per-source ring ->
+mixed-playback ring -> Mixer) still adds more hops than a direct
+connection to the Mixer ever did, and won't reach the sub-20ms round trip
+serious live monitoring needs. If that's still not tight enough after this
+fix, the right next step is probably a different approach for that
+specific use case rather than tuning buffer sizes further -- worth
+revisiting once this fix has actually been tested.
 
 ## Known issue: "stale" Mixer connection
 
