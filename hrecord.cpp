@@ -422,6 +422,70 @@ void PlaybackCallback(void* cookie, void* buffer, size_t size,
         memset(buffer, 0, size);
 }
 
+// ============================================================================
+// --allaudio: mixing multiple simultaneously-tapped sources
+//
+// The single-tap approach above hijacks exactly one app's own connection to
+// the Mixer. --allaudio repeats that same hijack, unmodified, once per app
+// currently playing -- but that leaves N independent streams, each in
+// whatever raw format its own app happened to negotiate (rate, channel
+// count, sample encoding can all differ between apps). Rather than trying
+// to splice into the Mixer's own internal mixing (the approach that
+// crashed Haiku's Mixer control thread early on, reproducibly, and was
+// abandoned), every tapped source is independently resampled to one fixed
+// "bus" format here, then summed together entirely in hrecord's own code.
+// ============================================================================
+
+const float kMixBusRate = 48000.0f;
+const int kMixBusChannels = 2;
+
+media_raw_audio_format MixBusFormat() {
+    media_raw_audio_format fmt = media_raw_audio_format::wildcard;
+    fmt.frame_rate = kMixBusRate;
+    fmt.channel_count = kMixBusChannels;
+    fmt.format = media_raw_audio_format::B_AUDIO_FLOAT;
+    fmt.byte_order = B_MEDIA_HOST_ENDIAN;
+    fmt.buffer_size = 4096;
+    return fmt;
+}
+
+// Resamples one buffer of raw PCM, in whatever format its own source tap
+// negotiated, into the shared mix bus format (interleaved float, see
+// MixBusFormat() above) and appends the result to that tap's own ring
+// buffer -- where MixedPlaybackCallback picks it up alongside every other
+// tapped source's ring to actually build the mix. Mirrors the allocation
+// pattern EncodeAudioSamples uses above (av_samples_alloc/av_freep per
+// call) rather than a fixed-size stack buffer, for the same reason: this
+// runs on the tap's own real-time control thread, one call per incoming
+// buffer, and buffer sizes aren't bounded tightly enough to size a stack
+// array with confidence.
+void MixAndBuffer(SwrContext* swr, const void* data, size_t size,
+        const media_raw_audio_format& format, AudioRingBuffer* ring) {
+    int sampleSize = format.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
+    int bytesPerFrame = sampleSize * (int)format.channel_count;
+    if (bytesPerFrame <= 0 || !swr || !ring)
+        return;
+    int nbSamples = (int)(size / bytesPerFrame);
+    if (nbSamples <= 0)
+        return;
+
+    // A generous margin over nbSamples covers any rate-conversion growth
+    // (e.g. 44.1kHz -> 48kHz) without needing to query swr's exact ratio.
+    int maxOutSamples = nbSamples * 2 + 256;
+
+    uint8_t* converted[1] = { nullptr };
+    if (av_samples_alloc(converted, nullptr, kMixBusChannels, maxOutSamples,
+            AV_SAMPLE_FMT_FLT, 0) < 0)
+        return;
+
+    const uint8_t* inData[1] = { (const uint8_t*)data };
+    int produced = swr_convert(swr, converted, maxOutSamples, inData, nbSamples);
+    if (produced > 0)
+        ring->Write(converted[0], (size_t)produced * kMixBusChannels * sizeof(float));
+
+    av_freep(&converted[0]);
+}
+
 class AudioTapNode : public BBufferConsumer, public BMediaEventLooper {
 public:
     media_input fInput;
@@ -451,6 +515,17 @@ public:
 
     void SetEncoder(AudioEncoder* encoder) { fEncoder = encoder; }
     void SetPlaybackRing(AudioRingBuffer* ring) { fRing = ring; }
+
+    // --allaudio mode: instead of encoding/playing this source directly
+    // (below), resample it to the shared mix bus format and hand it off
+    // via its own ring buffer for MixedPlaybackCallback to combine with
+    // every other tapped source. Mutually exclusive with SetEncoder/
+    // SetPlaybackRing above -- a tap is wired up one way or the other,
+    // never both.
+    void SetMixOutput(SwrContext* resampler, AudioRingBuffer* ring) {
+        fMixResampler = resampler;
+        fMixRing = ring;
+    }
 
     // --- BMediaNode ---
     virtual BMediaAddOn* AddOn(int32* internalID) const { return nullptr; }
@@ -506,11 +581,17 @@ public:
         void* data = buffer->Data();
         size_t size = buffer->SizeUsed();
 
-        if (fEncoder != nullptr && g_running)
-            EncodeAudioSamples(fEncoder, data, size, fInput.format.u.raw_audio);
+        if (fMixResampler != nullptr && fMixRing != nullptr) {
+            // --allaudio path: this source only ever feeds the shared mix,
+            // never the encoder or a playback ring directly.
+            MixAndBuffer(fMixResampler, data, size, fInput.format.u.raw_audio, fMixRing);
+        } else {
+            if (fEncoder != nullptr && g_running)
+                EncodeAudioSamples(fEncoder, data, size, fInput.format.u.raw_audio);
 
-        if (fRing != nullptr)
-            fRing->Write(data, size);
+            if (fRing != nullptr)
+                fRing->Write(data, size);
+        }
 
         buffer->Recycle();
     }
@@ -546,6 +627,8 @@ public:
 private:
     AudioEncoder* fEncoder = nullptr;
     AudioRingBuffer* fRing = nullptr;
+    SwrContext* fMixResampler = nullptr;
+    AudioRingBuffer* fMixRing = nullptr;
 };
 
 // Everything SetupDesktopAudioTap() needs to remember so
@@ -556,6 +639,29 @@ struct AudioTapHandles {
     BSoundPlayer* player = nullptr;
     media_node appNode;
     media_output originalAppOutput; // the app's output as connected before hrecord touched it
+    bool active = false;
+};
+
+// One hijacked source within an --allaudio session -- the equivalent of
+// AudioTapHandles' node/appNode/originalAppOutput trio, plus the per-source
+// resampler and ring buffer that feed it into the shared mix (see
+// MixAndBuffer/MixedPlaybackCallback above and below).
+struct AllAudioTapEntry {
+    AudioTapNode* node = nullptr;
+    SwrContext* resampler = nullptr;
+    AudioRingBuffer* ring = nullptr;
+    media_node appNode;
+    media_output originalAppOutput;
+};
+
+// Everything SetupAllAudioTaps() needs to remember so TeardownAllAudioTaps()
+// can put every hijacked app back exactly as it found them. One shared
+// BSoundPlayer (not one per tap) drives both playback and encoding off the
+// combined mix -- see MixedPlaybackCallback.
+struct AllAudioHandles {
+    std::vector<AllAudioTapEntry> taps;
+    std::vector<AudioRingBuffer*> mixSources; // same rings as taps[].ring; the callback's cookie
+    BSoundPlayer* player = nullptr;
     bool active = false;
 };
 
@@ -576,6 +682,148 @@ void WarnStaleMediaServerState() {
         "Media Kit quirk, not something hrecord caused." << std::endl;
     std::cerr << "[!] Fix: open Media preferences and click \"Restart Media Services\", then "
         "try again." << std::endl;
+}
+
+// Finds the app currently connected at mixerInput and redirects it to a
+// freshly registered AudioTapNode, stopping just short of starting either
+// node -- the caller wires up encoding/playback/mixing first, then starts
+// both, exactly mirroring how SetupDesktopAudioTap always has. On any
+// failure the app is put back exactly as found and nullptr is returned;
+// on success, the tap is returned connected-but-stopped and *outNegotiated
+// carries whatever raw format the connection actually settled on.
+//
+// Factored out of SetupDesktopAudioTap so SetupAllAudioTaps can repeat the
+// same hijack -- the trickiest part of this whole file, all the Media Kit
+// connect/disconnect choreography and its per-step rollback -- once per
+// currently-playing app, without a second copy of it.
+AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInput,
+        media_node* outAppNode, media_output* outOriginalAppOutput,
+        media_raw_audio_format* outNegotiated) {
+    // The Mixer says something is connected at mixerInput.source -- but if
+    // that producer has since disappeared without telling the Mixer, this
+    // lookup fails even though GetConnectedInputsFor() just reported it as
+    // live. See WarnStaleMediaServerState() above for what this means.
+    media_node_id appNodeId = roster->NodeIDFor(mixerInput.source.port);
+    media_node appNode;
+    if (appNodeId < 0 || roster->GetNodeFor(appNodeId, &appNode) != B_OK) {
+        WarnStaleMediaServerState();
+        return nullptr;
+    }
+
+    media_output appOutput;
+    int32 outCount = 0;
+    if (roster->GetConnectedOutputsFor(appNode, &appOutput, 1, &outCount) != B_OK || outCount < 1
+            || appOutput.destination != mixerInput.destination) {
+        WarnStaleMediaServerState();
+        return nullptr;
+    }
+
+    AudioTapNode* tap = new AudioTapNode();
+    tap->fInput.format = appOutput.format;
+    if (roster->RegisterNode(tap) != B_OK) {
+        std::cerr << "[-] Error: Failed to register an audio tap node." << std::endl;
+        delete tap;
+        return nullptr;
+    }
+
+    // Briefly stop the app before touching its connection, so it can't push
+    // a buffer into a destination that's mid-swap.
+    roster->StopNode(appNode, 0, true);
+    snooze(50000);
+
+    if (roster->Disconnect(appOutput, mixerInput) != B_OK) {
+        std::cerr << "[-] Error: Failed to detach a playing app from the Mixer." << std::endl;
+        roster->StartNode(appNode, 0);
+        roster->ReleaseNode(tap->Node());
+        return nullptr;
+    }
+    snooze(20000);
+
+    media_format fmt = appOutput.format;
+    media_output newAppOutput;
+    media_input newTapInput;
+    status_t err = roster->Connect(appOutput.source, tap->fInput.destination, &fmt,
+        &newAppOutput, &newTapInput);
+    if (err != B_OK) {
+        std::cerr << "[-] Error: Failed to connect a playing app to its audio tap (error "
+            << err << ")." << std::endl;
+        media_format restoreFmt = appOutput.format;
+        media_output restoredOutput;
+        media_input restoredInput;
+        roster->Connect(appOutput.source, mixerInput.destination, &restoreFmt, &restoredOutput,
+            &restoredInput);
+        roster->StartNode(appNode, 0);
+        roster->ReleaseNode(tap->Node());
+        return nullptr;
+    }
+
+    *outAppNode = appNode;
+    *outOriginalAppOutput = appOutput;
+    *outNegotiated = newTapInput.format.u.raw_audio;
+    return tap; // caller wires up encoding/playback/mixing, then starts appNode + tap->Node()
+}
+
+// Undoes a successful HijackAppIntoTap() when something *after* it (encoder
+// or player setup) fails -- disconnects the tap and reconnects the app
+// straight back to the exact Mixer destination it was just freed from,
+// since that's still known good this soon after HijackAppIntoTap returned.
+// Neither node was ever started, so there's nothing to stop first.
+void UndoHijack(BMediaRoster* roster, AudioTapNode* tap, const media_node& appNode,
+        const media_output& originalAppOutput) {
+    media_input tapInput;
+    int32 c2 = 0;
+    if (roster->GetConnectedInputsFor(tap->Node(), &tapInput, 1, &c2) == B_OK && c2 >= 1) {
+        roster->Disconnect(appNode.node, tapInput.source, tap->Node().node, tapInput.destination);
+    }
+    media_format restoreFmt = originalAppOutput.format;
+    media_output restoredOutput;
+    media_input restoredInput;
+    roster->Connect(originalAppOutput.source, originalAppOutput.destination, &restoreFmt,
+        &restoredOutput, &restoredInput);
+    roster->StartNode(appNode, 0);
+    roster->ReleaseNode(tap->Node());
+}
+
+// Disconnects a running tap and reconnects its app directly back to the
+// System Mixer, exactly where it was before hrecord touched it -- used at
+// the end of a full recording session (see TeardownDesktopAudioTap /
+// TeardownAllAudioTaps below). Unlike UndoHijack, this doesn't assume the
+// app's original Mixer destination is still free (a lot may have happened
+// since), so it asks the Mixer for any free input instead. Caller must
+// already have stopped both the app and the tap.
+void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_node& appNode,
+        const media_output& originalAppOutput) {
+    media_input tapInput;
+    int32 c2 = 0;
+    if (roster->GetConnectedInputsFor(tap->Node(), &tapInput, 1, &c2) == B_OK && c2 >= 1) {
+        roster->Disconnect(appNode.node, tapInput.source, tap->Node().node, tapInput.destination);
+    }
+    roster->ReleaseNode(tap->Node());
+
+    // Reconnect the app straight to the Mixer, letting it hand back a fresh
+    // input -- we didn't retain the app's original destination.id, and the
+    // Mixer treats any of its free inputs identically.
+    status_t err = B_ERROR;
+    media_node mixerNode;
+    if (roster->GetAudioMixer(&mixerNode) == B_OK) {
+        media_input freeInput;
+        int32 freeCount = 0;
+        if (roster->GetFreeInputsFor(mixerNode, &freeInput, 1, &freeCount, B_MEDIA_RAW_AUDIO) == B_OK
+                && freeCount >= 1) {
+            media_format restoreFormat = originalAppOutput.format;
+            media_output restoredOutput;
+            media_input restoredInput;
+            err = roster->Connect(originalAppOutput.source, freeInput.destination,
+                &restoreFormat, &restoredOutput, &restoredInput);
+        }
+    }
+    if (err != B_OK) {
+        std::cerr << "[!] Warning: Could not automatically reconnect an app back to the Mixer "
+            "(error " << err << "). It may have stopped playing; restart it manually if needed."
+            << std::endl;
+    }
+
+    roster->StartNode(appNode, 0);
 }
 
 // Finds one currently-playing app and redirects its connection to the
@@ -599,68 +847,16 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
         return false;
     }
 
-    // The Mixer says something is connected at mixerInput.source -- but if
-    // that producer has since disappeared without telling the Mixer, this
-    // lookup fails even though GetConnectedInputsFor() just reported it as
-    // live. See WarnStaleMediaServerState() above for what this means.
-    media_node_id appNodeId = roster->NodeIDFor(mixerInput.source.port);
     media_node appNode;
-    if (appNodeId < 0 || roster->GetNodeFor(appNodeId, &appNode) != B_OK) {
-        WarnStaleMediaServerState();
+    media_output originalAppOutput;
+    media_raw_audio_format negotiated;
+    AudioTapNode* tap = HijackAppIntoTap(roster, mixerInput, &appNode, &originalAppOutput,
+        &negotiated);
+    if (!tap)
         return false;
-    }
-
-    media_output appOutput;
-    int32 outCount = 0;
-    if (roster->GetConnectedOutputsFor(appNode, &appOutput, 1, &outCount) != B_OK || outCount < 1
-            || appOutput.destination != mixerInput.destination) {
-        WarnStaleMediaServerState();
-        return false;
-    }
 
     handles->appNode = appNode;
-    handles->originalAppOutput = appOutput;
-
-    AudioTapNode* tap = new AudioTapNode();
-    tap->fInput.format = appOutput.format;
-    if (roster->RegisterNode(tap) != B_OK) {
-        std::cerr << "[-] Error: Failed to register the audio tap node." << std::endl;
-        delete tap;
-        return false;
-    }
-
-    // Briefly stop the app before touching its connection, so it can't push
-    // a buffer into a destination that's mid-swap.
-    roster->StopNode(appNode, 0, true);
-    snooze(50000);
-
-    if (roster->Disconnect(appOutput, mixerInput) != B_OK) {
-        std::cerr << "[-] Error: Failed to detach the playing app from the Mixer." << std::endl;
-        roster->StartNode(appNode, 0);
-        roster->ReleaseNode(tap->Node());
-        return false;
-    }
-    snooze(20000);
-
-    media_format fmt = appOutput.format;
-    media_output newAppOutput;
-    media_input newTapInput;
-    status_t err = roster->Connect(appOutput.source, tap->fInput.destination, &fmt,
-        &newAppOutput, &newTapInput);
-    if (err != B_OK) {
-        std::cerr << "[-] Error: Failed to connect the playing app to the audio tap (error "
-            << err << ")." << std::endl;
-        media_format restoreFmt = appOutput.format;
-        media_output restoredOutput;
-        media_input restoredInput;
-        roster->Connect(appOutput.source, mixerInput.destination, &restoreFmt, &restoredOutput,
-            &restoredInput);
-        roster->StartNode(appNode, 0);
-        roster->ReleaseNode(tap->Node());
-        return false;
-    }
-
-    media_raw_audio_format negotiated = newTapInput.format.u.raw_audio;
+    handles->originalAppOutput = originalAppOutput;
 
     // Size the ring buffer to hold roughly half a second of audio -- enough
     // to smooth out the difference in cadence between the app's own buffer
@@ -679,14 +875,7 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
         std::cerr << "[-] Error: Could not start local audio playback (error "
             << player->InitCheck() << ")." << std::endl;
         delete player;
-        roster->Disconnect(newAppOutput, newTapInput);
-        media_format restoreFmt = appOutput.format;
-        media_output restoredOutput;
-        media_input restoredInput;
-        roster->Connect(appOutput.source, mixerInput.destination, &restoreFmt, &restoredOutput,
-            &restoredInput);
-        roster->StartNode(appNode, 0);
-        roster->ReleaseNode(tap->Node());
+        UndoHijack(roster, tap, appNode, originalAppOutput);
         return false;
     }
     player->SetHasData(true);
@@ -720,41 +909,190 @@ void TeardownDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles) {
         handles->player = nullptr;
     }
 
-    // Disconnect the hijacked app from the tap.
-    media_input tapInput;
-    int32 c2 = 0;
-    if (roster->GetConnectedInputsFor(handles->node->Node(), &tapInput, 1, &c2) == B_OK && c2 >= 1) {
-        roster->Disconnect(handles->appNode.node, tapInput.source, handles->node->Node().node,
-            tapInput.destination);
-    }
-
-    roster->ReleaseNode(handles->node->Node());
+    RestoreHijackedApp(roster, handles->node, handles->appNode, handles->originalAppOutput);
     handles->node = nullptr;
+    handles->active = false;
+}
 
-    // Reconnect the app straight to the Mixer, letting it hand back a fresh
-    // input -- we didn't retain the app's original destination.id, and the
-    // Mixer treats any of its free inputs identically.
-    status_t err = B_ERROR;
+// BSoundPlayer::BufferPlayerFunc used only in --allaudio mode. Unlike
+// PlaybackCallback (which just drains one ring for one hijacked app), this
+// pulls an equal-size chunk from every tapped source's own ring buffer
+// (each already resampled to the shared mix bus format by MixAndBuffer,
+// called from that source's own AudioTapNode::BufferReceived), sums them
+// into one combined chunk, and both plays that back *and* hands it to the
+// Vorbis encoder -- this single callback, on one thread, is where "all the
+// currently-playing apps" actually becomes "one mixed stream."
+//
+// The sum is scaled by 1/N (a plain average) rather than added outright:
+// since every individual source is itself already within [-1, 1], an
+// average of N such sources can never clip, at the cost of the mix getting
+// quieter as more sources join in. A fixed, guaranteed-safe tradeoff beats
+// a louder mix that occasionally distorts.
+void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
+        const media_raw_audio_format& format) {
+    std::vector<AudioRingBuffer*>* sources = (std::vector<AudioRingBuffer*>*)cookie;
+    float* out = (float*)buffer;
+    size_t sampleCount = size / sizeof(float);
+    std::fill(out, out + sampleCount, 0.0f);
+
+    if (sources == nullptr || sources->empty())
+        return;
+
+    static thread_local std::vector<float> scratch;
+    if (scratch.size() < sampleCount)
+        scratch.resize(sampleCount);
+
+    float gain = 1.0f / (float)sources->size();
+    for (AudioRingBuffer* ring : *sources) {
+        ring->Read(scratch.data(), size);
+        for (size_t i = 0; i < sampleCount; i++)
+            out[i] += scratch[i] * gain;
+    }
+
+    if (g_running)
+        EncodeAudioSamples(&g_audioEnc, buffer, size, MixBusFormat());
+}
+
+// Forward-declared: SetupAllAudioTaps' own failure path below reuses this
+// rather than duplicating teardown logic.
+void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles);
+
+// Hijacks *every* currently-playing app into its own AudioTapNode (see
+// HijackAppIntoTap), each resampled to the shared mix bus format, then
+// starts one shared BSoundPlayer/MixedPlaybackCallback to combine and
+// drive them. Individual sources that fail to tap are skipped with a
+// warning rather than aborting the whole thing; failure is only returned
+// if *no* source could be tapped at all.
+bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
+        media_raw_audio_format* outFormat) {
     media_node mixerNode;
-    if (roster->GetAudioMixer(&mixerNode) == B_OK) {
-        media_input freeInput;
-        int32 freeCount = 0;
-        if (roster->GetFreeInputsFor(mixerNode, &freeInput, 1, &freeCount, B_MEDIA_RAW_AUDIO) == B_OK
-                && freeCount >= 1) {
-            media_format restoreFormat = handles->originalAppOutput.format;
-            media_output restoredOutput;
-            media_input restoredInput;
-            err = roster->Connect(handles->originalAppOutput.source, freeInput.destination,
-                &restoreFormat, &restoredOutput, &restoredInput);
-        }
-    }
-    if (err != B_OK) {
-        std::cerr << "[!] Warning: Could not automatically reconnect the app back to the Mixer "
-            "(error " << err << "). It may have stopped playing; restart it manually if needed."
-            << std::endl;
+    if (roster->GetAudioMixer(&mixerNode) != B_OK) {
+        std::cerr << "[-] Error: Could not reach the System Mixer." << std::endl;
+        return false;
     }
 
-    roster->StartNode(handles->appNode, 0);
+    const int32 kMaxSources = 32;
+    media_input mixerInputs[kMaxSources];
+    int32 inCount = 0;
+    if (roster->GetConnectedInputsFor(mixerNode, mixerInputs, kMaxSources, &inCount) != B_OK
+            || inCount < 1) {
+        std::cerr << "[-] Error: Nothing is currently playing into the System Mixer to capture. "
+            "Start playback somewhere and try again." << std::endl;
+        return false;
+    }
+
+    media_raw_audio_format busFormat = MixBusFormat();
+    AVChannelLayout busLayout;
+    av_channel_layout_default(&busLayout, kMixBusChannels);
+
+    for (int32 i = 0; i < inCount; i++) {
+        media_node appNode;
+        media_output originalAppOutput;
+        media_raw_audio_format negotiated;
+        AudioTapNode* tap = HijackAppIntoTap(roster, mixerInputs[i], &appNode,
+            &originalAppOutput, &negotiated);
+        if (!tap)
+            continue; // that source's own error was already printed; keep tapping the rest
+
+        AVChannelLayout inLayout;
+        av_channel_layout_default(&inLayout, negotiated.channel_count > 0
+            ? negotiated.channel_count : 2);
+
+        SwrContext* resampler = nullptr;
+        int swrErr = swr_alloc_set_opts2(&resampler, &busLayout, AV_SAMPLE_FMT_FLT,
+            (int)busFormat.frame_rate, &inLayout, HaikuAudioFormatToAV(negotiated.format),
+            (int)(negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100), 0, nullptr);
+        if (swrErr >= 0 && resampler)
+            swrErr = swr_init(resampler);
+        av_channel_layout_uninit(&inLayout);
+        if (swrErr < 0 || !resampler) {
+            std::cerr << "[!] Warning: Failed to set up a resampler for one audio source ("
+                << AvErr(swrErr) << "); skipping it." << std::endl;
+            if (resampler) swr_free(&resampler);
+            UndoHijack(roster, tap, appNode, originalAppOutput);
+            continue;
+        }
+
+        AllAudioTapEntry entry;
+        entry.node = tap;
+        entry.resampler = resampler;
+        entry.ring = new AudioRingBuffer();
+        // Same half-second sizing rationale as the single-tap ring in
+        // SetupDesktopAudioTap, just measured in bus-format bytes.
+        size_t ringCapacity =
+            (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * 0.5);
+        entry.ring->Init(ringCapacity);
+        entry.appNode = appNode;
+        entry.originalAppOutput = originalAppOutput;
+        tap->SetMixOutput(resampler, entry.ring);
+        handles->taps.push_back(entry);
+
+        roster->StartNode(tap->Node(), 0);
+        roster->StartNode(appNode, 0);
+    }
+    av_channel_layout_uninit(&busLayout);
+
+    if (handles->taps.empty()) {
+        std::cerr << "[-] Error: Could not tap any currently-playing app." << std::endl;
+        return false;
+    }
+
+    handles->mixSources.clear();
+    for (auto& entry : handles->taps)
+        handles->mixSources.push_back(entry.ring);
+
+    BSoundPlayer* player = new BSoundPlayer(&busFormat, "hrecord Mixed Playback",
+        MixedPlaybackCallback, nullptr, &handles->mixSources);
+    if (player->InitCheck() != B_OK) {
+        std::cerr << "[-] Error: Could not start local mixed audio playback (error "
+            << player->InitCheck() << ")." << std::endl;
+        delete player;
+        // Not active yet, but the taps above are already live -- tear them
+        // all back down through the normal path rather than duplicating it.
+        handles->active = true;
+        TeardownAllAudioTaps(roster, handles);
+        return false;
+    }
+    player->SetHasData(true);
+    player->Start();
+
+    handles->player = player;
+    handles->active = true;
+    *outFormat = busFormat;
+    std::cout << "[+] Tapped " << handles->taps.size() << " currently-playing audio source(s)."
+        << std::endl;
+    return true;
+}
+
+// Stops the shared playback, then disconnects and restores every tapped
+// app -- the --allaudio equivalent of TeardownDesktopAudioTap.
+void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
+    if (!handles->active || handles->taps.empty())
+        return;
+
+    for (auto& entry : handles->taps) {
+        roster->StopNode(entry.appNode, 0, true);
+        if (entry.node)
+            roster->StopNode(entry.node->Node(), 0, true);
+    }
+    snooze(50000);
+
+    if (handles->player) {
+        handles->player->Stop();
+        delete handles->player;
+        handles->player = nullptr;
+    }
+
+    for (auto& entry : handles->taps) {
+        if (entry.node)
+            RestoreHijackedApp(roster, entry.node, entry.appNode, entry.originalAppOutput);
+        if (entry.resampler)
+            swr_free(&entry.resampler);
+        delete entry.ring;
+    }
+
+    handles->taps.clear();
+    handles->mixSources.clear();
     handles->active = false;
 }
 
@@ -764,6 +1102,7 @@ int main(int argc, char* argv[]) {
     // --audioonly flag that restricts recording to desktop audio only.
     // ========================================================================
     bool audioOnly = false;
+    bool allAudio = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -775,6 +1114,8 @@ int main(int argc, char* argv[]) {
             // default behavior, nothing to flag
         } else if (strcmp(argv[i], "--audioonly") == 0 || strcmp(argv[i], "--audoonly") == 0) {
             audioOnly = true;
+        } else if (strcmp(argv[i], "--allaudio") == 0) {
+            allAudio = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -784,10 +1125,15 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--high") == 0) {
             profileIndex = 2;
         } else {
-            std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
-                "[--list-audio-inputs]" << std::endl;
+            std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly "
+                "[--allaudio]] [--list-audio-inputs]" << std::endl;
             return 0;
         }
+    }
+
+    if (allAudio && !audioOnly) {
+        std::cerr << "[-] Error: --allaudio requires --audioonly." << std::endl;
+        return -1;
     }
 
     const VideoProfile& profile = kVideoProfiles[profileIndex];
@@ -907,17 +1253,33 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // 5a. Hijack one currently-playing app's connection to the System Mixer,
-    // then set up the Vorbis encoder using whatever format that negotiated.
-    // If either step fails, the tap (if any) is torn back down immediately
-    // so the hijacked app is never left mid-rewire.
+    // 5a. Hijack one currently-playing app's connection to the System Mixer
+    // (or, with --allaudio, every currently-playing app at once -- see
+    // SetupAllAudioTaps), then set up the Vorbis encoder using whatever
+    // format that negotiated. If any step fails, whatever was tapped is torn
+    // back down immediately so no hijacked app is ever left mid-rewire.
     BMediaRoster* mediaRoster = BMediaRoster::Roster();
     AudioTapHandles audioTap;
+    AllAudioHandles allAudioTap;
     bool audioConnected = false;
 
     if (mediaRoster == nullptr) {
         std::cerr << "[!] Warning: Could not reach the media_server; recording without audio."
             << std::endl;
+    } else if (allAudio) {
+        media_raw_audio_format negotiated;
+        if (SetupAllAudioTaps(mediaRoster, &allAudioTap, &negotiated)) {
+            if (SetupAudioEncoder(fmtCtx, negotiated, &g_audioEnc)) {
+                audioConnected = true;
+            } else {
+                std::cerr << "[-] Error: Audio sources tapped, but the Vorbis encoder failed to "
+                    "start; recording without audio." << std::endl;
+                TeardownAllAudioTaps(mediaRoster, &allAudioTap);
+            }
+        } else {
+            std::cerr << "[!] Warning: Could not set up desktop-audio capture; recording without "
+                "audio." << std::endl;
+        }
     } else {
         media_raw_audio_format negotiated;
         if (SetupDesktopAudioTap(mediaRoster, &audioTap, &negotiated)) {
@@ -1048,7 +1410,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.5.1";
+	    const char* localVersion = "v1.6.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -1114,10 +1476,14 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[+] Clean shutdown initiated. Finalizing output file container..." << std::endl;
 
     if (audioConnected) {
-        // Stop the tap/playback and restore the app's direct connection to
-        // the Mixer *before* flushing the encoder, so no BufferReceived()
-        // call can race the final flush below.
-        TeardownDesktopAudioTap(mediaRoster, &audioTap);
+        // Stop the tap(s)/playback and restore the app(s)' direct
+        // connection to the Mixer *before* flushing the encoder, so no
+        // BufferReceived()/MixedPlaybackCallback call can race the final
+        // flush below.
+        if (allAudio)
+            TeardownAllAudioTaps(mediaRoster, &allAudioTap);
+        else
+            TeardownDesktopAudioTap(mediaRoster, &audioTap);
 
         DrainAudioFifo(&g_audioEnc, true);
         {
