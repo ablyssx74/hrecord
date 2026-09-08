@@ -470,12 +470,24 @@ void PlaybackCallback(void* cookie, void* buffer, size_t size,
 // "bus" format here, then summed together entirely in hrecord's own code.
 // ============================================================================
 
-const float kMixBusRate = 48000.0f;
+const float kMixBusRate = 48000.0f; // fallback only, if no tapped source ever reports a usable rate
 const int kMixBusChannels = 2;
+
+// The bus rate actually in use for a session -- set once, in
+// SetupAllAudioTaps, from whichever tapped source is the first to
+// successfully connect. That rate is, by definition, one the Mixer/driver
+// already accepted without any reconfiguration (the source was already
+// playing through it before hrecord touched anything); requesting a fixed
+// rate of our own choosing instead risked asking the driver to switch
+// rates out from under an already-locked hardware clock domain (e.g. a
+// system with its native rate set to 192kHz in Media preferences) -- a
+// real, plausible cause of a multi-second startup stall before any audio
+// becomes audible. Read only after SetupAllAudioTaps has run.
+float g_mixBusRate = kMixBusRate;
 
 media_raw_audio_format MixBusFormat() {
     media_raw_audio_format fmt = media_raw_audio_format::wildcard;
-    fmt.frame_rate = kMixBusRate;
+    fmt.frame_rate = g_mixBusRate;
     fmt.channel_count = kMixBusChannels;
     fmt.format = media_raw_audio_format::B_AUDIO_FLOAT;
     fmt.byte_order = B_MEDIA_HOST_ENDIAN;
@@ -516,7 +528,7 @@ void MixAndBuffer(SwrContext* swr, const void* data, size_t size,
     // chopping once the ring runs dry between those delayed, bursty
     // catch-ups -- exactly what looks like "sample mismatch" but is
     // actually just an undersized buffer here.
-    double ratio = (format.frame_rate > 0) ? ((double)kMixBusRate / format.frame_rate) : 1.0;
+    double ratio = (format.frame_rate > 0) ? ((double)g_mixBusRate / format.frame_rate) : 1.0;
     int maxOutSamples = (int)(nbSamples * ratio * 1.2) + 256;
 
     uint8_t* converted[1] = { nullptr };
@@ -1093,7 +1105,8 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         return false;
     }
 
-    media_raw_audio_format busFormat = MixBusFormat();
+    media_raw_audio_format busFormat = MixBusFormat(); // .frame_rate here is just the fallback
+    bool busRateChosen = false;
     AVChannelLayout busLayout;
     av_channel_layout_default(&busLayout, kMixBusChannels);
 
@@ -1105,6 +1118,16 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
             &originalAppOutput, &negotiated);
         if (!tap)
             continue; // that source's own error was already printed; keep tapping the rest
+
+        if (!busRateChosen) {
+            // Lock the bus rate to whatever this first successfully
+            // tapped source already negotiated (see g_mixBusRate above)
+            // before setting up its resampler below, so even this first
+            // source picks up the real rate rather than the fallback.
+            busFormat.frame_rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : kMixBusRate;
+            g_mixBusRate = busFormat.frame_rate;
+            busRateChosen = true;
+        }
 
         AVChannelLayout inLayout;
         av_channel_layout_default(&inLayout, negotiated.channel_count > 0
@@ -1557,7 +1580,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.6.3";
+	    const char* localVersion = "v1.6.4";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),

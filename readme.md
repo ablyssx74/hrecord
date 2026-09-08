@@ -205,17 +205,22 @@ hands the result to a queue (same overflow/underrun-tracked ring buffer as
 above), and a separate worker drains that queue and does the actual encode
 work with no comparable timing pressure.
 
-**A several-second-plus delay before a tapped source is first heard** is a
-separate, still-open question -- not something the fixes above address.
-The leading theory is that `--allaudio` (like the single-tap path) briefly
-stops an app's Media Kit node as part of redirecting its connection, and a
-source that's itself streaming over the network (e.g. an internet radio
-player) may treat that stop/restart as a cue to rebuffer from scratch --
-an app-side delay outside hrecord's own pipeline entirely, rather than
-anything in the mixing/encoding path. Testing that source alone (no other
-apps playing, `--audioonly` without `--allaudio`) would help confirm
-whether the delay is inherent to that app/stream rather than specific to
-tapping multiple sources at once.
+**A several-second-plus delay before any tapped source is first heard**,
+seen even by users on Haiku's default audio settings (not just a
+low-latency-tuned one), pointed at something in `--allaudio`'s own setup
+rather than any one app's behavior. The mix bus format was requesting a
+fixed 48kHz from BSoundPlayer regardless of what the system's audio
+hardware was actually configured for -- on a system with its native rate
+set to something else in Media preferences (192kHz, say), that's asking
+the driver to switch an already-locked hardware clock domain out from
+under itself, which some audio codecs take real, non-trivial time to do.
+The bus rate is now chosen from whichever tapped source is the first to
+successfully connect, instead of a fixed value -- that rate is, by
+definition, one the Mixer/driver already accepted without any
+reconfiguration, since the source was already playing through it before
+hrecord touched anything. This is the same "just use whatever the app
+already negotiated" approach the single-tap path has always used, now
+applied to the shared mix bus too.
 
 ## Known issue: "stale" Mixer connection
 
