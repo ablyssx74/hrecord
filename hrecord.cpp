@@ -34,11 +34,34 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
-// Global configurations
-const int TARGET_FPS = 30;
-const int FRAME_DELAY = 1000000 / TARGET_FPS; // Microseconds (33.3ms)
-
 bool g_running = true;
+
+// ============================================================================
+// Screen recording quality profiles
+//
+// Capturing and MJPEG-encoding the whole screen at native resolution, every
+// frame, at 30fps with no cap on either was consistently pegging a full CPU
+// core -- enough to make the mouse visibly lag, since Haiku's own input/
+// compositing work was fighting hrecord for that core. Frame rate and
+// capture resolution are what actually drive that cost (both the sws_scale
+// colorspace conversion and the MJPEG encode itself are roughly linear in
+// pixel count and frame count), so those are the two levers each profile
+// tunes; JPEG quality is varied alongside them mostly because it's the
+// expected shape of a "quality" profile and it does trade off output size.
+// ============================================================================
+struct VideoProfile {
+    const char* name;
+    int fps;
+    int maxDimension; // longest edge, in pixels; 0 = record at native resolution
+    int swsFlags;      // sws_scale algorithm: cheaper flags cost less CPU per frame
+    int jpegQScale;    // FFmpeg constant-quantizer scale, 1 (best) .. 31 (worst)
+};
+
+const VideoProfile kVideoProfiles[3] = {
+    { "low",    15, 1280, SWS_FAST_BILINEAR, 20 },
+    { "medium", 24, 1600, SWS_BILINEAR,      10 },
+    { "high",   30, 0,    SWS_BICUBIC,        3 },
+};
 
 // Guards every write to the shared AVFormatContext (avformat_write_header,
 // av_interleaved_write_frame, av_write_trailer) since the video frames are
@@ -743,6 +766,7 @@ int main(int argc, char* argv[]) {
     bool audioOnly = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
+    int profileIndex = 1; // default: medium
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "stop") == 0) {
@@ -753,11 +777,20 @@ int main(int argc, char* argv[]) {
             audioOnly = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
+        } else if (strcmp(argv[i], "--low") == 0) {
+            profileIndex = 0;
+        } else if (strcmp(argv[i], "--medium") == 0) {
+            profileIndex = 1;
+        } else if (strcmp(argv[i], "--high") == 0) {
+            profileIndex = 2;
         } else {
-            std::cout << "Usage: hrecord [start|stop] [--audioonly] [--list-audio-inputs]" << std::endl;
+            std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
+                "[--list-audio-inputs]" << std::endl;
             return 0;
         }
     }
+
+    const VideoProfile& profile = kVideoProfiles[profileIndex];
 
     // ========================================================================
     // FIXED SIGNAL CONTROLLER: Uses absolute kernel execution paths
@@ -831,7 +864,8 @@ int main(int argc, char* argv[]) {
     // 4. Query Desktop Size (skipped entirely in --audioonly mode)
     BScreen screen(B_MAIN_SCREEN_ID);
     BRect screenFrame;
-    int width = 0, height = 0;
+    int width = 0, height = 0;   // native screen size -- what's actually captured
+    int outWidth = 0, outHeight = 0; // encode size -- what the profile scales down to
     if (!audioOnly) {
         if (!screen.IsValid()) {
             std::cerr << "[-] Error: Failed to initialize Haiku native BScreen handler." << std::endl;
@@ -840,6 +874,20 @@ int main(int argc, char* argv[]) {
         screenFrame = screen.Frame();
         width = screenFrame.IntegerWidth() + 1;
         height = screenFrame.IntegerHeight() + 1;
+
+        outWidth = width;
+        outHeight = height;
+        int longEdge = std::max(width, height);
+        if (profile.maxDimension > 0 && longEdge > profile.maxDimension) {
+            double scale = (double)profile.maxDimension / longEdge;
+            outWidth = (int)(width * scale);
+            outHeight = (int)(height * scale);
+        }
+        // YUV420 needs even dimensions for its chroma subsampling.
+        outWidth -= outWidth % 2;
+        outHeight -= outHeight % 2;
+        if (outWidth < 2) outWidth = 2;
+        if (outHeight < 2) outHeight = 2;
     }
 
     // 5. Build FFmpeg Container and Muxing Pipeline
@@ -915,13 +963,24 @@ int main(int argc, char* argv[]) {
         }
 
         videoCodecCtx = avcodec_alloc_context3(codec);
-        videoCodecCtx->width = width;
-        videoCodecCtx->height = height;
+        videoCodecCtx->width = outWidth;
+        videoCodecCtx->height = outHeight;
 
         // Set time_base to microseconds for precision real-world timing matching
         videoCodecCtx->time_base = {1, 1000000};
-        videoCodecCtx->framerate = {TARGET_FPS, 1};
+        videoCodecCtx->framerate = {profile.fps, 1};
         videoCodecCtx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+
+        // Constant-quantizer JPEG quality, tuned per profile (see kVideoProfiles).
+        videoCodecCtx->flags |= AV_CODEC_FLAG_QSCALE;
+        videoCodecCtx->global_quality = FF_QP2LAMBDA * profile.jpegQScale;
+
+        // MJPEG is intra-only, so slice threading parallelizes cleanly across
+        // cores instead of the single-threaded encode this used to be -- a
+        // second lever (independent of the profile) against a saturated core
+        // making the rest of the system feel sluggish while recording.
+        videoCodecCtx->thread_type = FF_THREAD_SLICE;
+        videoCodecCtx->thread_count = 0; // let FFmpeg pick based on available cores
 
         if (avcodec_open2(videoCodecCtx, codec, nullptr) < 0) {
             std::cerr << "[-] Error: Cannot open video encoder." << std::endl;
@@ -950,9 +1009,9 @@ int main(int argc, char* argv[]) {
     if (!audioOnly) {
         encodingFrame = av_frame_alloc();
         encodingFrame->format = videoCodecCtx->pix_fmt;
-        encodingFrame->width = width;
-        encodingFrame->height = height;
-        if (av_image_alloc(encodingFrame->data, encodingFrame->linesize, width, height,
+        encodingFrame->width = outWidth;
+        encodingFrame->height = outHeight;
+        if (av_image_alloc(encodingFrame->data, encodingFrame->linesize, outWidth, outHeight,
                 videoCodecCtx->pix_fmt, 32) < 0) {
             std::cerr << "[-] Error: Could not allocate raw video image buffers." << std::endl;
             return -1;
@@ -973,7 +1032,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.4.1";
+	    const char* localVersion = "v1.5.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -994,6 +1053,7 @@ int main(int argc, char* argv[]) {
             snooze(200000);
         }
     } else {
+        int frameDelay = 1000000 / profile.fps; // microseconds per frame at this profile's fps
         while (g_running) {
             bigtime_t loopIterationStart = system_time();
 
@@ -1001,8 +1061,8 @@ int main(int argc, char* argv[]) {
                 void* pixelBuffer = screenBitmap->Bits();
 
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                                              width, height, videoCodecCtx->pix_fmt,
-                                              SWS_BICUBIC, nullptr, nullptr, nullptr);
+                                              outWidth, outHeight, videoCodecCtx->pix_fmt,
+                                              profile.swsFlags, nullptr, nullptr, nullptr);
 
                 uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                 int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
@@ -1029,8 +1089,8 @@ int main(int argc, char* argv[]) {
             }
 
             bigtime_t loopIterationElapsed = system_time() - loopIterationStart;
-            if (loopIterationElapsed < FRAME_DELAY) {
-                snooze(FRAME_DELAY - loopIterationElapsed);
+            if (loopIterationElapsed < frameDelay) {
+                snooze(frameDelay - loopIterationElapsed);
             } else {
                 snooze(1000);
             }
