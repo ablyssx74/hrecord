@@ -664,6 +664,65 @@ public:
             // --allaudio path: this source only ever feeds the shared mix,
             // never the encoder or a playback ring directly.
             MixAndBuffer(fMixResampler, data, size, fInput.format.u.raw_audio, fMixRing);
+
+            // This node is deliberately untimed (SetTimeSource(nullptr),
+            // B_RECORDING run mode -- see the constructor) so it just
+            // takes whatever the hijacked app hands it, whenever, with no
+            // scheduling of its own. That's fine in single-tap mode: the
+            // encoder just processes whatever arrives, with nothing
+            // downstream that cares about wall-clock pacing. But in
+            // --allaudio mode there IS something real-time-paced
+            // downstream now: MixedPlaybackCallback, tied to the
+            // hardware's own clock. If the hijacked app pushes audio
+            // faster than real time -- confirmed happening here, tens of
+            // *millions* of bytes continuously dropped in one session,
+            // not a one-time burst -- nothing was pushing back on it, and
+            // it just piled up in fMixRing, either overflowing
+            // continuously (heard as popping) or, with a big enough ring
+            // to absorb it, settling into a fixed, ever-present backlog
+            // instead (heard as several seconds of pure delay before
+            // anything is heard, and while it's not overflowing right at
+            // that moment, everything after is still exactly ring-size
+            // behind). Neither is actually fixed by resizing the ring --
+            // that only changes which of the two symptoms you get.
+            //
+            // The actual fix is real backpressure: pace this tap's own
+            // consumption to real time so the *producer* is throttled
+            // instead, the same way it naturally would be were it still
+            // connected straight to the Mixer. Delaying Recycle() below
+            // is what does that -- it's the signal the Media Kit uses to
+            // let a producer know it can send more.
+            //
+            // This deliberately doesn't just give the node a real time
+            // source instead (the "normal" way Media Kit nodes stay
+            // paced) -- SetTimeSource(nullptr) was chosen earlier in this
+            // project specifically to avoid a reproducible
+            // BTimeSource::RealTimeFor crash in a different (now-abandoned)
+            // approach, and revisiting that tradeoff isn't worth the risk
+            // here when a simple snooze() achieves the same effect.
+            const media_raw_audio_format& fmt = fInput.format.u.raw_audio;
+            int sampleSize = fmt.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
+            int bytesPerFrame = sampleSize * (int)fmt.channel_count;
+            if (bytesPerFrame > 0 && fmt.frame_rate > 0) {
+                int nbSamples = (int)(size / bytesPerFrame);
+                bigtime_t bufferDurationUs = (bigtime_t)(nbSamples * 1000000.0 / fmt.frame_rate);
+
+                bigtime_t now = system_time();
+                if (fPacingStartTime == 0)
+                    fPacingStartTime = now;
+                fPacedDurationUs += bufferDurationUs;
+
+                bigtime_t aheadBy = fPacedDurationUs - (now - fPacingStartTime);
+                if (aheadBy > 0) {
+                    // Cap a single snooze so an unusual burst (e.g. right
+                    // at startup) corrects gradually over a few calls
+                    // instead of blocking this thread -- and so anything
+                    // else it needs to handle (a stop request included)
+                    // -- for a long single stretch.
+                    const bigtime_t kMaxSnooze = 200000; // 200ms
+                    snooze(std::min(aheadBy, kMaxSnooze));
+                }
+            }
         } else {
             if (fEncoder != nullptr && g_running)
                 EncodeAudioSamples(fEncoder, data, size, fInput.format.u.raw_audio);
@@ -708,6 +767,11 @@ private:
     AudioRingBuffer* fRing = nullptr;
     SwrContext* fMixResampler = nullptr;
     AudioRingBuffer* fMixRing = nullptr;
+
+    // --allaudio pacing state (see BufferReceived) -- unused, and so
+    // harmless, in single-tap mode.
+    bigtime_t fPacingStartTime = 0;
+    bigtime_t fPacedDurationUs = 0;
 };
 
 // Everything SetupDesktopAudioTap() needs to remember so
@@ -1617,7 +1681,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.6.5";
+	    const char* localVersion = "v1.6.6";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
