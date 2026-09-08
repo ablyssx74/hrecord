@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly [--allaudio]] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -19,7 +19,11 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--list-audio-inputs]
 - `hrecord start --audioonly` — records desktop audio only (no screen
   capture) to `/boot/home/hrecord_capture.ogg`, an Ogg/Vorbis file. Both Ogg
   and Vorbis are open, royalty-free formats, so this carries none of the
-  licensing baggage a proprietary audio codec would.
+  licensing baggage a proprietary audio codec would. Taps one currently
+  playing app (see "How desktop-audio capture works" below).
+- `hrecord start --audioonly --allaudio` — same as above, but taps *every*
+  app currently playing sound and mixes them together, instead of just one.
+  See "Recording every audio source at once" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -112,6 +116,38 @@ being audible until it's restarted (or, if needed, Media preferences'
 If nothing is currently playing when hrecord starts, it records video only
 (with a warning) in the default mode, or fails outright for `--audioonly`
 since there'd be nothing to capture.
+
+## Recording every audio source at once (`--allaudio`)
+
+The single-tap approach above hijacks exactly one app's own connection to
+the Mixer. `--allaudio` repeats that same hijack, completely unmodified,
+once for *every* app currently playing sound — but that leaves N
+independent streams, each in whatever raw format its own app happened to
+negotiate (sample rate, channel count, and sample encoding can all differ
+between apps). Rather than trying to splice into the Mixer's own internal
+mixing (the approach that crashed Haiku's Mixer control thread early on,
+reproducibly, and was abandoned for exactly that reason — see above), each
+tapped source is independently resampled to one fixed format (48kHz stereo
+float) and then summed together entirely in hrecord's own code. One shared
+`BSoundPlayer` plays back that combined mix and feeds it to the Vorbis
+encoder, instead of one per source.
+
+The mix is a plain average (divide the sum by however many sources are
+tapped), not a straight sum — since every individual source is already
+within its own valid range, an average of N sources can never clip, at the
+cost of getting quieter as more apps join in. That's a deliberate tradeoff:
+a guaranteed-safe mix over a louder one that occasionally distorts.
+
+If any individual app can't be tapped (stale Mixer state, a failed
+connection), it's skipped with a warning and the rest continue; the whole
+thing only fails if *no* source could be tapped at all. On shutdown, every
+tapped app is restored directly to the Mixer, the same way the single-tap
+path already does.
+
+**Not yet tested on real Haiku hardware.** This was built and reviewed
+carefully against Haiku's Media Kit source, but --allaudio hasn't actually
+been run yet — if the mix sounds off (too quiet, distorted, or silent),
+that's the first thing to report back.
 
 ## Known issue: "stale" Mixer connection
 
