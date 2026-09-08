@@ -161,6 +161,67 @@ from each source's real rate ratio instead of a flat guess, with a bounded
 drain loop as a second line of defense against any backlog compounding
 across calls.
 
+**A source whose own producer delivers audio in bursts, not a steady
+drip** -- a network radio stream doing its own internal buffering or
+rebuffering being the clearest example -- can run into a *different*
+problem than a rate mismatch: overflowing (dropping audio, heard as a pop
+at the seam) or underrunning (zero-filled gaps, heard as a blip) a per-tap
+ring buffer that's too small to absorb the burstiness, independent of
+whether the sample rate itself needed converting. hrecord can't do
+anything about jitter in how a source's own app delivers audio -- but it
+can absorb more of it: each tapped source's ring buffer is now sized for 2
+seconds of audio (up from half a second), trading a bit more live-
+monitoring lag for a lot more headroom. Each source's ring also now
+tracks how many bytes it's ever had to drop (overflow) or silence-fill
+(underrun); if either is non-zero when a session ends, hrecord prints
+which tapped app it happened to and how much, e.g.:
+
+```
+[i] Audio source "SomaFM Player": 4032 bytes dropped (arrived faster than
+the mix could take them), 0 bytes silence-filled (arrived slower, or with
+gaps, than the mix needed them) -- a likely cause of any popping or
+dropouts heard for this source.
+```
+
+If that still shows up with real numbers after the larger buffer, it's
+concrete confirmation of a burstiness mismatch for that specific source
+(rather than something to keep guessing about from the recorded audio
+alone) and the ring size is the next thing to tune upward.
+
+**Encoding used to happen directly on the mixed-playback callback's own
+thread**, which runs under a hard deadline set by the sound driver's own
+hardware buffer depth -- e.g. Haiku's HDA driver defaults to buffers deep
+enough for tens of milliseconds of slack, but a driver tuned for low
+latency (a `play_buffer_frames`/`play_buffer_count` override in
+`hda.settings`, the kind serious real-time audio work like rakarrack
+already depends on) can bring that down to single-digit milliseconds.
+Vorbis encoding is variable-latency work (FFmpeg resampling, FIFO
+buffering, the actual codec call) with no business running under a
+deadline that tight; missing it is audible as clicking, independent of
+anything upstream, and was a real, confirmed contributor to `--allaudio`
+popping under exactly that kind of driver tuning. Encoding now happens on
+its own dedicated thread instead: the playback callback only mixes and
+hands the result to a queue (same overflow/underrun-tracked ring buffer as
+above), and a separate worker drains that queue and does the actual encode
+work with no comparable timing pressure.
+
+**A several-second-plus delay before any tapped source is first heard**,
+seen even by users on Haiku's default audio settings (not just a
+low-latency-tuned one), pointed at something in `--allaudio`'s own setup
+rather than any one app's behavior. The mix bus format was requesting a
+fixed 48kHz from BSoundPlayer regardless of what the system's audio
+hardware was actually configured for -- on a system with its native rate
+set to something else in Media preferences (192kHz, say), that's asking
+the driver to switch an already-locked hardware clock domain out from
+under itself, which some audio codecs take real, non-trivial time to do.
+The bus rate is now chosen from whichever tapped source is the first to
+successfully connect, instead of a fixed value -- that rate is, by
+definition, one the Mixer/driver already accepted without any
+reconfiguration, since the source was already playing through it before
+hrecord touched anything. This is the same "just use whatever the app
+already negotiated" approach the single-tap path has always used, now
+applied to the shared mix bus too.
+
 ## Known issue: "stale" Mixer connection
 
 Occasionally (usually after repeatedly closing and reopening whatever app is
