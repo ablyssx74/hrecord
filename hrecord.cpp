@@ -1016,6 +1016,22 @@ int main(int argc, char* argv[]) {
             std::cerr << "[-] Error: Could not allocate raw video image buffers." << std::endl;
             return -1;
         }
+
+        // Allocate the capture bitmap once and reuse it every frame via
+        // ReadBitmap() below, instead of calling GetBitmap() per frame.
+        // GetBitmap() allocates a brand-new BBitmap (and the shared memory
+        // area app_server backs it with) on every single call -- that
+        // alloc/IPC round trip at full native resolution, every frame
+        // regardless of the chosen profile, turned out to be the actual
+        // bottleneck causing the sluggishness/mouse lag: the profiles only
+        // ever changed downstream scaling/encoding cost, never this. A
+        // single long-lived bitmap that app_server just refills in place
+        // removes that per-frame allocation entirely.
+        screenBitmap = new BBitmap(screenFrame, screen.ColorSpace());
+        if (screenBitmap->InitCheck() != B_OK) {
+            std::cerr << "[-] Error: Could not allocate the screen capture bitmap." << std::endl;
+            return -1;
+        }
     }
 
     if (audioOnly) {
@@ -1032,7 +1048,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.5.0";
+	    const char* localVersion = "v1.5.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -1057,7 +1073,7 @@ int main(int argc, char* argv[]) {
         while (g_running) {
             bigtime_t loopIterationStart = system_time();
 
-            if (screen.GetBitmap(&screenBitmap, false, &screenFrame) == B_OK && screenBitmap != nullptr) {
+            if (screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK) {
                 void* pixelBuffer = screenBitmap->Bits();
 
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
@@ -1083,9 +1099,6 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
-
-                delete screenBitmap;
-                screenBitmap = nullptr;
             }
 
             bigtime_t loopIterationElapsed = system_time() - loopIterationStart;
@@ -1134,6 +1147,8 @@ int main(int argc, char* argv[]) {
         av_frame_free(&encodingFrame);
         avcodec_free_context(&videoCodecCtx);
         if (swsCtx) sws_freeContext(swsCtx);
+        delete screenBitmap;
+        screenBitmap = nullptr;
     }
 
     av_write_trailer(fmtCtx);
