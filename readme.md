@@ -205,22 +205,31 @@ hands the result to a queue (same overflow/underrun-tracked ring buffer as
 above), and a separate worker drains that queue and does the actual encode
 work with no comparable timing pressure.
 
-**A several-second-plus delay before any tapped source is first heard**,
-seen even by users on Haiku's default audio settings (not just a
-low-latency-tuned one), pointed at something in `--allaudio`'s own setup
-rather than any one app's behavior. The mix bus format was requesting a
-fixed 48kHz from BSoundPlayer regardless of what the system's audio
-hardware was actually configured for -- on a system with its native rate
-set to something else in Media preferences (192kHz, say), that's asking
-the driver to switch an already-locked hardware clock domain out from
-under itself, which some audio codecs take real, non-trivial time to do.
-The bus rate is now chosen from whichever tapped source is the first to
-successfully connect, instead of a fixed value -- that rate is, by
-definition, one the Mixer/driver already accepted without any
-reconfiguration, since the source was already playing through it before
-hrecord touched anything. This is the same "just use whatever the app
-already negotiated" approach the single-tap path has always used, now
-applied to the shared mix bus too.
+**A several-second-plus delay before any tapped source is first heard is
+still an open problem**, and not a small one -- on one system running at
+192kHz, deriving the mix bus rate from an already-negotiated source
+(rather than a fixed 48kHz, on the theory that requesting an unfamiliar
+rate might force a slow hardware reconfiguration) made it *worse*
+(measured at 63s, up from an earlier 10-20s), which means that theory was
+wrong or at least incomplete. Rather than guess a third time, the actual
+first-callback timing and each source's already-queued backlog are now
+logged:
+
+```
+[i] BSoundPlayer::Start() returned 42ms after tap setup began.
+[i] Mixed playback: first callback 58ms after tap setup began.
+    source #1 backlog already queued: 12288 bytes (~0.03s)
+    source #2 backlog already queued: 1536000 bytes (~4.00s)
+```
+
+Compare the first two lines to distinguish two different problems that
+would otherwise sound identical (a long wait, then clean audio): a large
+gap between `Start()` returning and the first callback firing points at
+BSoundPlayer/Mixer/driver startup itself being slow; a *small* gap there
+but a large backlog already queued per source points at real audio piling
+up somewhere before playback ever engages, which then just takes real
+time to drain through. The per-source backlog numbers say which of the
+tapped apps (if either) is responsible.
 
 ## Known issue: "stale" Mixer connection
 
