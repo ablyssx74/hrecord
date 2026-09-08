@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--audioonly] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -25,6 +25,27 @@ hrecord [start|stop] [--audioonly] [--list-audio-inputs]
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
   System Mixer (i.e. currently playing sound). `--audioonly` needs at least
   one.
+
+## Screen recording quality profiles
+
+Capturing and MJPEG-encoding the full screen every frame at 30fps, uncapped,
+was consistently pegging a full CPU core — enough that the mouse itself
+would visibly lag, since Haiku's own input/compositing work was fighting
+hrecord for that core. Three profiles trade recording quality for headroom:
+
+| Profile | Flag | FPS | Max resolution (longest edge) | Notes |
+|---|---|---|---|---|
+| Low | `--low` | 15 | 1280px | Cheapest scaling algorithm, most compression. Best choice on slower hardware or when you just need a legible reference recording. |
+| Medium | `--medium` (default) | 24 | 1600px | Balanced; a reasonable default for most machines. |
+| High | `--high` | 30 | native (no downscale) | Full native resolution and framerate, sharpest output, most CPU. |
+
+`hrecord start` with no profile flag uses Medium. All three profiles also
+benefit from MJPEG slice-threading, which spreads the actual JPEG encode
+work across available CPU cores regardless of which profile is picked —
+that part isn't something the flags affect, it's on for every recording.
+
+`--audioonly` recordings aren't affected by these flags — there's no video
+being captured to scale or encode.
 
 ## How desktop-audio capture works
 
