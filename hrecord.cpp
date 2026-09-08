@@ -439,7 +439,17 @@ public:
                 media_header* outHeader = outBuffer->Header();
                 outHeader->type = B_MEDIA_RAW_AUDIO;
                 outHeader->size_used = sizeUsed;
-                outHeader->start_time = NextScheduleTime(inHeader->start_time, sizeUsed);
+                // Forward the app's own timestamp unchanged -- we don't
+                // resample or otherwise alter this audio, so it's already
+                // the correct performance time for this exact data. The
+                // Mixer places incoming audio into its output ring buffer
+                // by this timestamp (frames_for_duration(...) %
+                // ringBufferFrameCount in its own source), so a synthesized
+                // timestamp that doesn't line up with the app's real timeline
+                // lands the audio at the wrong offset -- silently, with no
+                // error back to us. That was true of an earlier version of
+                // this method that tried to build its own schedule.
+                outHeader->start_time = inHeader->start_time;
 
                 status_t sendErr = SendBuffer(outBuffer, fOutput.source, fOutput.destination);
                 if (sendErr != B_OK) {
@@ -595,32 +605,6 @@ public:
             bigtime_t newLatency, uint32 flags) {}
 
 private:
-    // Builds an output timeline that tracks the hijacked app's own buffer
-    // timestamps but free-runs smoothly between them, rather than either
-    // blindly reusing a source timestamp our downstream connection doesn't
-    // share a clock with, or drifting forever unchecked.
-    bigtime_t NextScheduleTime(bigtime_t sourceStartTime, size_t sizeUsed) {
-        bigtime_t duration = 0;
-        uint32 sampleSize = fInput.format.u.raw_audio.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
-        uint32 channels = fInput.format.u.raw_audio.channel_count;
-        float rate = fInput.format.u.raw_audio.frame_rate;
-        if (sampleSize > 0 && channels > 0 && rate > 0) {
-            size_t frames = sizeUsed / (sampleSize * channels);
-            duration = (bigtime_t)((double)frames * 1000000.0 / rate);
-        }
-
-        bigtime_t scheduled;
-        if (fNextScheduleTime == 0
-                || fNextScheduleTime < sourceStartTime - 100000
-                || fNextScheduleTime > sourceStartTime + 500000) {
-            scheduled = sourceStartTime + 20000; // resync with a small forward pad
-        } else {
-            scheduled = fNextScheduleTime;
-        }
-        fNextScheduleTime = scheduled + duration;
-        return scheduled;
-    }
-
     // Rate-limited stderr diagnostics for the forwarding leg (tap -> Mixer),
     // so a silent-but-not-crashing recording says exactly where the audio
     // is being lost instead of just not being audible. Capped to once a
@@ -636,7 +620,6 @@ private:
 
     BBufferGroup* fBufferGroup = nullptr;
     AudioEncoder* fEncoder = nullptr;
-    bigtime_t fNextScheduleTime = 0;
     bigtime_t fLastForwardLogTime = 0;
     uint64_t fForwardedCount = 0;
     bool fOutputEnabled = true;
@@ -1078,7 +1061,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.3.1";
+	    const char* localVersion = "v1.3.2";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
