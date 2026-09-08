@@ -65,3 +65,24 @@ being audible until it's restarted (or, if needed, Media preferences'
 If nothing is currently playing when hrecord starts, it records video only
 (with a warning) in the default mode, or fails outright for `--audioonly`
 since there'd be nothing to capture.
+
+## Known issue: "stale" Mixer connection
+
+Occasionally (usually after repeatedly closing and reopening whatever app is
+providing audio), the System Mixer ends up reporting a connected input that
+no longer actually resolves to a live app:
+
+```
+BMediaRoster::NodeIDFor: failed (error 0xffffffff)
+[-] Error: The System Mixer is reporting an audio connection hrecord can't
+actually find or reach. ...
+```
+
+This is Haiku's Mixer holding onto a stale/ghost entry left behind by an app
+that disappeared (closed, killed, or crashed) without cleanly disconnecting
+first — state that lives inside `media_server` itself, not anything
+hrecord's own process (which starts fresh and holds no state between runs)
+can have caused or can clean up from the outside. hrecord detects this and
+tells you so rather than failing with a bare, unexplained error. The fix is
+the same one Haiku's own Media preferences offers for this exact situation:
+open Media preferences and click "Restart Media Services", then try again.
