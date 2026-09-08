@@ -31,7 +31,22 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--list-audio-inputs]
 Capturing and MJPEG-encoding the full screen every frame at 30fps, uncapped,
 was consistently pegging a full CPU core — enough that the mouse itself
 would visibly lag, since Haiku's own input/compositing work was fighting
-hrecord for that core. Three profiles trade recording quality for headroom:
+hrecord for that core.
+
+**The actual dominant cost turned out not to be the encoder at all.** Every
+captured frame was pulled via `BScreen::GetBitmap()`, which allocates a
+brand-new `BBitmap` — and the shared-memory area `app_server` backs it
+with — from scratch on every single call. That per-frame allocate/IPC/free
+cycle, at full native resolution, ran the same way regardless of profile,
+which is why lowering fps/resolution/quality alone didn't fix the lag: the
+capture side was never touched by any of that. hrecord now allocates one
+`BBitmap` up front and refills it in place every frame via
+`BScreen::ReadBitmap()` instead, which removes that allocation entirely.
+The three profiles below still matter for the encode side (and for output
+size), but the capture-side fix is what actually addresses the sluggish,
+laggy-mouse symptom.
+
+Three profiles trade recording quality for headroom:
 
 | Profile | Flag | FPS | Max resolution (longest edge) | Notes |
 |---|---|---|---|---|
