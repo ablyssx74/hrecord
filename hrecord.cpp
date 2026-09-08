@@ -536,6 +536,25 @@ struct AudioTapHandles {
     bool active = false;
 };
 
+// Printed whenever the System Mixer's own bookkeeping doesn't match reality
+// -- e.g. it still reports a "connected" input for an app hrecord can no
+// longer find or reach. Haiku's Mixer can be left holding one of these
+// stale/ghost entries when a producer app disappears without cleanly
+// disconnecting first (killed, crashed, or otherwise torn down mid-stream);
+// the entry doesn't clear itself until media_server is restarted. This is
+// state living inside media_server itself, not anything hrecord's own
+// (short-lived, stateless-between-runs) process could have caused or can
+// clean up from the outside -- so the fix is the same one Haiku's own Media
+// preferences offers for exactly this situation.
+void WarnStaleMediaServerState() {
+    std::cerr << "[-] Error: The System Mixer is reporting an audio connection hrecord can't "
+        "actually find or reach. This usually means a previous app was closed (or crashed) "
+        "without cleanly disconnecting from the Mixer, leaving a stale entry behind -- a Haiku "
+        "Media Kit quirk, not something hrecord caused." << std::endl;
+    std::cerr << "[!] Fix: open Media preferences and click \"Restart Media Services\", then "
+        "try again." << std::endl;
+}
+
 // Finds one currently-playing app and redirects its connection to the
 // System Mixer through a new AudioTapNode, then starts a BSoundPlayer to
 // keep its audio actually audible (see the block comment above). On
@@ -557,10 +576,14 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
         return false;
     }
 
+    // The Mixer says something is connected at mixerInput.source -- but if
+    // that producer has since disappeared without telling the Mixer, this
+    // lookup fails even though GetConnectedInputsFor() just reported it as
+    // live. See WarnStaleMediaServerState() above for what this means.
     media_node_id appNodeId = roster->NodeIDFor(mixerInput.source.port);
     media_node appNode;
     if (appNodeId < 0 || roster->GetNodeFor(appNodeId, &appNode) != B_OK) {
-        std::cerr << "[-] Error: Could not resolve the app currently playing audio." << std::endl;
+        WarnStaleMediaServerState();
         return false;
     }
 
@@ -568,8 +591,7 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     int32 outCount = 0;
     if (roster->GetConnectedOutputsFor(appNode, &appOutput, 1, &outCount) != B_OK || outCount < 1
             || appOutput.destination != mixerInput.destination) {
-        std::cerr << "[-] Error: Could not confirm the playing app's connection to the Mixer."
-            << std::endl;
+        WarnStaleMediaServerState();
         return false;
     }
 
@@ -951,7 +973,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.4.0";
+	    const char* localVersion = "v1.4.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
