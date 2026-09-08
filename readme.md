@@ -144,10 +144,22 @@ thing only fails if *no* source could be tapped at all. On shutdown, every
 tapped app is restored directly to the Mixer, the same way the single-tap
 path already does.
 
-**Not yet tested on real Haiku hardware.** This was built and reviewed
-carefully against Haiku's Media Kit source, but --allaudio hasn't actually
-been run yet — if the mix sounds off (too quiet, distorted, or silent),
-that's the first thing to report back.
+**Resampling a source with a native rate well below the 48kHz bus rate**
+(e.g. a synth running its own engine at 8kHz or 11kHz) used to need several
+times as many output samples as input to upsample -- and the per-buffer
+output size was originally sized for something closer to a flat "roughly
+double" margin (fine for e.g. 44.1kHz -> 48kHz, not for a much lower native
+rate). Undersizing that doesn't fail loudly: whatever doesn't fit stays
+buffered inside the resampler's own internal state and only comes out on a
+*later* call, which shows up first as growing startup latency (real audio
+piling up before any of it reaches the mix) and then as chopping in that
+one source specifically, once its own per-tap buffer runs dry between
+those delayed, bursty catch-ups -- easy to mistake for an inherent "sample
+mismatch" between sources, but actually just a fixed-size buffer that
+wasn't sized for the actual rate ratio. The output buffer is now sized
+from each source's real rate ratio instead of a flat guess, with a bounded
+drain loop as a second line of defense against any backlog compounding
+across calls.
 
 ## Known issue: "stale" Mixer connection
 
