@@ -124,6 +124,22 @@ hijacked app is left connected to hrecord instead of the Mixer and will stop
 being audible until it's restarted (or, if needed, Media preferences'
 "Restart Media Services").
 
+**Fixed: hijacked apps staying listed in Media preferences' Audio mixer
+after being fully closed**, even on a clean shutdown -- confirmed not to
+happen on a Haiku session that's never run hrecord, so this was hrecord's
+own bug, not the pre-existing Haiku quirk below. Every Media Kit roster
+call that hands back a `media_node` (`GetNodeFor()`, `GetAudioMixer()`)
+hands out a reference the caller owns and must explicitly release with
+`ReleaseNode()` -- hrecord was acquiring one for each hijacked app
+(`GetNodeFor()`, to find and control it) and for the Mixer itself
+(`GetAudioMixer()`, to query its connected/free inputs) but never
+releasing either, on every single hijack. `media_server` kept the
+underlying node considered "in use" by hrecord's own already-exited
+process indefinitely, which is consistent with what stayed visible even
+after the app itself was closed. Every acquisition now has a matching
+release, including on every internal failure path (not just the
+success/teardown path).
+
 If nothing is currently playing when hrecord starts, it records video only
 (with a warning) in the default mode, or fails outright for `--audioonly`
 since there'd be nothing to capture.

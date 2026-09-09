@@ -136,18 +136,24 @@ void ListAudioInputs(BMediaRoster* roster) {
         std::cerr << "[-] Error: Could not reach the System Mixer." << std::endl;
         return;
     }
+    // GetAudioMixer() (like GetNodeFor() and every other roster call that
+    // hands back a media_node) hands out a reference hrecord is now
+    // responsible for releasing -- see the note on this same pattern in
+    // HijackAppIntoTap. Every exit path below releases it.
 
     const int32 kMax = 32;
     media_input inputs[kMax];
     int32 count = kMax;
     if (roster->GetConnectedInputsFor(mixerNode, inputs, kMax, &count) != B_OK) {
         std::cerr << "[-] Error: Failed to query the Mixer's connected inputs." << std::endl;
+        roster->ReleaseNode(mixerNode);
         return;
     }
 
     if (count == 0) {
         std::cout << "[!] Nothing is currently playing into the System Mixer. Start playback "
             "somewhere before recording desktop audio." << std::endl;
+        roster->ReleaseNode(mixerNode);
         return;
     }
 
@@ -158,12 +164,15 @@ void ListAudioInputs(BMediaRoster* roster) {
         live_node_info info;
         media_node sourceNode;
         const char* name = "(unknown)";
-        if (sourceNodeId >= 0 && roster->GetNodeFor(sourceNodeId, &sourceNode) == B_OK
-                && roster->GetLiveNodeInfo(sourceNode, &info) == B_OK) {
-            name = info.name;
+        if (sourceNodeId >= 0 && roster->GetNodeFor(sourceNodeId, &sourceNode) == B_OK) {
+            if (roster->GetLiveNodeInfo(sourceNode, &info) == B_OK)
+                name = info.name;
+            roster->ReleaseNode(sourceNode);
         }
         std::cout << "    - \"" << name << "\"" << std::endl;
     }
+
+    roster->ReleaseNode(mixerNode);
 }
 
 // Adds a Vorbis audio stream to fmtCtx and wires up the resampler/FIFO used
@@ -896,11 +905,22 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
         return nullptr;
     }
 
+    // GetNodeFor() (like GetAudioMixer() and every other roster call that
+    // hands back a media_node) hands out a reference hrecord now owns and
+    // must eventually release -- confirmed, in practice, as the cause of
+    // apps hijacked by hrecord staying listed as connected in Media
+    // preferences' Audio mixer even after being fully closed (never
+    // reproduces on a clean Haiku session that never ran hrecord). Every
+    // failure path below that acquired appNode releases it before
+    // returning nullptr; the success path hands ownership of the
+    // reference to the caller via *outAppNode, for it to release once the
+    // tap is torn down (UndoHijack / RestoreHijackedApp).
     media_output appOutput;
     int32 outCount = 0;
     if (roster->GetConnectedOutputsFor(appNode, &appOutput, 1, &outCount) != B_OK || outCount < 1
             || appOutput.destination != mixerInput.destination) {
         WarnStaleMediaServerState();
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
 
@@ -909,6 +929,7 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
     if (roster->RegisterNode(tap) != B_OK) {
         std::cerr << "[-] Error: Failed to register an audio tap node." << std::endl;
         delete tap;
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
 
@@ -921,6 +942,7 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
         std::cerr << "[-] Error: Failed to detach a playing app from the Mixer." << std::endl;
         roster->StartNode(appNode, 0);
         roster->ReleaseNode(tap->Node());
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
     snooze(20000);
@@ -940,6 +962,7 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
             &restoredInput);
         roster->StartNode(appNode, 0);
         roster->ReleaseNode(tap->Node());
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
 
@@ -968,6 +991,9 @@ void UndoHijack(BMediaRoster* roster, AudioTapNode* tap, const media_node& appNo
         &restoredOutput, &restoredInput);
     roster->StartNode(appNode, 0);
     roster->ReleaseNode(tap->Node());
+    // Release the reference HijackAppIntoTap's GetNodeFor() acquired and
+    // handed us via appNode -- see its own comment on this.
+    roster->ReleaseNode(appNode);
 }
 
 // Disconnects a running tap and reconnects its app directly back to the
@@ -1002,6 +1028,7 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
             err = roster->Connect(originalAppOutput.source, freeInput.destination,
                 &restoreFormat, &restoredOutput, &restoredInput);
         }
+        roster->ReleaseNode(mixerNode);
     }
     if (err != B_OK) {
         std::cerr << "[!] Warning: Could not automatically reconnect an app back to the Mixer "
@@ -1010,6 +1037,11 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
     }
 
     roster->StartNode(appNode, 0);
+    // Release the reference HijackAppIntoTap's GetNodeFor() acquired and
+    // handed us via appNode -- see its own comment on this. Confirmed, in
+    // practice, as the reason hijacked apps stayed listed in Media
+    // preferences' Audio mixer even after being fully closed.
+    roster->ReleaseNode(appNode);
 }
 
 // Finds one currently-playing app and redirects its connection to the
@@ -1027,7 +1059,10 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
 
     media_input mixerInput;
     int32 inCount = 0;
-    if (roster->GetConnectedInputsFor(mixerNode, &mixerInput, 1, &inCount) != B_OK || inCount < 1) {
+    bool haveInput = roster->GetConnectedInputsFor(mixerNode, &mixerInput, 1, &inCount) == B_OK
+        && inCount >= 1;
+    roster->ReleaseNode(mixerNode); // not needed past this point
+    if (!haveInput) {
         std::cerr << "[-] Error: Nothing is currently playing into the System Mixer to capture. "
             "Start playback somewhere and try again." << std::endl;
         return false;
@@ -1281,8 +1316,10 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
     const int32 kMaxSources = 32;
     media_input mixerInputs[kMaxSources];
     int32 inCount = 0;
-    if (roster->GetConnectedInputsFor(mixerNode, mixerInputs, kMaxSources, &inCount) != B_OK
-            || inCount < 1) {
+    bool haveInputs = roster->GetConnectedInputsFor(mixerNode, mixerInputs, kMaxSources, &inCount)
+        == B_OK && inCount >= 1;
+    roster->ReleaseNode(mixerNode); // not needed past this point
+    if (!haveInputs) {
         std::cerr << "[-] Error: Nothing is currently playing into the System Mixer to capture. "
             "Start playback somewhere and try again." << std::endl;
         return false;
@@ -1800,7 +1837,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.0";
+	    const char* localVersion = "v1.9.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
