@@ -1,4 +1,4 @@
-# hTV Build Script (Native Haiku OS Conversion)
+# hrecord Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
 VERSION = 1.9.7
