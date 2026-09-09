@@ -385,17 +385,28 @@ cause rather than being three separate bugs:
 The common thread across all three: repeatedly hijacking the same app in
 quick succession, rather than anything specific to `--allaudio` or the
 number of tapped sources (case 1 reproduces with one source as readily as
-three). The leading theory is that a hijacked app's own connection needs
-more time to settle after being freed than hrecord was giving it --
-`HijackAppIntoTap` already pauses briefly after its own Disconnect before
-reconnecting, but the mirror-image restore path (`UndoHijack` /
-`RestoreHijackedApp`) was reconnecting immediately with no equivalent
-pause, which is now fixed to match. Whether that's the whole story for
-cases 2 and 3 specifically is unconfirmed -- the periodic backlog log
-above exists partly to help chase case 1 further: comparing its output
-between a first and second run against the same still-open apps is the
-next concrete step, and whether cases 2-3 still occur at all after this
-settle-delay fix is the other one.
+three). A settle-delay fix (matching `HijackAppIntoTap`'s own pause after
+Disconnect, previously missing from the mirror-image restore path) didn't
+resolve case 1.
+
+**Case 1's own diagnostics now point away from hrecord's pipeline
+entirely.** Comparing the periodic backlog log between a run with barely
+any noticeable lag and a very similar run where lag was clearly audible:
+the numbers were essentially identical -- the same source sat at its
+ring's full capacity (a fixed ~0.07s) for the entire session in *both*
+runs, and the overflow/underrun counts at teardown were nearly the same
+either way. If the lag isn't visible in the ring backlog, the
+overflow/underrun counts, or the callback timing, it isn't happening in
+hrecord's tap -> ring -> mix -> BSoundPlayer pipeline at all -- there's
+nothing left in that path for these diagnostics to catch. That points
+at something upstream of hrecord's own tap entirely: most plausibly the
+tapped app's *own* internal audio processing latency (hrecord only ever
+sees whatever audio data an app hands it, never that app's own
+input-to-output round trip), possibly varying depending on how its output
+connection looks each time it's reconnected -- which would make this an
+app-side behavior outside what hrecord's own code can observe or fix. Not
+confirmed; the next isolating test is whether restarting only the tapped
+app (not hrecord) between runs makes case 1 go away.
 
 ## Known issue: "stale" Mixer connection
 
