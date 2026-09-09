@@ -1849,7 +1849,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.2";
+	    const char* localVersion = "v1.9.3";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
