@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -38,9 +38,14 @@ whatever an earlier run left behind in `/boot/home`.
   with or without `--allaudio`/`--audioonly`. Worth it for genuinely
   real-time use (e.g. playing an instrument live through effects, such as
   rakarrack, while recording); a casual recording doesn't need it. See
-  "--realtime: lower monitoring latency" below. (`--experimental` is still
-  accepted for backward compatibility but is a no-op now -- its tuning is
-  part of `--realtime`'s own defaults.)
+  "--realtime: lower monitoring latency" below.
+- `hrecord start --experimental` — caps how long a tap can hold a source's
+  buffer back, relative to that source's own buffer size, instead of the
+  flat 50ms `--realtime` otherwise uses for every source alike. Unconfirmed
+  experiment aimed at small-buffer producers whose own BSoundPlayer buffer
+  pool can start failing to reclaim buffers when held back that long. See
+  "--experimental: capping buffer holds relative to the source's own
+  buffer size" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -346,9 +351,50 @@ adding. Fixed by decoupling them: the snooze cap is a single, generous
 blocking this thread too long -- never needed to scale with a latency
 target), leaving ring buffer size as the real, and only, latency dial.
 Retested at a gentler 0.07s (up from 0.03s) with three simultaneous
-sources and confirmed clean, so that's `--realtime`'s own default now --
-`--experimental` is no longer a separate flag (still accepted, but a
-no-op, purely so an existing invocation doesn't break).
+sources and confirmed clean, so that's `--realtime`'s own default now.
+`--experimental` was a no-op for a while after that (its old tuning had
+been folded into `--realtime`'s defaults, so passing it did nothing) --
+it's since been repurposed for a new, unrelated experiment; see below.
+
+### `--experimental`: capping buffer holds relative to the source's own buffer size
+
+A completely different symptom, found later: with `--realtime` engaged,
+Haiku's own `SoundPlayNode::FillNextBuffer: RequestBuffer failed` started
+flooding the terminal of a tapped app (rakarrack) for as long as its
+connection to hrecord's tap was held -- starting the instant hrecord
+started, stopping the instant hrecord stopped, confirmed reproducible
+across repeated on/off cycles. That's Haiku's own Media Kit code (inside
+`libmedia.so`'s `BSoundPlayer` implementation), not rakarrack's and not
+hrecord's -- it means a producer's request for a free buffer from its own
+`BBufferGroup` failed.
+
+The likely mechanism: pacing's backpressure (see above) works by
+deliberately delaying `buffer->Recycle()` by up to the 50ms cap, as the
+signal that tells a fast producer to slow down. That's fine for a
+producer with a normal-size buffer pool. rakarrack's own output runs on
+very small buffers (~256 frames, ~5.3ms @ 48kHz), and Haiku's
+`BBufferGroup`/`SoundPlayNode` pools are typically only 2-3 buffers deep --
+holding even one buffer back for anywhere close to 50ms while the
+producer tries to reclaim a fresh one roughly every 5ms can starve a pool
+that small, and every subsequent request fails until the held buffer
+finally comes back. Continuous, for as long as pacing keeps holding
+buffers that long -- matching what was observed exactly.
+
+`--experimental` caps the hold at roughly 2x *that source's own* buffer
+duration instead of the flat 50ms, whenever that's tighter. This is
+deliberately not the same mistake as the regression above: a flat,
+*smaller* cap applied to every source alike is what broke correction
+speed there. This cap only tightens for sources whose own buffers are
+small and frequent to begin with (rakarrack's ~5.3ms buffers get roughly
+a 10.6ms cap) -- and for exactly those sources, correction *opportunity*
+scales right along with the tighter cap, since `BufferReceived` fires
+again just as often. A source with large, infrequent buffers keeps the
+full 50ms, identical to every other mode, so this shouldn't touch
+behavior for anything but small-buffer producers like rakarrack.
+
+Not folded into `--realtime`'s own defaults (unlike the ring/buffer-size
+tuning above) -- kept as its own opt-in flag since it's unconfirmed
+pending real-world testing.
 
 **The periodic (`t+Ns: source #N backlog: ...`) logging that used to print
 every ~2 seconds has been removed.** It was added specifically to catch a
@@ -409,20 +455,41 @@ tapped app between runs is the workaround. It's plausible the same
 app-side degradation also explains cases 2 and 3 below, though that's not
 separately confirmed.
 
-**Cases 2 and 3 got a second, independent data point: they're
-`media_server`-side, confirmed from outside hrecord entirely.** After an
-`hrecord --allaudio --realtime --audioonly` session hijacked and restored
-Rakarrack, a *later, separate* launch of Rakarrack (hrecord not even
-running) started printing Haiku's own `SoundPlayNode::FillNextBuffer:
-RequestBuffer failed` -- the Media Kit's internal `BSoundPlayer`
-implementation failing to push a buffer through a connection the Mixer
-still considered live. Same family of symptom as cases 2/3 (a connection
-the Mixer thinks is fine turning out not to be), just observed this time
-from the *other* app's side instead of hrecord's. It only cleared once
-Media Services were fully restarted -- exactly the same fix documented
-below for the "stale" Mixer connection issue, and consistent with the
-corruption living in `media_server` itself rather than in either app's
-own process state.
+**Cases 2 and 3 got a second data point from a different app's side --
+which turned out to point somewhere more specific than first thought.**
+After an `hrecord --allaudio --realtime --audioonly` session hijacked and
+restored Rakarrack, a later launch of Rakarrack started printing Haiku's
+own `SoundPlayNode::FillNextBuffer: RequestBuffer failed` -- the Media
+Kit's internal `BSoundPlayer` implementation failing to push a buffer
+through a connection the Mixer still considered live. A controlled
+follow-up test (Rakarrack already running standalone and quiet, *then*
+starting hrecord) pinned down the timing precisely: the flood starts the
+instant hrecord starts, stops the instant hrecord stops, and resumes the
+instant hrecord restarts -- tracking hrecord's live connection window
+exactly, not persisting once hrecord actually exits. That rules out
+stale post-disconnect `media_server` state (what the 100ms settle-delay
+change above was aimed at) as the cause of *this* symptom specifically --
+it's continuous for as long as the tap is connected, not a one-time
+reconnect-moment glitch.
+
+The likely mechanism instead: pacing's backpressure (see above) works by
+deliberately delaying `buffer->Recycle()`, holding a buffer back for up
+to 50ms as the signal that tells a fast producer to slow down. Rakarrack's
+own output runs on very small buffers (~256 frames, ~5.3ms @ 48kHz), and
+Haiku's `BBufferGroup`/`SoundPlayNode` pools are typically only 2-3
+buffers deep -- holding even one buffer back for anywhere close to 50ms
+while the producer tries to reclaim a fresh one roughly every 5ms can
+starve a pool that small, continuously, for as long as pacing keeps doing
+it. Testing also found no audio at all for a while immediately after
+stopping hrecord (the Mixer reconnect completing, but Rakarrack staying
+silent afterward) -- consistent with `SoundPlayNode`'s own buffer-pool
+bookkeeping not recovering cleanly from a long run of failed requests,
+and quite possibly the same underlying mechanism behind the original
+"restarting Rakarrack fixes the 2nd-instance lag" finding in case 1
+above, rather than a fully separate issue.
+
+See `--experimental` below for the fix being tried for this specific
+symptom.
 
 Following this, the settle delay between `Disconnect` and `Connect` in
 `HijackAppIntoTap`/`UndoHijack`/`RestoreHijackedApp` (previously a flat
