@@ -2,7 +2,7 @@ name			$(GUI_TARGET)
 version			$(VERSION)-1
 architecture	$(ARCH)
 summary 		"hrecord"
-description 	"hrecord - Haiku Screen & Desktop Audio Recorder Terminal App."
+description 	"Haiku Recorder - Screen, Desktop Audio & Real-Time Mixing"
 packager		"ablyss <hrecord@epluribusunix.net>"
 vendor			"epluribusunix.net Project"
 licenses {
