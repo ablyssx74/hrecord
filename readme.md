@@ -1,4 +1,4 @@
-# Haiku Terminal Screen Recorder App.
+# Haiku Recorder - Screen, Desktop Audio & Real-Time Mixing
 
 ## Build
 
