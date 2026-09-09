@@ -39,26 +39,19 @@ bool g_running = true;
 
 // Set once from the --realtime CLI flag (see main()). When true, the
 // audio-tap ring buffers and the buffer size requested from BSoundPlayer
-// are tuned smaller, trading away some of the safety margin against
-// buffering-jitter glitches for lower monitoring latency -- worth it for
-// a genuinely real-time use case (e.g. playing guitar live through
-// rakarrack while recording), not something a casual recording needs, and
-// only useful alongside a driver already tuned for low latency (see
-// readme.md) -- this doesn't touch the driver's own buffer settings.
+// are tuned smaller (256 frames / ~0.07s), trading away some of the
+// safety margin against buffering-jitter glitches for lower monitoring
+// latency -- worth it for a genuinely real-time use case (e.g. playing
+// guitar live through rakarrack while recording), not something a casual
+// recording needs, and only useful alongside a driver already tuned for
+// low latency (see readme.md) -- this doesn't touch the driver's own
+// buffer settings. These numbers were originally gated behind a separate
+// --experimental flag pending real-world testing; confirmed clean with
+// three simultaneous sources on a driver hand-tuned to
+// play_buffer_frames 256, so they're --realtime's own defaults now.
+// --experimental is still accepted on the command line (a no-op, purely
+// so an existing invocation doesn't break) -- see main().
 bool g_realtimeAudio = false;
-
-// Set once from the --experimental CLI flag (requires --realtime; see
-// main()). Pushes the same knobs --realtime tunes even further -- meant
-// for someone who has *also* hand-tuned their sound driver well past
-// hda.settings' own low-latency example (a real user of this project
-// ended up at play_buffer_frames 256, well under the 1024 --realtime
-// itself targets) and wants hrecord's own buffering to try to keep pace.
-// Less tested than --realtime itself, hence its own flag rather than
-// folding into --realtime directly -- expect to need to tune the actual
-// constants this controls (see MixBusFormat, SetupAllAudioTaps,
-// SetupDesktopAudioTap, AudioTapNode::PaceToRealTime) against whatever a
-// given driver configuration can actually sustain.
-bool g_experimentalAudio = false;
 
 // ============================================================================
 // Screen recording quality profiles
@@ -143,18 +136,24 @@ void ListAudioInputs(BMediaRoster* roster) {
         std::cerr << "[-] Error: Could not reach the System Mixer." << std::endl;
         return;
     }
+    // GetAudioMixer() (like GetNodeFor() and every other roster call that
+    // hands back a media_node) hands out a reference hrecord is now
+    // responsible for releasing -- see the note on this same pattern in
+    // HijackAppIntoTap. Every exit path below releases it.
 
     const int32 kMax = 32;
     media_input inputs[kMax];
     int32 count = kMax;
     if (roster->GetConnectedInputsFor(mixerNode, inputs, kMax, &count) != B_OK) {
         std::cerr << "[-] Error: Failed to query the Mixer's connected inputs." << std::endl;
+        roster->ReleaseNode(mixerNode);
         return;
     }
 
     if (count == 0) {
         std::cout << "[!] Nothing is currently playing into the System Mixer. Start playback "
             "somewhere before recording desktop audio." << std::endl;
+        roster->ReleaseNode(mixerNode);
         return;
     }
 
@@ -165,12 +164,15 @@ void ListAudioInputs(BMediaRoster* roster) {
         live_node_info info;
         media_node sourceNode;
         const char* name = "(unknown)";
-        if (sourceNodeId >= 0 && roster->GetNodeFor(sourceNodeId, &sourceNode) == B_OK
-                && roster->GetLiveNodeInfo(sourceNode, &info) == B_OK) {
-            name = info.name;
+        if (sourceNodeId >= 0 && roster->GetNodeFor(sourceNodeId, &sourceNode) == B_OK) {
+            if (roster->GetLiveNodeInfo(sourceNode, &info) == B_OK)
+                name = info.name;
+            roster->ReleaseNode(sourceNode);
         }
         std::cout << "    - \"" << name << "\"" << std::endl;
     }
+
+    roster->ReleaseNode(mixerNode);
 }
 
 // Adds a Vorbis audio stream to fmtCtx and wires up the resampler/FIFO used
@@ -514,16 +516,14 @@ media_raw_audio_format MixBusFormat() {
     fmt.channel_count = kMixBusChannels;
     fmt.format = media_raw_audio_format::B_AUDIO_FLOAT;
     fmt.byte_order = B_MEDIA_HOST_ENDIAN;
-    // Under --realtime, request 1024 frames -- deliberately mirroring the
-    // frame count in the hda.settings low-latency example this project's
-    // own readme documents (~5-20ms depending on rate), rather than an
-    // arbitrary byte count. --experimental goes further still, to 256
-    // frames, matching how far a real user of this project ended up
-    // tuning their own driver. Either way this is only a hint (the Mixer
-    // may renegotiate it away entirely), but matching the same scale as
-    // an already-tuned driver gives it the best chance of being honored.
-    int frames = g_experimentalAudio ? 256 : (g_realtimeAudio ? 1024 : 0);
-    fmt.buffer_size = frames > 0 ? (size_t)(kMixBusChannels * sizeof(float) * frames) : 4096;
+    // Under --realtime, request 256 frames -- confirmed in testing to
+    // work cleanly, matching how far a real user of this project hand-
+    // tuned their own driver (play_buffer_frames 256). This is only a
+    // hint (the Mixer may renegotiate it away entirely), but matching the
+    // same scale as an already-tuned driver gives it the best chance of
+    // being honored.
+    fmt.buffer_size = g_realtimeAudio
+        ? (size_t)(kMixBusChannels * sizeof(float) * 256) : 4096;
     return fmt;
 }
 
@@ -905,11 +905,22 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
         return nullptr;
     }
 
+    // GetNodeFor() (like GetAudioMixer() and every other roster call that
+    // hands back a media_node) hands out a reference hrecord now owns and
+    // must eventually release -- confirmed, in practice, as the cause of
+    // apps hijacked by hrecord staying listed as connected in Media
+    // preferences' Audio mixer even after being fully closed (never
+    // reproduces on a clean Haiku session that never ran hrecord). Every
+    // failure path below that acquired appNode releases it before
+    // returning nullptr; the success path hands ownership of the
+    // reference to the caller via *outAppNode, for it to release once the
+    // tap is torn down (UndoHijack / RestoreHijackedApp).
     media_output appOutput;
     int32 outCount = 0;
     if (roster->GetConnectedOutputsFor(appNode, &appOutput, 1, &outCount) != B_OK || outCount < 1
             || appOutput.destination != mixerInput.destination) {
         WarnStaleMediaServerState();
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
 
@@ -918,6 +929,7 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
     if (roster->RegisterNode(tap) != B_OK) {
         std::cerr << "[-] Error: Failed to register an audio tap node." << std::endl;
         delete tap;
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
 
@@ -930,6 +942,7 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
         std::cerr << "[-] Error: Failed to detach a playing app from the Mixer." << std::endl;
         roster->StartNode(appNode, 0);
         roster->ReleaseNode(tap->Node());
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
     snooze(20000);
@@ -949,6 +962,7 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
             &restoredInput);
         roster->StartNode(appNode, 0);
         roster->ReleaseNode(tap->Node());
+        roster->ReleaseNode(appNode);
         return nullptr;
     }
 
@@ -977,6 +991,9 @@ void UndoHijack(BMediaRoster* roster, AudioTapNode* tap, const media_node& appNo
         &restoredOutput, &restoredInput);
     roster->StartNode(appNode, 0);
     roster->ReleaseNode(tap->Node());
+    // Release the reference HijackAppIntoTap's GetNodeFor() acquired and
+    // handed us via appNode -- see its own comment on this.
+    roster->ReleaseNode(appNode);
 }
 
 // Disconnects a running tap and reconnects its app directly back to the
@@ -1011,6 +1028,7 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
             err = roster->Connect(originalAppOutput.source, freeInput.destination,
                 &restoreFormat, &restoredOutput, &restoredInput);
         }
+        roster->ReleaseNode(mixerNode);
     }
     if (err != B_OK) {
         std::cerr << "[!] Warning: Could not automatically reconnect an app back to the Mixer "
@@ -1019,6 +1037,11 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
     }
 
     roster->StartNode(appNode, 0);
+    // Release the reference HijackAppIntoTap's GetNodeFor() acquired and
+    // handed us via appNode -- see its own comment on this. Confirmed, in
+    // practice, as the reason hijacked apps stayed listed in Media
+    // preferences' Audio mixer even after being fully closed.
+    roster->ReleaseNode(appNode);
 }
 
 // Finds one currently-playing app and redirects its connection to the
@@ -1036,7 +1059,10 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
 
     media_input mixerInput;
     int32 inCount = 0;
-    if (roster->GetConnectedInputsFor(mixerNode, &mixerInput, 1, &inCount) != B_OK || inCount < 1) {
+    bool haveInput = roster->GetConnectedInputsFor(mixerNode, &mixerInput, 1, &inCount) == B_OK
+        && inCount >= 1;
+    roster->ReleaseNode(mixerNode); // not needed past this point
+    if (!haveInput) {
         std::cerr << "[-] Error: Nothing is currently playing into the System Mixer to capture. "
             "Start playback somewhere and try again." << std::endl;
         return false;
@@ -1061,26 +1087,21 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     float rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100.0f;
     // See PaceToRealTime's comment: with the tap's own consumption now
     // paced to real time, this ring's steady-state fill tracks genuine
-    // jitter rather than a growing backlog, so --realtime (and
-    // --experimental further still) can trade some of that jitter
-    // headroom for a lower latency ceiling. --experimental's own margin
-    // over --realtime is deliberately modest (not the aggressive cut
-    // tried initially) since ring size is the actual latency dial now
-    // that the snooze cap isn't limiting correction speed -- see
-    // PaceToRealTime.
-    double ringSeconds = g_experimentalAudio ? 0.07 : (g_realtimeAudio ? 0.1 : 0.5);
+    // jitter rather than a growing backlog, so --realtime can trade some
+    // of that jitter headroom for a lower latency ceiling -- confirmed
+    // clean in testing at these numbers with three simultaneous sources.
+    double ringSeconds = g_realtimeAudio ? 0.07 : 0.5;
     size_t ringCapacity = bytesPerFrame > 0
         ? (size_t)(bytesPerFrame * rate * ringSeconds) : 65536;
     g_playbackRing.Init(ringCapacity);
     tap->SetPlaybackRing(&g_playbackRing);
 
     if (g_realtimeAudio && bytesPerFrame > 0) {
-        // Same rationale as MixBusFormat(): request ~1024 frames (256
-        // under --experimental), matching the scale of an already-tuned
-        // driver, rather than leaving whatever buffer_size the app itself
-        // happened to negotiate with the Mixer originally.
-        int frames = g_experimentalAudio ? 256 : 1024;
-        negotiated.buffer_size = (size_t)bytesPerFrame * frames;
+        // Same rationale as MixBusFormat(): request ~256 frames, matching
+        // the scale of an already-tuned driver, rather than leaving
+        // whatever buffer_size the app itself happened to negotiate with
+        // the Mixer originally.
+        negotiated.buffer_size = (size_t)bytesPerFrame * 256;
     }
 
     BSoundPlayer* player = new BSoundPlayer(&negotiated, "hrecord Playback", PlaybackCallback,
@@ -1193,6 +1214,34 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
         }
     }
 
+    // Periodic (not just first-call) backlog check: roughly every 2
+    // seconds, log any source whose queued backlog is more than
+    // negligible. The one-time startup snapshot above can't tell a
+    // healthy session (backlog stays near its steady-state floor) apart
+    // from one where a source is drifting ahead of real time faster than
+    // pacing/the ring can absorb -- which would show up to a listener as
+    // gradually growing lag with nothing in the log to point at it. If
+    // this never prints, backlog is staying flat; if it prints with a
+    // steadily climbing number for the same source, that source is the
+    // one drifting.
+    static bigtime_t sLastPeriodicLog = 0;
+    bigtime_t logNow = system_time();
+    if (sources != nullptr && logNow - sLastPeriodicLog > 2000000) {
+        sLastPeriodicLog = logNow;
+        int idx = 0;
+        for (AudioRingBuffer* ring : *sources) {
+            idx++;
+            size_t avail = ring->Available();
+            double seconds = g_mixBusRate > 0
+                ? (double)avail / (kMixBusChannels * sizeof(float) * g_mixBusRate) : 0.0;
+            if (seconds > 0.02) {
+                std::cout << "[i] t+" << ((logNow - g_allAudioSetupStartTime) / 1000000)
+                    << "s: source #" << idx << " backlog: " << avail << " bytes (~"
+                    << seconds << "s)" << std::endl;
+            }
+        }
+    }
+
     float* out = (float*)buffer;
     size_t sampleCount = size / sizeof(float);
     std::fill(out, out + sampleCount, 0.0f);
@@ -1267,8 +1316,10 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
     const int32 kMaxSources = 32;
     media_input mixerInputs[kMaxSources];
     int32 inCount = 0;
-    if (roster->GetConnectedInputsFor(mixerNode, mixerInputs, kMaxSources, &inCount) != B_OK
-            || inCount < 1) {
+    bool haveInputs = roster->GetConnectedInputsFor(mixerNode, mixerInputs, kMaxSources, &inCount)
+        == B_OK && inCount >= 1;
+    roster->ReleaseNode(mixerNode); // not needed past this point
+    if (!haveInputs) {
         std::cerr << "[-] Error: Nothing is currently playing into the System Mixer to capture. "
             "Start playback somewhere and try again." << std::endl;
         return false;
@@ -1333,16 +1384,14 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         //
         // Now that AudioTapNode paces its own consumption to real time
         // (see BufferReceived), this ring's steady-state fill level tracks
-        // genuine jitter, not a growing backlog -- so under --realtime (and
-        // --experimental further still) it trades some of that jitter
-        // headroom back for a lower worst-case latency ceiling instead, on
-        // the theory that a real-time monitoring use case would rather
-        // risk an occasional glitch than accept seconds of guaranteed
-        // slack it's very unlikely to ever need. --experimental's own
-        // margin over --realtime is deliberately modest (not the
-        // aggressive cut tried initially) -- see the note in
-        // SetupDesktopAudioTap and PaceToRealTime.
-        double ringSeconds = g_experimentalAudio ? 0.07 : (g_realtimeAudio ? 0.1 : 2.0);
+        // genuine jitter, not a growing backlog -- so under --realtime it
+        // trades some of that jitter headroom back for a lower worst-case
+        // latency ceiling instead, on the theory that a real-time
+        // monitoring use case would rather risk an occasional glitch than
+        // accept seconds of guaranteed slack it's very unlikely to ever
+        // need. Confirmed clean in testing at this number with three
+        // simultaneous sources.
+        double ringSeconds = g_realtimeAudio ? 0.07 : 2.0;
         size_t ringCapacity =
             (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * ringSeconds);
         entry.ring->Init(ringCapacity);
@@ -1482,24 +1531,27 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // --experimental's own tuning was folded into --realtime's defaults
+    // after confirming it clean in testing (see g_realtimeAudio above);
+    // it's still accepted here as a no-op purely so an existing
+    // invocation that includes it doesn't break.
     if (experimentalAudio && !realtimeAudio) {
-        std::cerr << "[-] Error: --experimental requires --realtime." << std::endl;
-        return -1;
+        std::cout << "[i] --experimental now requires nothing extra -- its tuning is part of "
+            "--realtime's own defaults. Add --realtime to get it." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
     // SetupDesktopAudioTap and SetupAllAudioTaps -- must be set before any
     // of those run, which the audio-tap setup below (section 5a) does.
     g_realtimeAudio = realtimeAudio;
-    g_experimentalAudio = experimentalAudio;
-    if (g_experimentalAudio) {
-        std::cout << "[i] --experimental: pushing audio buffers even tighter than --realtime "
-            "alone. Less tested -- only worth it if --realtime by itself still isn't tight "
-            "enough for your own hand-tuned driver settings (see readme.md)." << std::endl;
-    } else if (g_realtimeAudio) {
+    if (g_realtimeAudio) {
         std::cout << "[i] --realtime: using tighter audio buffers for lower monitoring "
             "latency. Best paired with a sound driver already tuned for low latency (see "
             "readme.md) -- this doesn't change the driver's own buffer settings." << std::endl;
+        if (experimentalAudio) {
+            std::cout << "[i] --experimental is redundant now (its tuning is already part of "
+                "--realtime) but harmless to keep passing." << std::endl;
+        }
     }
 
     const VideoProfile& profile = kVideoProfiles[profileIndex];
@@ -1785,7 +1837,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.8.1";
+	    const char* localVersion = "v1.9.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
