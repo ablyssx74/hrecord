@@ -350,22 +350,18 @@ sources and confirmed clean, so that's `--realtime`'s own default now --
 `--experimental` is no longer a separate flag (still accepted, but a
 no-op, purely so an existing invocation doesn't break).
 
-**Ongoing (not just startup) backlog is now logged too.** A one-time
-snapshot at the first callback can't tell a healthy session (backlog
-staying near its steady-state floor) apart from one where a source is
-slowly drifting ahead of real time over the course of a session -- which
-would reach a listener as gradually growing lag with nothing in the log to
-point at. Roughly every 2 seconds, any source whose queued backlog is more
-than negligible gets logged with a timestamp:
-
-```
-[i] t+14s: source #2 backlog: 96000 bytes (~0.25s)
-```
-
-If this never prints, backlog is staying flat. If it prints with a
-steadily climbing number for the same source, that source is drifting --
-useful for tracking down session-length latency growth that a fresh
-`--list-audio-inputs`-style snapshot wouldn't catch.
+**The periodic (`t+Ns: source #N backlog: ...`) logging that used to print
+every ~2 seconds has been removed.** It was added specifically to catch a
+source slowly drifting ahead of real time over the course of a session --
+useful diagnostic noise while chasing the "known open issues" below, but it
+did its job: real-world testing with it in place showed hrecord's own
+ring backlog staying flat and nearly identical across both laggy and
+lag-free runs, which is what pointed the case-1 root cause at the tapped
+app itself (see below) rather than anything in hrecord's pipeline. With
+that confirmed, the extra per-callback logging overhead isn't earning its
+keep anymore. The one-time startup snapshot (`[i] Mixed playback: first
+callback ...`) stays -- it's cheap (runs once) and still useful for
+diagnosing startup delay.
 
 **Known open issues, likely related:** three things reported from testing
 against still-open apps across repeated runs, which may share one root

@@ -1227,34 +1227,6 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
         }
     }
 
-    // Periodic (not just first-call) backlog check: roughly every 2
-    // seconds, log any source whose queued backlog is more than
-    // negligible. The one-time startup snapshot above can't tell a
-    // healthy session (backlog stays near its steady-state floor) apart
-    // from one where a source is drifting ahead of real time faster than
-    // pacing/the ring can absorb -- which would show up to a listener as
-    // gradually growing lag with nothing in the log to point at it. If
-    // this never prints, backlog is staying flat; if it prints with a
-    // steadily climbing number for the same source, that source is the
-    // one drifting.
-    static bigtime_t sLastPeriodicLog = 0;
-    bigtime_t logNow = system_time();
-    if (sources != nullptr && logNow - sLastPeriodicLog > 2000000) {
-        sLastPeriodicLog = logNow;
-        int idx = 0;
-        for (AudioRingBuffer* ring : *sources) {
-            idx++;
-            size_t avail = ring->Available();
-            double seconds = g_mixBusRate > 0
-                ? (double)avail / (kMixBusChannels * sizeof(float) * g_mixBusRate) : 0.0;
-            if (seconds > 0.02) {
-                std::cout << "[i] t+" << ((logNow - g_allAudioSetupStartTime) / 1000000)
-                    << "s: source #" << idx << " backlog: " << avail << " bytes (~"
-                    << seconds << "s)" << std::endl;
-            }
-        }
-    }
-
     float* out = (float*)buffer;
     size_t sampleCount = size / sizeof(float);
     std::fill(out, out + sampleCount, 0.0f);
@@ -1858,7 +1830,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.6";
+	    const char* localVersion = "v1.9.7";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
