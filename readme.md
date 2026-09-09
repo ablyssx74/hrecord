@@ -367,54 +367,47 @@ keep anymore. The one-time startup snapshot (`[i] Mixed playback: first
 callback ...`) stays -- it's cheap (runs once) and still useful for
 diagnosing startup delay.
 
-**Known open issues, likely related:** three things reported from testing
+**Known open issues, likely related:** two things reported from testing
 against still-open apps across repeated runs, which may share one root
-cause rather than being three separate bugs:
+cause rather than being two separate bugs:
 
-1. Re-running hrecord against apps still connected from a previous run
-   (stopped hrecord, apps left open, started hrecord again without
-   restarting them) shows noticeably more lag on the second run than the
-   first, even though the startup backlog/overflow numbers logged look
-   similar between the two.
-2. The same repeated-hijack scenario has, intermittently, produced Haiku's
-   own Media Kit printing `Bad port ID`/`GetNodeFor failed` diagnostics
-   during teardown, alongside a large stretch of silence-filled audio
-   mid-session -- consistent with the hijacked app's own connection having
-   gone away before hrecord tried to restore it. hrecord itself doesn't
-   crash when this happens (it finishes and writes output normally), and
-   it doesn't reproduce every time -- sporadic across otherwise-identical
-   repeated runs of the same single tapped app.
-3. When an app disappears mid-session like that (case 2), the zombie
+1. Repeatedly hijacking the same app in quick succession has,
+   intermittently, produced Haiku's own Media Kit printing
+   `Bad port ID`/`GetNodeFor failed` diagnostics during teardown,
+   alongside a large stretch of silence-filled audio mid-session --
+   consistent with the hijacked app's own connection having gone away
+   before hrecord tried to restore it. hrecord itself doesn't crash when
+   this happens (it finishes and writes output normally), and it doesn't
+   reproduce every time -- sporadic across otherwise-identical repeated
+   runs of the same single tapped app.
+2. When an app disappears mid-session like that, the zombie
    Media-preferences-entry problem above can still occur, since there's
    nothing left to cleanly restore by the time hrecord's teardown runs.
 
-The common thread across all three: repeatedly hijacking the same app in
-quick succession, rather than anything specific to `--allaudio` or the
-number of tapped sources (case 1 reproduces with one source as readily as
-three). A settle-delay fix (matching `HijackAppIntoTap`'s own pause after
-Disconnect, previously missing from the mirror-image restore path) didn't
-resolve case 1.
+**Not an hrecord issue, resolved: a "2nd-instance lag" finding
+previously listed here.** Re-running hrecord against apps still connected
+from a previous run (stopped hrecord, apps left open, started hrecord
+again without restarting them) showed noticeably more lag on the second
+run than the first. Comparing the periodic backlog log between a run with
+barely any noticeable lag and a very similar run where lag was clearly
+audible: the numbers were essentially identical -- the same source sat at
+its ring's full capacity (a fixed ~0.07s) for the entire session in
+*both* runs, and the overflow/underrun counts at teardown were nearly the
+same either way. With nothing distinguishing the two runs anywhere in
+hrecord's tap -> ring -> mix -> BSoundPlayer pipeline, the isolating test
+was to restart only the tapped app (Rakarrack) between runs, leaving
+hrecord itself untouched -- and that alone made the lag go away. So this
+lived entirely inside the tapped app's own internal state, not hrecord's
+(hrecord only ever sees whatever audio data an app hands it, never that
+app's own input-to-output round trip, and apparently that round trip
+degraded across repeated hijack/restore cycles for at least this
+particular app). No longer listed as an hrecord issue above; if it ever
+shows up again with some other tapped app, restarting that app between
+runs is the workaround.
 
-**Case 1 is confirmed: it isn't hrecord.** Comparing the periodic backlog
-log between a run with barely any noticeable lag and a very similar run
-where lag was clearly audible: the numbers were essentially identical --
-the same source sat at its ring's full capacity (a fixed ~0.07s) for the
-entire session in *both* runs, and the overflow/underrun counts at
-teardown were nearly the same either way. With nothing distinguishing the
-two runs anywhere in hrecord's tap -> ring -> mix -> BSoundPlayer
-pipeline, the isolating test was to restart only the tapped app (Rakarrack)
-between runs, leaving hrecord itself untouched -- and that alone made the
-lag go away. So case 1 lives entirely inside the tapped app's own internal
-state (hrecord only ever sees whatever audio data an app hands it, never
-that app's own input-to-output round trip, and apparently that round trip
-itself degrades across repeated hijack/restore cycles for at least this
-app). There's nothing in hrecord's own code to fix here; restarting the
-tapped app between runs is the workaround. It's plausible the same
-app-side degradation also explains cases 2 and 3 below, though that's not
-separately confirmed.
-
-**Cases 2 and 3, resolved: the `SoundPlayNode` flood was leftover zombie
-Media Server state, not a persistent hrecord-triggered bug.** After an
+**Cases 1 and 2 above, and the resolved 2nd-instance-lag finding, got a
+shared data point: the `SoundPlayNode` flood was leftover zombie Media
+Server state, not a persistent hrecord-triggered bug.** After an
 `hrecord --allaudio --realtime --audioonly` session hijacked and restored
 Rakarrack, a later launch of Rakarrack started printing Haiku's own
 `SoundPlayNode::FillNextBuffer: RequestBuffer failed` -- the Media Kit's
@@ -444,10 +437,10 @@ widening is harmless to keep (closes a real asymmetry regardless) and
 stays; the `--experimental` buffer-hold cap turned out unnecessary once
 the real cause was identified, so it's been reverted and `--experimental`
 is back to being a no-op, same as before this investigation started.
-Cases 2 and 3 were reported against test sessions carrying the same kind
-of accumulated zombie state -- plausibly the same explanation applies to
-both, though that's not separately re-confirmed against a freshly
-restarted Media Server the way case 2's flood was.
+Cases 1 and 2 above were reported against test sessions carrying the same
+kind of accumulated zombie state -- plausibly the same explanation
+applies to both, though that's not separately re-confirmed against a
+freshly restarted Media Server the way the `SoundPlayNode` flood was.
 
 ## Known issue: "stale" Mixer connection
 

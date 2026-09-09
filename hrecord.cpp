@@ -1,3 +1,8 @@
+/*
+ * Copyright 2026, Kris Beazley (ablyss) hrecord@epluribusunix.net
+ * All rights reserved. Distributed under the terms of the MIT license.
+ */
+
 #include <InterfaceKit.h> // Pulls in BApplication, BScreen, BBitmap
 #include <StorageKit.h>
 #include <SupportKit.h>   // Pulls in system_time()
@@ -1844,7 +1849,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.11";
+	    const char* localVersion = "v1.9.13";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
