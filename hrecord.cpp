@@ -50,23 +50,9 @@ bool g_running = true;
 // --experimental flag pending real-world testing; confirmed clean with
 // three simultaneous sources on a driver hand-tuned to
 // play_buffer_frames 256, so they're --realtime's own defaults now.
-// --experimental is still accepted on the command line, but it's no
-// longer a no-op -- it now gates a different, unrelated experiment (see
-// g_experimentalAudio below).
+// --experimental is still accepted on the command line (a no-op, purely
+// so an existing invocation doesn't break) -- see main().
 bool g_realtimeAudio = false;
-
-// Set once from the --experimental CLI flag (see main()). When true,
-// PaceToRealTime's backpressure hold on a buffer is capped relative to
-// that source's own buffer duration instead of the flat 50ms every other
-// mode uses -- see PaceToRealTime's own comment for the full reasoning.
-// Motivated by a small-buffer producer (rakarrack, ~256 frames/~5.3ms @
-// 48kHz) whose own small BSoundPlayer buffer pool started failing
-// Haiku's "SoundPlayNode::FillNextBuffer: RequestBuffer" continuously
-// for as long as hrecord's tap held its connection. Kept behind its own
-// flag rather than folded into --realtime's defaults (unlike the
-// buffer-size/ring tuning that already lives there) because it's
-// unconfirmed pending real-world testing.
-bool g_experimentalAudio = false;
 
 // ============================================================================
 // Screen recording quality profiles
@@ -781,43 +767,21 @@ public:
             // right at startup) corrects gradually over a few calls
             // instead of blocking this thread -- and anything else it
             // needs to handle, a stop request included -- for one long
-            // stretch. This is *not* a latency dial: a flat, *smaller*
-            // cap applied to every source alike doesn't scale down well
-            // with --realtime (a real user's testing showed the old
-            // --experimental's tighter flat cap turning *zero* drops into
-            // millions -- a smaller cap means slower correction per call,
-            // which a source that's persistently running even slightly
-            // ahead of real time, not just bursting once, never fully
-            // recovers from before the next buffer arrives; combined with
-            // that mode's smaller ring having far less room to absorb the
-            // shortfall, drift compounded across the whole session
-            // instead of clearing). A single generous cap lets correction
-            // actually keep up during normal operation regardless of
-            // mode; ring buffer size (see SetupAllAudioTaps /
-            // SetupDesktopAudioTap) is the actual latency dial.
-            bigtime_t kMaxSnooze = 50000; // 50ms
-
-            // --experimental: cap the hold at roughly 2x *this buffer's
-            // own* duration instead, when that's tighter than 50ms.
-            // Different from the old flat-smaller-cap regression above:
-            // this only tightens the ceiling for sources whose buffers
-            // are themselves small and frequent (e.g. rakarrack's ~256
-            // frames/~5.3ms @ 48kHz gets roughly a 10.6ms cap) -- and for
-            // exactly those sources, correction *opportunity* scales
-            // right along with the tighter cap, since BufferReceived
-            // fires again just as often. A source with large, infrequent
-            // buffers keeps the full 50ms, identical to every other mode.
-            // Motivated by a small-buffer producer's own BSoundPlayer
-            // buffer pool failing to reclaim buffers ("RequestBuffer"
-            // errors) for as long as this tap held one back anywhere
-            // close to the full 50ms -- unconfirmed pending real-world
-            // testing; see readme.md.
-            if (g_experimentalAudio) {
-                bigtime_t relativeCap = bufferDurationUs * 2;
-                if (relativeCap < kMaxSnooze)
-                    kMaxSnooze = relativeCap;
-            }
-
+            // stretch. This is *not* a latency dial: it doesn't scale
+            // down with --realtime/--experimental (a real user's testing
+            // showed --experimental's previous, tighter cap turning
+            // *zero* drops into millions -- a smaller cap means slower
+            // correction per call, which a source that's persistently
+            // running even slightly ahead of real time, not just
+            // bursting once, never fully recovers from before the next
+            // buffer arrives; combined with --experimental's smaller
+            // ring having far less room to absorb that shortfall, drift
+            // compounded across the whole session instead of clearing).
+            // A single generous cap lets correction actually keep up
+            // during normal operation regardless of mode; ring buffer
+            // size (see SetupAllAudioTaps / SetupDesktopAudioTap) is the
+            // actual latency dial.
+            const bigtime_t kMaxSnooze = 50000; // 50ms
             snooze(std::min(aheadBy, kMaxSnooze));
         }
     }
@@ -1566,6 +1530,15 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // --experimental's own tuning was folded into --realtime's defaults
+    // after confirming it clean in testing (see g_realtimeAudio above);
+    // it's still accepted here as a no-op purely so an existing
+    // invocation that includes it doesn't break.
+    if (experimentalAudio && !realtimeAudio) {
+        std::cout << "[i] --experimental now requires nothing extra -- its tuning is part of "
+            "--realtime's own defaults. Add --realtime to get it." << std::endl;
+    }
+
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
     // SetupDesktopAudioTap and SetupAllAudioTaps -- must be set before any
     // of those run, which the audio-tap setup below (section 5a) does.
@@ -1574,17 +1547,10 @@ int main(int argc, char* argv[]) {
         std::cout << "[i] --realtime: using tighter audio buffers for lower monitoring "
             "latency. Best paired with a sound driver already tuned for low latency (see "
             "readme.md) -- this doesn't change the driver's own buffer settings." << std::endl;
-    }
-
-    // Read by PaceToRealTime() -- see its own comment and g_experimentalAudio's
-    // for what this changes and why it's a separate, unconfirmed opt-in
-    // rather than folded into --realtime's defaults.
-    g_experimentalAudio = experimentalAudio;
-    if (g_experimentalAudio) {
-        std::cout << "[i] --experimental: capping how long a tap can hold a source's buffer "
-            "back, relative to that source's own buffer size, instead of a flat 50ms for "
-            "everyone -- an unconfirmed experiment aimed at small-buffer producers (see "
-            "readme.md)." << std::endl;
+        if (experimentalAudio) {
+            std::cout << "[i] --experimental is redundant now (its tuning is already part of "
+                "--realtime) but harmless to keep passing." << std::endl;
+        }
     }
 
     const VideoProfile& profile = kVideoProfiles[profileIndex];
@@ -1878,7 +1844,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.9";
+	    const char* localVersion = "v1.9.8";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
