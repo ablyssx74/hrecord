@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -33,6 +33,11 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realt
   real-time use (e.g. playing an instrument live through effects, such as
   rakarrack, while recording); a casual recording doesn't need it. See
   "--realtime: lower monitoring latency" below.
+- `hrecord start --realtime --experimental` — pushes the same buffers
+  --realtime tunes even tighter, for someone who's *also* hand-tuned their
+  own sound driver well past a typical low-latency setting. Requires
+  `--realtime`. Less tested than `--realtime` alone -- see "--experimental:
+  pushing further" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -272,26 +277,47 @@ a live instrument through effects, e.g. rakarrack, while playing -- that
 remaining margin is latency worth trimming; a casual recording doesn't
 need to.
 
-`--realtime` trims two things, in both single-tap and `--allaudio` mode:
+`--realtime` trims three things, in both single-tap and `--allaudio` mode.
+With pacing already preventing a growing backlog, the ring buffers'
+steady-state fill tracks genuine jitter, not a queue that needs seconds of
+headroom -- so trading away some of that headroom for a lower latency
+ceiling is a reasonable bet for a real-time use case, even though it's
+never been formally load-tested against a heavily loaded system:
 
-- The audio-tap ring buffer(s): down from 2s to 0.1s in `--allaudio` mode
-  (per source), and from 0.5s to 0.1s in single-tap mode. With pacing
-  already preventing a growing backlog, these rings' steady-state fill
-  tracks genuine jitter, not a queue that needs seconds of headroom --
-  `--realtime` trades some of that jitter headroom for a lower latency
-  ceiling.
-- The buffer size requested from BSoundPlayer: down to ~1024 frames
-  (deliberately the same scale as the `hda.settings` low-latency example
-  above, ~5-20ms depending on rate) from a larger default. It's only a
-  hint -- the Mixer can renegotiate it away -- but matching an
-  already-tuned driver's own scale gives it the best chance of being
-  honored.
+| | Default | `--realtime` | `--realtime --experimental` |
+|---|---|---|---|
+| Audio-tap ring buffer (`--allaudio`, per source) | 2s | 0.1s | 0.03s |
+| Audio-tap ring buffer (single-tap) | 0.5s | 0.1s | 0.03s |
+| BSoundPlayer buffer size requested | (default) | ~1024 frames | ~256 frames |
+| Pacing catch-up snooze cap | 200ms | 20ms | 5ms |
 
-`--realtime` only touches hrecord's own buffering. It doesn't change your
-sound driver's own settings -- pair it with a driver already tuned for low
-latency (the `hda.settings` section above) for it to actually matter; on
-default driver settings there's a hardware buffer floor `--realtime` can't
-get under.
+The BSoundPlayer buffer size is only a hint -- the Mixer can renegotiate it
+away -- but matching an already-tuned driver's own scale gives it the best
+chance of being honored. `--realtime` only touches hrecord's own
+buffering, not your sound driver's own settings -- pair it with a driver
+already tuned for low latency (the `hda.settings` section above) for it to
+actually matter; on default driver settings there's a hardware buffer
+floor neither flag can get under.
+
+## `--experimental`: pushing further
+
+`--realtime`'s own numbers were chosen to match the `hda.settings`
+low-latency example this readme documents (~1024 frames). A real user of
+this project went well past that, hand-tuning their own driver down to
+`play_buffer_frames 256`/`play_buffer_count 4` at 48kHz -- tighter than
+what `--realtime` alone targets. `--experimental` (requires `--realtime`)
+pushes hrecord's own buffers to roughly match that same tighter scale (see
+the table above).
+
+This is meant as a starting point for tuning against a specific,
+already-aggressively-configured driver, not a universally-better default
+-- it's less tested than `--realtime` itself, and how far it can safely go
+depends on what a given system can actually sustain. If it introduces
+glitches `--realtime` alone didn't, that's a sign the constants it uses
+(`MixBusFormat`, the ring sizing in `SetupAllAudioTaps` /
+`SetupDesktopAudioTap`, and the snooze cap in
+`AudioTapNode::PaceToRealTime`) need tuning for that specific setup rather
+than something to just live with.
 
 ## Known issue: "stale" Mixer connection
 
