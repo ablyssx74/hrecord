@@ -277,7 +277,7 @@ a live instrument through effects, e.g. rakarrack, while playing -- that
 remaining margin is latency worth trimming; a casual recording doesn't
 need to.
 
-`--realtime` trims three things, in both single-tap and `--allaudio` mode.
+`--realtime` trims two things, in both single-tap and `--allaudio` mode.
 With pacing already preventing a growing backlog, the ring buffers'
 steady-state fill tracks genuine jitter, not a queue that needs seconds of
 headroom -- so trading away some of that headroom for a lower latency
@@ -286,10 +286,9 @@ never been formally load-tested against a heavily loaded system:
 
 | | Default | `--realtime` | `--realtime --experimental` |
 |---|---|---|---|
-| Audio-tap ring buffer (`--allaudio`, per source) | 2s | 0.1s | 0.03s |
-| Audio-tap ring buffer (single-tap) | 0.5s | 0.1s | 0.03s |
+| Audio-tap ring buffer (`--allaudio`, per source) | 2s | 0.1s | 0.07s |
+| Audio-tap ring buffer (single-tap) | 0.5s | 0.1s | 0.07s |
 | BSoundPlayer buffer size requested | (default) | ~1024 frames | ~256 frames |
-| Pacing catch-up snooze cap | 200ms | 20ms | 5ms |
 
 The BSoundPlayer buffer size is only a hint -- the Mixer can renegotiate it
 away -- but matching an already-tuned driver's own scale gives it the best
@@ -306,18 +305,39 @@ low-latency example this readme documents (~1024 frames). A real user of
 this project went well past that, hand-tuning their own driver down to
 `play_buffer_frames 256`/`play_buffer_count 4` at 48kHz -- tighter than
 what `--realtime` alone targets. `--experimental` (requires `--realtime`)
-pushes hrecord's own buffers to roughly match that same tighter scale (see
-the table above).
+requests a matching ~256-frame buffer from BSoundPlayer and trims the ring
+buffers a bit further (see the table above) -- deliberately a modest step
+beyond `--realtime`, not an aggressive one.
 
-This is meant as a starting point for tuning against a specific,
+**A first attempt at this went badly**, and it's worth explaining why,
+since it's a real correction rather than just a smaller number. That first
+version *also* shrank a "catch-up snooze cap" inside the pacing logic --
+reasoning that a smaller cap meant a large corrective sleep could never
+itself become a latency spike. In testing it did the opposite: overflow on
+three tapped sources went from at-or-near zero (clean) under `--realtime`
+to hundreds of thousands, even tens of millions, of bytes dropped -- heard
+as constant crackling on everything, not just a little extra lag. The
+mechanism: that cap doesn't just bound a single sleep, it bounds *how much
+drift pacing can correct per buffer*. A source running even slightly ahead
+of real time needs to fully correct before the next buffer arrives to stay
+caught up; a tighter cap makes that take more calls, and a smaller ring
+(also shrunk in that first attempt) leaves far less room to absorb the gap
+while it does. The two changes compounded instead of adding.
+
+The fix: the snooze cap is no longer part of the --realtime/--experimental
+tuning at all -- it's a single, generous 50ms in every mode now, since its
+actual job (stop one anomalous burst from blocking this thread for too
+long) never needed to scale with a latency target in the first place. Ring
+buffer size is the real, and only, latency dial `--experimental` turns.
+
+This is still meant as a starting point for tuning against a specific,
 already-aggressively-configured driver, not a universally-better default
 -- it's less tested than `--realtime` itself, and how far it can safely go
-depends on what a given system can actually sustain. If it introduces
-glitches `--realtime` alone didn't, that's a sign the constants it uses
-(`MixBusFormat`, the ring sizing in `SetupAllAudioTaps` /
-`SetupDesktopAudioTap`, and the snooze cap in
-`AudioTapNode::PaceToRealTime`) need tuning for that specific setup rather
-than something to just live with.
+depends on what a given system can actually sustain. If it still
+introduces glitches `--realtime` alone didn't, that's a sign the ring
+sizing in `SetupAllAudioTaps` / `SetupDesktopAudioTap` needs tuning for
+that specific setup (try easing `0.07` back toward `0.1`) rather than
+something to just live with.
 
 ## Known issue: "stale" Mixer connection
 

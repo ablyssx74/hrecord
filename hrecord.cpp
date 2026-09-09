@@ -762,16 +762,25 @@ public:
 
         bigtime_t aheadBy = fPacedDurationUs - (now - fPacingStartTime);
         if (aheadBy > 0) {
-            // Cap a single snooze so an unusual burst (e.g. right at
-            // startup) corrects gradually over a few calls instead of
-            // blocking this thread -- and so anything else it needs to
-            // handle (a stop request included) -- for a long single
-            // stretch. Tighter under --realtime (tighter still under
-            // --experimental), where a large single catch-up sleep would
-            // itself be a latency spike worth avoiding, at the cost of
-            // taking a little longer to fully correct an unusual burst.
-            const bigtime_t kMaxSnooze =
-                g_experimentalAudio ? 5000 : (g_realtimeAudio ? 20000 : 200000); // 5/20/200ms
+            // Cap a single snooze so a one-time anomalous burst (e.g.
+            // right at startup) corrects gradually over a few calls
+            // instead of blocking this thread -- and anything else it
+            // needs to handle, a stop request included -- for one long
+            // stretch. This is *not* a latency dial: it doesn't scale
+            // down with --realtime/--experimental (a real user's testing
+            // showed --experimental's previous, tighter cap turning
+            // *zero* drops into millions -- a smaller cap means slower
+            // correction per call, which a source that's persistently
+            // running even slightly ahead of real time, not just
+            // bursting once, never fully recovers from before the next
+            // buffer arrives; combined with --experimental's smaller
+            // ring having far less room to absorb that shortfall, drift
+            // compounded across the whole session instead of clearing).
+            // A single generous cap lets correction actually keep up
+            // during normal operation regardless of mode; ring buffer
+            // size (see SetupAllAudioTaps / SetupDesktopAudioTap) is the
+            // actual latency dial.
+            const bigtime_t kMaxSnooze = 50000; // 50ms
             snooze(std::min(aheadBy, kMaxSnooze));
         }
     }
@@ -1054,8 +1063,12 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     // paced to real time, this ring's steady-state fill tracks genuine
     // jitter rather than a growing backlog, so --realtime (and
     // --experimental further still) can trade some of that jitter
-    // headroom for a lower latency ceiling.
-    double ringSeconds = g_experimentalAudio ? 0.03 : (g_realtimeAudio ? 0.1 : 0.5);
+    // headroom for a lower latency ceiling. --experimental's own margin
+    // over --realtime is deliberately modest (not the aggressive cut
+    // tried initially) since ring size is the actual latency dial now
+    // that the snooze cap isn't limiting correction speed -- see
+    // PaceToRealTime.
+    double ringSeconds = g_experimentalAudio ? 0.07 : (g_realtimeAudio ? 0.1 : 0.5);
     size_t ringCapacity = bytesPerFrame > 0
         ? (size_t)(bytesPerFrame * rate * ringSeconds) : 65536;
     g_playbackRing.Init(ringCapacity);
@@ -1325,8 +1338,11 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         // headroom back for a lower worst-case latency ceiling instead, on
         // the theory that a real-time monitoring use case would rather
         // risk an occasional glitch than accept seconds of guaranteed
-        // slack it's very unlikely to ever need.
-        double ringSeconds = g_experimentalAudio ? 0.03 : (g_realtimeAudio ? 0.1 : 2.0);
+        // slack it's very unlikely to ever need. --experimental's own
+        // margin over --realtime is deliberately modest (not the
+        // aggressive cut tried initially) -- see the note in
+        // SetupDesktopAudioTap and PaceToRealTime.
+        double ringSeconds = g_experimentalAudio ? 0.07 : (g_realtimeAudio ? 0.1 : 2.0);
         size_t ringCapacity =
             (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * ringSeconds);
         entry.ring->Init(ringCapacity);
@@ -1769,7 +1785,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.8.0";
+	    const char* localVersion = "v1.8.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
