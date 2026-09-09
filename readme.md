@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly [--allaudio]] [--realtime] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -21,16 +21,18 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly [--allaudio]] [--realt
   and Vorbis are open, royalty-free formats, so this carries none of the
   licensing baggage a proprietary audio codec would. Taps one currently
   playing app (see "How desktop-audio capture works" below).
-- `hrecord start --audioonly --allaudio` — same as above, but taps *every*
-  app currently playing sound and mixes them together, instead of just one.
-  See "Recording every audio source at once" below.
-- `hrecord start --realtime` (with or without `--allaudio`) — trims the
-  audio-tap ring buffers and the buffer size requested from BSoundPlayer for
-  lower live-monitoring latency, at the cost of a smaller safety margin
-  against glitches. Worth it for genuinely real-time use (e.g. playing an
-  instrument live through effects, such as rakarrack, while recording); a
-  casual recording doesn't need it. See "--realtime: lower monitoring
-  latency" below.
+- `hrecord start --allaudio` — taps *every* app currently playing sound and
+  mixes them together, instead of just one. Works with or without
+  `--audioonly` -- combine it with plain `hrecord start` to get screen
+  recording with every currently-playing app mixed into its audio track,
+  not just one. See "Recording every audio source at once" below.
+- `hrecord start --realtime` — trims the audio-tap ring buffers and the
+  buffer size requested from BSoundPlayer for lower live-monitoring
+  latency, at the cost of a smaller safety margin against glitches. Works
+  with or without `--allaudio`/`--audioonly`. Worth it for genuinely
+  real-time use (e.g. playing an instrument live through effects, such as
+  rakarrack, while recording); a casual recording doesn't need it. See
+  "--realtime: lower monitoring latency" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the

@@ -1438,15 +1438,10 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--high") == 0) {
             profileIndex = 2;
         } else {
-            std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly "
-                "[--allaudio]] [--realtime] [--list-audio-inputs]" << std::endl;
+            std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
+                "[--allaudio] [--realtime] [--list-audio-inputs]" << std::endl;
             return 0;
         }
-    }
-
-    if (allAudio && !audioOnly) {
-        std::cerr << "[-] Error: --allaudio requires --audioonly." << std::endl;
-        return -1;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -1742,7 +1737,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.7.0";
+	    const char* localVersion = "v1.7.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
