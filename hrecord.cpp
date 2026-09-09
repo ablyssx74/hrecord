@@ -47,6 +47,19 @@ bool g_running = true;
 // readme.md) -- this doesn't touch the driver's own buffer settings.
 bool g_realtimeAudio = false;
 
+// Set once from the --experimental CLI flag (requires --realtime; see
+// main()). Pushes the same knobs --realtime tunes even further -- meant
+// for someone who has *also* hand-tuned their sound driver well past
+// hda.settings' own low-latency example (a real user of this project
+// ended up at play_buffer_frames 256, well under the 1024 --realtime
+// itself targets) and wants hrecord's own buffering to try to keep pace.
+// Less tested than --realtime itself, hence its own flag rather than
+// folding into --realtime directly -- expect to need to tune the actual
+// constants this controls (see MixBusFormat, SetupAllAudioTaps,
+// SetupDesktopAudioTap, AudioTapNode::PaceToRealTime) against whatever a
+// given driver configuration can actually sustain.
+bool g_experimentalAudio = false;
+
 // ============================================================================
 // Screen recording quality profiles
 //
@@ -145,8 +158,8 @@ void ListAudioInputs(BMediaRoster* roster) {
         return;
     }
 
-    std::cout << "[+] Apps currently feeding the System Mixer (hrecord taps one of these):"
-        << std::endl;
+    std::cout << "[+] Apps currently feeding the System Mixer (hrecord taps one of these, or "
+        "taps all apps with --allaudio):" << std::endl;
     for (int32 i = 0; i < count; i++) {
         media_node_id sourceNodeId = roster->NodeIDFor(inputs[i].source.port);
         live_node_info info;
@@ -504,11 +517,13 @@ media_raw_audio_format MixBusFormat() {
     // Under --realtime, request 1024 frames -- deliberately mirroring the
     // frame count in the hda.settings low-latency example this project's
     // own readme documents (~5-20ms depending on rate), rather than an
-    // arbitrary byte count. This is only a hint (the Mixer may renegotiate
-    // it away entirely), but matching the same scale as an already-tuned
-    // driver gives it the best chance of actually being honored.
-    fmt.buffer_size = g_realtimeAudio
-        ? (size_t)(kMixBusChannels * sizeof(float) * 1024) : 4096;
+    // arbitrary byte count. --experimental goes further still, to 256
+    // frames, matching how far a real user of this project ended up
+    // tuning their own driver. Either way this is only a hint (the Mixer
+    // may renegotiate it away entirely), but matching the same scale as
+    // an already-tuned driver gives it the best chance of being honored.
+    int frames = g_experimentalAudio ? 256 : (g_realtimeAudio ? 1024 : 0);
+    fmt.buffer_size = frames > 0 ? (size_t)(kMixBusChannels * sizeof(float) * frames) : 4096;
     return fmt;
 }
 
@@ -751,11 +766,12 @@ public:
             // startup) corrects gradually over a few calls instead of
             // blocking this thread -- and so anything else it needs to
             // handle (a stop request included) -- for a long single
-            // stretch. Tighter under --realtime, where a large single
-            // catch-up sleep would itself be a latency spike worth
-            // avoiding, at the cost of taking a little longer to fully
-            // correct an unusual burst.
-            const bigtime_t kMaxSnooze = g_realtimeAudio ? 20000 : 200000; // 20ms / 200ms
+            // stretch. Tighter under --realtime (tighter still under
+            // --experimental), where a large single catch-up sleep would
+            // itself be a latency spike worth avoiding, at the cost of
+            // taking a little longer to fully correct an unusual burst.
+            const bigtime_t kMaxSnooze =
+                g_experimentalAudio ? 5000 : (g_realtimeAudio ? 20000 : 200000); // 5/20/200ms
             snooze(std::min(aheadBy, kMaxSnooze));
         }
     }
@@ -1036,20 +1052,22 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     float rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100.0f;
     // See PaceToRealTime's comment: with the tap's own consumption now
     // paced to real time, this ring's steady-state fill tracks genuine
-    // jitter rather than a growing backlog, so --realtime can trade some
-    // of that jitter headroom for a lower latency ceiling.
-    double ringSeconds = g_realtimeAudio ? 0.1 : 0.5;
+    // jitter rather than a growing backlog, so --realtime (and
+    // --experimental further still) can trade some of that jitter
+    // headroom for a lower latency ceiling.
+    double ringSeconds = g_experimentalAudio ? 0.03 : (g_realtimeAudio ? 0.1 : 0.5);
     size_t ringCapacity = bytesPerFrame > 0
         ? (size_t)(bytesPerFrame * rate * ringSeconds) : 65536;
     g_playbackRing.Init(ringCapacity);
     tap->SetPlaybackRing(&g_playbackRing);
 
     if (g_realtimeAudio && bytesPerFrame > 0) {
-        // Same rationale as MixBusFormat(): request ~1024 frames, matching
-        // the scale of the hda.settings low-latency example this project's
-        // readme documents, rather than leaving whatever buffer_size the
-        // app itself happened to negotiate with the Mixer originally.
-        negotiated.buffer_size = (size_t)bytesPerFrame * 1024;
+        // Same rationale as MixBusFormat(): request ~1024 frames (256
+        // under --experimental), matching the scale of an already-tuned
+        // driver, rather than leaving whatever buffer_size the app itself
+        // happened to negotiate with the Mixer originally.
+        int frames = g_experimentalAudio ? 256 : 1024;
+        negotiated.buffer_size = (size_t)bytesPerFrame * frames;
     }
 
     BSoundPlayer* player = new BSoundPlayer(&negotiated, "hrecord Playback", PlaybackCallback,
@@ -1302,12 +1320,13 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         //
         // Now that AudioTapNode paces its own consumption to real time
         // (see BufferReceived), this ring's steady-state fill level tracks
-        // genuine jitter, not a growing backlog -- so under --realtime it
-        // trades some of that jitter headroom back for a lower worst-case
-        // latency ceiling instead, on the theory that a real-time monitoring
-        // use case would rather risk an occasional glitch than accept
-        // seconds of guaranteed slack it's very unlikely to ever need.
-        double ringSeconds = g_realtimeAudio ? 0.1 : 2.0;
+        // genuine jitter, not a growing backlog -- so under --realtime (and
+        // --experimental further still) it trades some of that jitter
+        // headroom back for a lower worst-case latency ceiling instead, on
+        // the theory that a real-time monitoring use case would rather
+        // risk an occasional glitch than accept seconds of guaranteed
+        // slack it's very unlikely to ever need.
+        double ringSeconds = g_experimentalAudio ? 0.03 : (g_realtimeAudio ? 0.1 : 2.0);
         size_t ringCapacity =
             (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * ringSeconds);
         entry.ring->Init(ringCapacity);
@@ -1414,6 +1433,7 @@ int main(int argc, char* argv[]) {
     bool audioOnly = false;
     bool allAudio = false;
     bool realtimeAudio = false;
+    bool experimentalAudio = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -1429,6 +1449,8 @@ int main(int argc, char* argv[]) {
             allAudio = true;
         } else if (strcmp(argv[i], "--realtime") == 0) {
             realtimeAudio = true;
+        } else if (strcmp(argv[i], "--experimental") == 0) {
+            experimentalAudio = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -1439,16 +1461,26 @@ int main(int argc, char* argv[]) {
             profileIndex = 2;
         } else {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
-                "[--allaudio] [--realtime] [--list-audio-inputs]" << std::endl;
+                "[--allaudio] [--realtime] [--experimental] [--list-audio-inputs]" << std::endl;
             return 0;
         }
+    }
+
+    if (experimentalAudio && !realtimeAudio) {
+        std::cerr << "[-] Error: --experimental requires --realtime." << std::endl;
+        return -1;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
     // SetupDesktopAudioTap and SetupAllAudioTaps -- must be set before any
     // of those run, which the audio-tap setup below (section 5a) does.
     g_realtimeAudio = realtimeAudio;
-    if (g_realtimeAudio) {
+    g_experimentalAudio = experimentalAudio;
+    if (g_experimentalAudio) {
+        std::cout << "[i] --experimental: pushing audio buffers even tighter than --realtime "
+            "alone. Less tested -- only worth it if --realtime by itself still isn't tight "
+            "enough for your own hand-tuned driver settings (see readme.md)." << std::endl;
+    } else if (g_realtimeAudio) {
         std::cout << "[i] --realtime: using tighter audio buffers for lower monitoring "
             "latency. Best paired with a sound driver already tuned for low latency (see "
             "readme.md) -- this doesn't change the driver's own buffer settings." << std::endl;
@@ -1737,7 +1769,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.7.1";
+	    const char* localVersion = "v1.8.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
