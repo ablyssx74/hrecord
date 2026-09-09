@@ -37,6 +37,16 @@ extern "C" {
 
 bool g_running = true;
 
+// Set once from the --realtime CLI flag (see main()). When true, the
+// audio-tap ring buffers and the buffer size requested from BSoundPlayer
+// are tuned smaller, trading away some of the safety margin against
+// buffering-jitter glitches for lower monitoring latency -- worth it for
+// a genuinely real-time use case (e.g. playing guitar live through
+// rakarrack while recording), not something a casual recording needs, and
+// only useful alongside a driver already tuned for low latency (see
+// readme.md) -- this doesn't touch the driver's own buffer settings.
+bool g_realtimeAudio = false;
+
 // ============================================================================
 // Screen recording quality profiles
 //
@@ -491,7 +501,14 @@ media_raw_audio_format MixBusFormat() {
     fmt.channel_count = kMixBusChannels;
     fmt.format = media_raw_audio_format::B_AUDIO_FLOAT;
     fmt.byte_order = B_MEDIA_HOST_ENDIAN;
-    fmt.buffer_size = 4096;
+    // Under --realtime, request 1024 frames -- deliberately mirroring the
+    // frame count in the hda.settings low-latency example this project's
+    // own readme documents (~5-20ms depending on rate), rather than an
+    // arbitrary byte count. This is only a hint (the Mixer may renegotiate
+    // it away entirely), but matching the same scale as an already-tuned
+    // driver gives it the best chance of actually being honored.
+    fmt.buffer_size = g_realtimeAudio
+        ? (size_t)(kMixBusChannels * sizeof(float) * 1024) : 4096;
     return fmt;
 }
 
@@ -659,79 +676,88 @@ public:
 
         void* data = buffer->Data();
         size_t size = buffer->SizeUsed();
+        bool feedsLivePlayback = false;
 
         if (fMixResampler != nullptr && fMixRing != nullptr) {
             // --allaudio path: this source only ever feeds the shared mix,
             // never the encoder or a playback ring directly.
             MixAndBuffer(fMixResampler, data, size, fInput.format.u.raw_audio, fMixRing);
-
-            // This node is deliberately untimed (SetTimeSource(nullptr),
-            // B_RECORDING run mode -- see the constructor) so it just
-            // takes whatever the hijacked app hands it, whenever, with no
-            // scheduling of its own. That's fine in single-tap mode: the
-            // encoder just processes whatever arrives, with nothing
-            // downstream that cares about wall-clock pacing. But in
-            // --allaudio mode there IS something real-time-paced
-            // downstream now: MixedPlaybackCallback, tied to the
-            // hardware's own clock. If the hijacked app pushes audio
-            // faster than real time -- confirmed happening here, tens of
-            // *millions* of bytes continuously dropped in one session,
-            // not a one-time burst -- nothing was pushing back on it, and
-            // it just piled up in fMixRing, either overflowing
-            // continuously (heard as popping) or, with a big enough ring
-            // to absorb it, settling into a fixed, ever-present backlog
-            // instead (heard as several seconds of pure delay before
-            // anything is heard, and while it's not overflowing right at
-            // that moment, everything after is still exactly ring-size
-            // behind). Neither is actually fixed by resizing the ring --
-            // that only changes which of the two symptoms you get.
-            //
-            // The actual fix is real backpressure: pace this tap's own
-            // consumption to real time so the *producer* is throttled
-            // instead, the same way it naturally would be were it still
-            // connected straight to the Mixer. Delaying Recycle() below
-            // is what does that -- it's the signal the Media Kit uses to
-            // let a producer know it can send more.
-            //
-            // This deliberately doesn't just give the node a real time
-            // source instead (the "normal" way Media Kit nodes stay
-            // paced) -- SetTimeSource(nullptr) was chosen earlier in this
-            // project specifically to avoid a reproducible
-            // BTimeSource::RealTimeFor crash in a different (now-abandoned)
-            // approach, and revisiting that tradeoff isn't worth the risk
-            // here when a simple snooze() achieves the same effect.
-            const media_raw_audio_format& fmt = fInput.format.u.raw_audio;
-            int sampleSize = fmt.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
-            int bytesPerFrame = sampleSize * (int)fmt.channel_count;
-            if (bytesPerFrame > 0 && fmt.frame_rate > 0) {
-                int nbSamples = (int)(size / bytesPerFrame);
-                bigtime_t bufferDurationUs = (bigtime_t)(nbSamples * 1000000.0 / fmt.frame_rate);
-
-                bigtime_t now = system_time();
-                if (fPacingStartTime == 0)
-                    fPacingStartTime = now;
-                fPacedDurationUs += bufferDurationUs;
-
-                bigtime_t aheadBy = fPacedDurationUs - (now - fPacingStartTime);
-                if (aheadBy > 0) {
-                    // Cap a single snooze so an unusual burst (e.g. right
-                    // at startup) corrects gradually over a few calls
-                    // instead of blocking this thread -- and so anything
-                    // else it needs to handle (a stop request included)
-                    // -- for a long single stretch.
-                    const bigtime_t kMaxSnooze = 200000; // 200ms
-                    snooze(std::min(aheadBy, kMaxSnooze));
-                }
-            }
+            feedsLivePlayback = true;
         } else {
             if (fEncoder != nullptr && g_running)
                 EncodeAudioSamples(fEncoder, data, size, fInput.format.u.raw_audio);
 
-            if (fRing != nullptr)
+            if (fRing != nullptr) {
                 fRing->Write(data, size);
+                feedsLivePlayback = true;
+            }
         }
 
+        if (feedsLivePlayback)
+            PaceToRealTime(fInput.format.u.raw_audio, size);
+
         buffer->Recycle();
+    }
+
+    // This node is deliberately untimed (SetTimeSource(nullptr),
+    // B_RECORDING run mode -- see the constructor) so it just takes
+    // whatever the hijacked app hands it, whenever, with no scheduling of
+    // its own. That's harmless when nothing downstream cares about
+    // wall-clock pacing -- but both single-tap and --allaudio mode always
+    // feed a real-time-paced BSoundPlayer for live monitoring (via fRing
+    // or fMixRing respectively), tied to the hardware's own clock. If the
+    // hijacked app pushes audio faster than real time -- confirmed
+    // happening in practice, tens of *millions* of bytes continuously
+    // dropped in one --allaudio session, not a one-time burst -- nothing
+    // was pushing back on it, and it just piled up in that ring buffer,
+    // either overflowing continuously (heard as popping) or, with a big
+    // enough ring to absorb it, settling into a fixed, ever-present
+    // backlog instead (heard as a long delay before anything is heard,
+    // and staying exactly that far behind afterward). Neither is actually
+    // fixed by resizing the ring -- that only changes which of the two
+    // symptoms shows up.
+    //
+    // The actual fix is real backpressure: pace this tap's own
+    // consumption to real time so the *producer* is throttled instead,
+    // the same way it naturally would be were it still connected straight
+    // to the Mixer. Delaying Recycle() (back in BufferReceived, after this
+    // returns) is what does that -- it's the signal Media Kit uses to let
+    // a producer know it can send more.
+    //
+    // This deliberately doesn't just give the node a real time source
+    // instead (the more "normal" way Media Kit nodes stay paced) --
+    // SetTimeSource(nullptr) was chosen earlier in this project
+    // specifically to avoid a reproducible BTimeSource::RealTimeFor crash
+    // in a different (now-abandoned) approach, and revisiting that
+    // tradeoff isn't worth the risk here when a simple snooze() achieves
+    // the same effect.
+    void PaceToRealTime(const media_raw_audio_format& fmt, size_t size) {
+        int sampleSize = fmt.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
+        int bytesPerFrame = sampleSize * (int)fmt.channel_count;
+        if (bytesPerFrame <= 0 || fmt.frame_rate <= 0)
+            return;
+
+        int nbSamples = (int)(size / bytesPerFrame);
+        bigtime_t bufferDurationUs = (bigtime_t)(nbSamples * 1000000.0 / fmt.frame_rate);
+
+        bigtime_t now = system_time();
+        if (fPacingStartTime == 0)
+            fPacingStartTime = now;
+        fPacedDurationUs += bufferDurationUs;
+
+        bigtime_t aheadBy = fPacedDurationUs - (now - fPacingStartTime);
+        if (aheadBy > 0) {
+            // Cap a single snooze so an unusual burst (e.g. right at
+            // startup) corrects gradually over a few calls instead of
+            // blocking this thread -- and so anything else it needs to
+            // handle (a stop request included) -- for a long single
+            // stretch. Tighter under --realtime, where a large single
+            // catch-up sleep would itself be a latency spike worth
+            // avoiding, at the cost of taking a little longer to fully
+            // correct an unusual burst.
+            const bigtime_t kMaxSnooze = g_realtimeAudio ? 20000 : 200000; // 20ms / 200ms
+            snooze(std::min(aheadBy, kMaxSnooze));
+        }
     }
 
     virtual void ProducerDataStatus(const media_destination& forWhom, int32 status,
@@ -1008,10 +1034,23 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     int bytesPerFrame = (negotiated.format & media_raw_audio_format::B_AUDIO_SIZE_MASK)
         * (int)(negotiated.channel_count > 0 ? negotiated.channel_count : 2);
     float rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100.0f;
+    // See PaceToRealTime's comment: with the tap's own consumption now
+    // paced to real time, this ring's steady-state fill tracks genuine
+    // jitter rather than a growing backlog, so --realtime can trade some
+    // of that jitter headroom for a lower latency ceiling.
+    double ringSeconds = g_realtimeAudio ? 0.1 : 0.5;
     size_t ringCapacity = bytesPerFrame > 0
-        ? (size_t)(bytesPerFrame * rate * 0.5) : 65536;
+        ? (size_t)(bytesPerFrame * rate * ringSeconds) : 65536;
     g_playbackRing.Init(ringCapacity);
     tap->SetPlaybackRing(&g_playbackRing);
+
+    if (g_realtimeAudio && bytesPerFrame > 0) {
+        // Same rationale as MixBusFormat(): request ~1024 frames, matching
+        // the scale of the hda.settings low-latency example this project's
+        // readme documents, rather than leaving whatever buffer_size the
+        // app itself happened to negotiate with the Mixer originally.
+        negotiated.buffer_size = (size_t)bytesPerFrame * 1024;
+    }
 
     BSoundPlayer* player = new BSoundPlayer(&negotiated, "hrecord Playback", PlaybackCallback,
         nullptr, &g_playbackRing);
@@ -1260,8 +1299,17 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         // well before any rate mismatch is even in play. Two seconds costs
         // only ~1.5MB per tapped source and trades a bit more live-
         // monitoring lag for a lot more headroom against exactly that.
+        //
+        // Now that AudioTapNode paces its own consumption to real time
+        // (see BufferReceived), this ring's steady-state fill level tracks
+        // genuine jitter, not a growing backlog -- so under --realtime it
+        // trades some of that jitter headroom back for a lower worst-case
+        // latency ceiling instead, on the theory that a real-time monitoring
+        // use case would rather risk an occasional glitch than accept
+        // seconds of guaranteed slack it's very unlikely to ever need.
+        double ringSeconds = g_realtimeAudio ? 0.1 : 2.0;
         size_t ringCapacity =
-            (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * 2.0);
+            (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * ringSeconds);
         entry.ring->Init(ringCapacity);
         entry.appNode = appNode;
         entry.originalAppOutput = originalAppOutput;
@@ -1365,6 +1413,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     bool audioOnly = false;
     bool allAudio = false;
+    bool realtimeAudio = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -1378,6 +1427,8 @@ int main(int argc, char* argv[]) {
             audioOnly = true;
         } else if (strcmp(argv[i], "--allaudio") == 0) {
             allAudio = true;
+        } else if (strcmp(argv[i], "--realtime") == 0) {
+            realtimeAudio = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -1388,7 +1439,7 @@ int main(int argc, char* argv[]) {
             profileIndex = 2;
         } else {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly "
-                "[--allaudio]] [--list-audio-inputs]" << std::endl;
+                "[--allaudio]] [--realtime] [--list-audio-inputs]" << std::endl;
             return 0;
         }
     }
@@ -1396,6 +1447,16 @@ int main(int argc, char* argv[]) {
     if (allAudio && !audioOnly) {
         std::cerr << "[-] Error: --allaudio requires --audioonly." << std::endl;
         return -1;
+    }
+
+    // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
+    // SetupDesktopAudioTap and SetupAllAudioTaps -- must be set before any
+    // of those run, which the audio-tap setup below (section 5a) does.
+    g_realtimeAudio = realtimeAudio;
+    if (g_realtimeAudio) {
+        std::cout << "[i] --realtime: using tighter audio buffers for lower monitoring "
+            "latency. Best paired with a sound driver already tuned for low latency (see "
+            "readme.md) -- this doesn't change the driver's own buffer settings." << std::endl;
     }
 
     const VideoProfile& profile = kVideoProfiles[profileIndex];
@@ -1681,7 +1742,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.6.6";
+	    const char* localVersion = "v1.7.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
