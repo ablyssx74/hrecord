@@ -14,13 +14,19 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realt
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
-  container) to `/boot/home/hrecord_capture.mkv`, with a Vorbis desktop-audio
-  track alongside it whenever the audio tap (below) can be set up.
+  container) to `/boot/home/hrecord_capture_YYYYMMDD_HHMMSS.mkv`, with a
+  Vorbis desktop-audio track alongside it whenever the audio tap (below) can
+  be set up.
 - `hrecord start --audioonly` — records desktop audio only (no screen
-  capture) to `/boot/home/hrecord_capture.ogg`, an Ogg/Vorbis file. Both Ogg
-  and Vorbis are open, royalty-free formats, so this carries none of the
-  licensing baggage a proprietary audio codec would. Taps one currently
-  playing app (see "How desktop-audio capture works" below).
+  capture) to `/boot/home/hrecord_capture_YYYYMMDD_HHMMSS.ogg`, an
+  Ogg/Vorbis file. Both Ogg and Vorbis are open, royalty-free formats, so
+  this carries none of the licensing baggage a proprietary audio codec
+  would. Taps one currently playing app (see "How desktop-audio capture
+  works" below).
+
+Every run's filename is stamped with its own start time (local time,
+`YYYYMMDD_HHMMSS`), so starting a new recording never silently overwrites
+whatever an earlier run left behind in `/boot/home`.
 - `hrecord start --allaudio` — taps *every* app currently playing sound and
   mixes them together, instead of just one. Works with or without
   `--audioonly` -- combine it with plain `hrecord start` to get screen

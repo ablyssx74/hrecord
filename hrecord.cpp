@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
+#include <ctime>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -1672,9 +1673,17 @@ int main(int argc, char* argv[]) {
     //    default      -> Matroska file carrying MJPEG video plus, when the
     //                    desktop-audio tap could be set up, a Vorbis audio
     //                    track alongside it
-    const char* output_filename = audioOnly
-        ? "/boot/home/hrecord_capture.ogg"
-        : "/boot/home/hrecord_capture.mkv";
+    //    Each run's filename carries its own start-time timestamp
+    //    (hrecord_capture_YYYYMMDD_HHMMSS.ext) so starting a new recording
+    //    never silently overwrites whatever an earlier run left behind.
+    time_t nowTime = time(nullptr);
+    struct tm nowTm;
+    localtime_r(&nowTime, &nowTm);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &nowTm);
+    std::string output_filename_str = std::string("/boot/home/hrecord_capture_") + timestamp
+        + (audioOnly ? ".ogg" : ".mkv");
+    const char* output_filename = output_filename_str.c_str();
 
     AVFormatContext* fmtCtx = nullptr;
     const char* muxerName = audioOnly ? "ogg" : nullptr;
@@ -1849,7 +1858,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.5";
+	    const char* localVersion = "v1.9.6";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
