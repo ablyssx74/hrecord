@@ -427,3 +427,12 @@ can have caused or can clean up from the outside. hrecord detects this and
 tells you so rather than failing with a bare, unexplained error. The fix is
 the same one Haiku's own Media preferences offers for this exact situation:
 open Media preferences and click "Restart Media Services", then try again.
+
+## Credits
+
+hrecord's use of Haiku's Media Kit (`BMediaRoster`, node hijacking, buffer
+tapping) built on groundwork the author laid earlier while porting
+[JAMin](https://jamin.sourceforge.net/) (the JACK Audio Mastering
+interface) to Haiku, a project developed with help from Google AI. That
+prior hands-on experience with `BMediaRoster`/`BBufferConsumer`/node
+lifecycle behavior informed how hrecord's own audio tapping was designed.
