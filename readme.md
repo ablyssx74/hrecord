@@ -409,27 +409,41 @@ tapped app between runs is the workaround. It's plausible the same
 app-side degradation also explains cases 2 and 3 below, though that's not
 separately confirmed.
 
-**Cases 2 and 3 got a second, independent data point: they're
-`media_server`-side, confirmed from outside hrecord entirely.** After an
+**Cases 2 and 3, resolved: the `SoundPlayNode` flood was leftover zombie
+Media Server state, not a persistent hrecord-triggered bug.** After an
 `hrecord --allaudio --realtime --audioonly` session hijacked and restored
-Rakarrack, a *later, separate* launch of Rakarrack (hrecord not even
-running) started printing Haiku's own `SoundPlayNode::FillNextBuffer:
-RequestBuffer failed` -- the Media Kit's internal `BSoundPlayer`
-implementation failing to push a buffer through a connection the Mixer
-still considered live. Same family of symptom as cases 2/3 (a connection
-the Mixer thinks is fine turning out not to be), just observed this time
-from the *other* app's side instead of hrecord's. It only cleared once
-Media Services were fully restarted -- exactly the same fix documented
-below for the "stale" Mixer connection issue, and consistent with the
-corruption living in `media_server` itself rather than in either app's
-own process state.
+Rakarrack, a later launch of Rakarrack started printing Haiku's own
+`SoundPlayNode::FillNextBuffer: RequestBuffer failed` -- the Media Kit's
+internal `BSoundPlayer` implementation failing to push a buffer through a
+connection the Mixer still considered live. A controlled test (Rakarrack
+running standalone and quiet, *then* starting hrecord) initially found
+this flooding continuously for as long as hrecord's tap stayed connected,
+stopping the moment hrecord stopped. The actual explanation turned out to
+be simpler: that test's Media Server had already accumulated zombie node
+state from earlier testing sessions (see the reference-leak bug above and
+the "stale" Mixer connection issue below) -- a node roster already in a
+bad state doesn't settle a new connection cleanly, however long you wait.
+With Media Server freshly restarted (no zombie entries left in Media
+preferences' Audio mixer beforehand), the same test instead shows
+`RequestBuffer failed` for a few seconds right after hrecord's tap
+connects, then settles into normal operation for the rest of the
+session -- ordinary Media Kit connection warm-up, not a sustained
+failure. Considered resolved: keep Media Server clean (restart it,
+per the known issue below, if zombie entries ever show up) and this
+doesn't reproduce as a persistent problem.
 
-Following this, the settle delay between `Disconnect` and `Connect` in
-`HijackAppIntoTap`/`UndoHijack`/`RestoreHijackedApp` (previously a flat
-20ms) was widened to 100ms, on the theory that the Mixer's own internal
-connection state may not have been fully settling in the shorter window
-before hrecord reused it. Unconfirmed pending real-world retesting --
-recorded here as the current experiment in progress, not a verified fix.
+A settle-delay widening (`Disconnect`/`Connect` in
+`HijackAppIntoTap`/`UndoHijack`/`RestoreHijackedApp`, 20ms -> 100ms) and a
+`--experimental` flag capping how long a tap could hold a buffer back
+were both tried as fixes before this was understood -- the settle-delay
+widening is harmless to keep (closes a real asymmetry regardless) and
+stays; the `--experimental` buffer-hold cap turned out unnecessary once
+the real cause was identified, so it's been reverted and `--experimental`
+is back to being a no-op, same as before this investigation started.
+Cases 2 and 3 were reported against test sessions carrying the same kind
+of accumulated zombie state -- plausibly the same explanation applies to
+both, though that's not separately re-confirmed against a freshly
+restarted Media Server the way case 2's flood was.
 
 ## Known issue: "stale" Mixer connection
 
