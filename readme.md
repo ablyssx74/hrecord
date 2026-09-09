@@ -389,24 +389,23 @@ three). A settle-delay fix (matching `HijackAppIntoTap`'s own pause after
 Disconnect, previously missing from the mirror-image restore path) didn't
 resolve case 1.
 
-**Case 1's own diagnostics now point away from hrecord's pipeline
-entirely.** Comparing the periodic backlog log between a run with barely
-any noticeable lag and a very similar run where lag was clearly audible:
-the numbers were essentially identical -- the same source sat at its
-ring's full capacity (a fixed ~0.07s) for the entire session in *both*
-runs, and the overflow/underrun counts at teardown were nearly the same
-either way. If the lag isn't visible in the ring backlog, the
-overflow/underrun counts, or the callback timing, it isn't happening in
-hrecord's tap -> ring -> mix -> BSoundPlayer pipeline at all -- there's
-nothing left in that path for these diagnostics to catch. That points
-at something upstream of hrecord's own tap entirely: most plausibly the
-tapped app's *own* internal audio processing latency (hrecord only ever
-sees whatever audio data an app hands it, never that app's own
-input-to-output round trip), possibly varying depending on how its output
-connection looks each time it's reconnected -- which would make this an
-app-side behavior outside what hrecord's own code can observe or fix. Not
-confirmed; the next isolating test is whether restarting only the tapped
-app (not hrecord) between runs makes case 1 go away.
+**Case 1 is confirmed: it isn't hrecord.** Comparing the periodic backlog
+log between a run with barely any noticeable lag and a very similar run
+where lag was clearly audible: the numbers were essentially identical --
+the same source sat at its ring's full capacity (a fixed ~0.07s) for the
+entire session in *both* runs, and the overflow/underrun counts at
+teardown were nearly the same either way. With nothing distinguishing the
+two runs anywhere in hrecord's tap -> ring -> mix -> BSoundPlayer
+pipeline, the isolating test was to restart only the tapped app (Rakarrack)
+between runs, leaving hrecord itself untouched -- and that alone made the
+lag go away. So case 1 lives entirely inside the tapped app's own internal
+state (hrecord only ever sees whatever audio data an app hands it, never
+that app's own input-to-output round trip, and apparently that round trip
+itself degrades across repeated hijack/restore cycles for at least this
+app). There's nothing in hrecord's own code to fix here; restarting the
+tapped app between runs is the workaround. It's plausible the same
+app-side degradation also explains cases 2 and 3 below, though that's not
+separately confirmed.
 
 ## Known issue: "stale" Mixer connection
 
@@ -428,3 +427,12 @@ can have caused or can clean up from the outside. hrecord detects this and
 tells you so rather than failing with a bare, unexplained error. The fix is
 the same one Haiku's own Media preferences offers for this exact situation:
 open Media preferences and click "Restart Media Services", then try again.
+
+## Credits
+
+hrecord's use of Haiku's Media Kit (`BMediaRoster`, node hijacking, buffer
+tapping) built on groundwork the author laid earlier while porting
+[JAMin](https://jamin.sourceforge.net/) (the JACK Audio Mastering
+interface) to Haiku, a project developed with help from Google AI. That
+prior hands-on experience with `BMediaRoster`/`BBufferConsumer`/node
+lifecycle behavior informed how hrecord's own audio tapping was designed.
