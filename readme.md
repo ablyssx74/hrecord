@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly [--allaudio]] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly [--allaudio]] [--realtime] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -24,6 +24,13 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly [--allaudio]] [--list-
 - `hrecord start --audioonly --allaudio` — same as above, but taps *every*
   app currently playing sound and mixes them together, instead of just one.
   See "Recording every audio source at once" below.
+- `hrecord start --realtime` (with or without `--allaudio`) — trims the
+  audio-tap ring buffers and the buffer size requested from BSoundPlayer for
+  lower live-monitoring latency, at the cost of a smaller safety margin
+  against glitches. Worth it for genuinely real-time use (e.g. playing an
+  instrument live through effects, such as rakarrack, while recording); a
+  casual recording doesn't need it. See "--realtime: lower monitoring
+  latency" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -247,15 +254,42 @@ The timing/backlog diagnostics that found this are still logged on every
     source #1 backlog already queued: 16384 bytes (~0.0106667s)
 ```
 
-**A caveat for genuinely real-time use** (monitoring a live instrument
-through effects, e.g. rakarrack, while playing): pacing fixes runaway
-backlog, but the hijack-and-relay path itself (tap -> per-source ring ->
-mixed-playback ring -> Mixer) still adds more hops than a direct
-connection to the Mixer ever did, and won't reach the sub-20ms round trip
-serious live monitoring needs. If that's still not tight enough after this
-fix, the right next step is probably a different approach for that
-specific use case rather than tuning buffer sizes further -- worth
-revisiting once this fix has actually been tested.
+Confirmed fixed in testing: with pacing in place, backlog and delay both
+dropped to milliseconds (from as much as several seconds before), and
+overflow drops went to zero -- rakarrack and a second source now record
+together in near-real-time with no popping.
+
+## `--realtime`: lower monitoring latency
+
+Pacing removed the *runaway* backlog, but the hijack-and-relay path itself
+(tap -> per-source ring -> mixed-playback ring -> Mixer) still has more
+hops than a direct connection to the Mixer ever did, and the default
+buffer sizes were chosen for safety margin against jitter, not for the
+lowest latency possible. For a genuinely real-time use case -- monitoring
+a live instrument through effects, e.g. rakarrack, while playing -- that
+remaining margin is latency worth trimming; a casual recording doesn't
+need to.
+
+`--realtime` trims two things, in both single-tap and `--allaudio` mode:
+
+- The audio-tap ring buffer(s): down from 2s to 0.1s in `--allaudio` mode
+  (per source), and from 0.5s to 0.1s in single-tap mode. With pacing
+  already preventing a growing backlog, these rings' steady-state fill
+  tracks genuine jitter, not a queue that needs seconds of headroom --
+  `--realtime` trades some of that jitter headroom for a lower latency
+  ceiling.
+- The buffer size requested from BSoundPlayer: down to ~1024 frames
+  (deliberately the same scale as the `hda.settings` low-latency example
+  above, ~5-20ms depending on rate) from a larger default. It's only a
+  hint -- the Mixer can renegotiate it away -- but matching an
+  already-tuned driver's own scale gives it the best chance of being
+  honored.
+
+`--realtime` only touches hrecord's own buffering. It doesn't change your
+sound driver's own settings -- pair it with a driver already tuned for low
+latency (the `hda.settings` section above) for it to actually matter; on
+default driver settings there's a hardware buffer floor `--realtime` can't
+get under.
 
 ## Known issue: "stale" Mixer connection
 
