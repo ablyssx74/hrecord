@@ -140,6 +140,16 @@ after the app itself was closed. Every acquisition now has a matching
 release, including on every internal failure path (not just the
 success/teardown path).
 
+**Follow-up from real-world testing:** confirmed fixed for the reported
+case (stop hrecord, then close the apps -- no zombie entries). But an app
+closed *before* stopping hrecord (i.e. disappearing mid-session, while
+still hijacked) can still leave a zombie entry, alongside Haiku's own
+Media Kit printing a cascade of `Bad port ID`/`GetNodeFor failed`
+diagnostics when hrecord's restore code tries to reconnect an app that's
+no longer there. hrecord itself doesn't crash in this case (it finishes
+and writes its output normally) and this appears tied to a broader,
+still-open reliability question -- see "Known open issues" below.
+
 If nothing is currently playing when hrecord starts, it records video only
 (with a warning) in the default mode, or fails outright for `--audioonly`
 since there'd be nothing to capture.
@@ -351,16 +361,41 @@ steadily climbing number for the same source, that source is drifting --
 useful for tracking down session-length latency growth that a fresh
 `--list-audio-inputs`-style snapshot wouldn't catch.
 
-**Known open issue:** re-running hrecord against apps still connected from
-a previous run (stopped hrecord, apps left open, started hrecord again
-without restarting them) has been reported to show noticeably more lag on
-the second run than the first, even though the startup backlog/overflow
-numbers logged look similar between the two. Not yet root-caused --
-possibly something in how a hijacked app's own connection settles after
-being freed and reconnected once already, rather than anything in
-hrecord's own pacing. The periodic backlog log above exists partly to help
-chase this down: comparing its output between a first and second run
-against the same still-open apps is the next concrete step.
+**Known open issues, likely related:** three things reported from testing
+against still-open apps across repeated runs, which may share one root
+cause rather than being three separate bugs:
+
+1. Re-running hrecord against apps still connected from a previous run
+   (stopped hrecord, apps left open, started hrecord again without
+   restarting them) shows noticeably more lag on the second run than the
+   first, even though the startup backlog/overflow numbers logged look
+   similar between the two.
+2. The same repeated-hijack scenario has, intermittently, produced Haiku's
+   own Media Kit printing `Bad port ID`/`GetNodeFor failed` diagnostics
+   during teardown, alongside a large stretch of silence-filled audio
+   mid-session -- consistent with the hijacked app's own connection having
+   gone away before hrecord tried to restore it. hrecord itself doesn't
+   crash when this happens (it finishes and writes output normally), and
+   it doesn't reproduce every time -- sporadic across otherwise-identical
+   repeated runs of the same single tapped app.
+3. When an app disappears mid-session like that (case 2), the zombie
+   Media-preferences-entry problem above can still occur, since there's
+   nothing left to cleanly restore by the time hrecord's teardown runs.
+
+The common thread across all three: repeatedly hijacking the same app in
+quick succession, rather than anything specific to `--allaudio` or the
+number of tapped sources (case 1 reproduces with one source as readily as
+three). The leading theory is that a hijacked app's own connection needs
+more time to settle after being freed than hrecord was giving it --
+`HijackAppIntoTap` already pauses briefly after its own Disconnect before
+reconnecting, but the mirror-image restore path (`UndoHijack` /
+`RestoreHijackedApp`) was reconnecting immediately with no equivalent
+pause, which is now fixed to match. Whether that's the whole story for
+cases 2 and 3 specifically is unconfirmed -- the periodic backlog log
+above exists partly to help chase case 1 further: comparing its output
+between a first and second run against the same still-open apps is the
+next concrete step, and whether cases 2-3 still occur at all after this
+settle-delay fix is the other one.
 
 ## Known issue: "stale" Mixer connection
 

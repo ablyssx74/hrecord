@@ -984,6 +984,11 @@ void UndoHijack(BMediaRoster* roster, AudioTapNode* tap, const media_node& appNo
     if (roster->GetConnectedInputsFor(tap->Node(), &tapInput, 1, &c2) == B_OK && c2 >= 1) {
         roster->Disconnect(appNode.node, tapInput.source, tap->Node().node, tapInput.destination);
     }
+    // Same settle delay HijackAppIntoTap gives itself between its own
+    // Disconnect and Connect -- this is the mirror-image operation and
+    // was missing it, an asymmetry worth closing regardless of whether
+    // it's the whole story behind reconnect failures seen in practice.
+    snooze(20000);
     media_format restoreFmt = originalAppOutput.format;
     media_output restoredOutput;
     media_input restoredInput;
@@ -1011,6 +1016,13 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
         roster->Disconnect(appNode.node, tapInput.source, tap->Node().node, tapInput.destination);
     }
     roster->ReleaseNode(tap->Node());
+    // Same settle delay HijackAppIntoTap gives itself between its own
+    // Disconnect and Connect -- this is the mirror-image operation and
+    // was missing it, an asymmetry worth closing regardless of whether
+    // it's the whole story behind reconnect failures seen in practice
+    // ("BMediaRoster::NodeIDFor: failed", "Bad port ID" -- consistent
+    // with reconnecting before the app's own side has settled).
+    snooze(20000);
 
     // Reconnect the app straight to the Mixer, letting it hand back a fresh
     // input -- we didn't retain the app's original destination.id, and the
@@ -1837,7 +1849,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.1";
+	    const char* localVersion = "v1.9.2";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
