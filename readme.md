@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -32,12 +32,9 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realt
   with or without `--allaudio`/`--audioonly`. Worth it for genuinely
   real-time use (e.g. playing an instrument live through effects, such as
   rakarrack, while recording); a casual recording doesn't need it. See
-  "--realtime: lower monitoring latency" below.
-- `hrecord start --realtime --experimental` — pushes the same buffers
-  --realtime tunes even tighter, for someone who's *also* hand-tuned their
-  own sound driver well past a typical low-latency setting. Requires
-  `--realtime`. Less tested than `--realtime` alone -- see "--experimental:
-  pushing further" below.
+  "--realtime: lower monitoring latency" below. (`--experimental` is still
+  accepted for backward compatibility but is a no-op now -- its tuning is
+  part of `--realtime`'s own defaults.)
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -281,14 +278,13 @@ need to.
 With pacing already preventing a growing backlog, the ring buffers'
 steady-state fill tracks genuine jitter, not a queue that needs seconds of
 headroom -- so trading away some of that headroom for a lower latency
-ceiling is a reasonable bet for a real-time use case, even though it's
-never been formally load-tested against a heavily loaded system:
+ceiling is a reasonable bet for a real-time use case:
 
-| | Default | `--realtime` | `--realtime --experimental` |
-|---|---|---|---|
-| Audio-tap ring buffer (`--allaudio`, per source) | 2s | 0.1s | 0.07s |
-| Audio-tap ring buffer (single-tap) | 0.5s | 0.1s | 0.07s |
-| BSoundPlayer buffer size requested | (default) | ~1024 frames | ~256 frames |
+| | Default | `--realtime` |
+|---|---|---|
+| Audio-tap ring buffer (`--allaudio`, per source) | 2s | 0.07s |
+| Audio-tap ring buffer (single-tap) | 0.5s | 0.07s |
+| BSoundPlayer buffer size requested | (default) | ~256 frames |
 
 The BSoundPlayer buffer size is only a hint -- the Mixer can renegotiate it
 away -- but matching an already-tuned driver's own scale gives it the best
@@ -296,48 +292,59 @@ chance of being honored. `--realtime` only touches hrecord's own
 buffering, not your sound driver's own settings -- pair it with a driver
 already tuned for low latency (the `hda.settings` section above) for it to
 actually matter; on default driver settings there's a hardware buffer
-floor neither flag can get under.
+floor `--realtime` can't get under.
 
-## `--experimental`: pushing further
+These numbers were reached in two steps, worth knowing about since the
+first one went badly enough to explain here rather than just quietly
+picking better numbers. They started out behind a separate
+`--experimental` flag (256 frames / 0.03s rings) alongside a *tighter*
+"catch-up snooze cap" inside the pacing logic -- reasoning that a smaller
+cap meant a large corrective sleep could never itself become a latency
+spike. In testing it did the opposite: overflow on three simultaneously
+tapped sources went from at-or-near zero (clean) to hundreds of thousands,
+even tens of millions, of bytes dropped -- heard as constant crackling on
+everything, not just a little extra lag. The mechanism: that cap doesn't
+just bound a single sleep, it bounds *how much drift pacing can correct
+per buffer*. A source running even slightly ahead of real time needs to
+fully correct before the next buffer arrives to stay caught up; a tighter
+cap makes that take more calls, and the also-shrunk ring left far less
+room to absorb the gap while it did. The two changes compounded instead of
+adding. Fixed by decoupling them: the snooze cap is a single, generous
+50ms in every mode now (its actual job -- stop one anomalous burst from
+blocking this thread too long -- never needed to scale with a latency
+target), leaving ring buffer size as the real, and only, latency dial.
+Retested at a gentler 0.07s (up from 0.03s) with three simultaneous
+sources and confirmed clean, so that's `--realtime`'s own default now --
+`--experimental` is no longer a separate flag (still accepted, but a
+no-op, purely so an existing invocation doesn't break).
 
-`--realtime`'s own numbers were chosen to match the `hda.settings`
-low-latency example this readme documents (~1024 frames). A real user of
-this project went well past that, hand-tuning their own driver down to
-`play_buffer_frames 256`/`play_buffer_count 4` at 48kHz -- tighter than
-what `--realtime` alone targets. `--experimental` (requires `--realtime`)
-requests a matching ~256-frame buffer from BSoundPlayer and trims the ring
-buffers a bit further (see the table above) -- deliberately a modest step
-beyond `--realtime`, not an aggressive one.
+**Ongoing (not just startup) backlog is now logged too.** A one-time
+snapshot at the first callback can't tell a healthy session (backlog
+staying near its steady-state floor) apart from one where a source is
+slowly drifting ahead of real time over the course of a session -- which
+would reach a listener as gradually growing lag with nothing in the log to
+point at. Roughly every 2 seconds, any source whose queued backlog is more
+than negligible gets logged with a timestamp:
 
-**A first attempt at this went badly**, and it's worth explaining why,
-since it's a real correction rather than just a smaller number. That first
-version *also* shrank a "catch-up snooze cap" inside the pacing logic --
-reasoning that a smaller cap meant a large corrective sleep could never
-itself become a latency spike. In testing it did the opposite: overflow on
-three tapped sources went from at-or-near zero (clean) under `--realtime`
-to hundreds of thousands, even tens of millions, of bytes dropped -- heard
-as constant crackling on everything, not just a little extra lag. The
-mechanism: that cap doesn't just bound a single sleep, it bounds *how much
-drift pacing can correct per buffer*. A source running even slightly ahead
-of real time needs to fully correct before the next buffer arrives to stay
-caught up; a tighter cap makes that take more calls, and a smaller ring
-(also shrunk in that first attempt) leaves far less room to absorb the gap
-while it does. The two changes compounded instead of adding.
+```
+[i] t+14s: source #2 backlog: 96000 bytes (~0.25s)
+```
 
-The fix: the snooze cap is no longer part of the --realtime/--experimental
-tuning at all -- it's a single, generous 50ms in every mode now, since its
-actual job (stop one anomalous burst from blocking this thread for too
-long) never needed to scale with a latency target in the first place. Ring
-buffer size is the real, and only, latency dial `--experimental` turns.
+If this never prints, backlog is staying flat. If it prints with a
+steadily climbing number for the same source, that source is drifting --
+useful for tracking down session-length latency growth that a fresh
+`--list-audio-inputs`-style snapshot wouldn't catch.
 
-This is still meant as a starting point for tuning against a specific,
-already-aggressively-configured driver, not a universally-better default
--- it's less tested than `--realtime` itself, and how far it can safely go
-depends on what a given system can actually sustain. If it still
-introduces glitches `--realtime` alone didn't, that's a sign the ring
-sizing in `SetupAllAudioTaps` / `SetupDesktopAudioTap` needs tuning for
-that specific setup (try easing `0.07` back toward `0.1`) rather than
-something to just live with.
+**Known open issue:** re-running hrecord against apps still connected from
+a previous run (stopped hrecord, apps left open, started hrecord again
+without restarting them) has been reported to show noticeably more lag on
+the second run than the first, even though the startup backlog/overflow
+numbers logged look similar between the two. Not yet root-caused --
+possibly something in how a hijacked app's own connection settles after
+being freed and reconnected once already, rather than anything in
+hrecord's own pacing. The periodic backlog log above exists partly to help
+chase this down: comparing its output between a first and second run
+against the same still-open apps is the next concrete step.
 
 ## Known issue: "stale" Mixer connection
 
