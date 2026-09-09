@@ -946,7 +946,17 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
         roster->ReleaseNode(appNode);
         return nullptr;
     }
-    snooze(20000);
+    // Settle delay between Disconnect and Connect -- widened from 20ms to
+    // 100ms (see UndoHijack/RestoreHijackedApp, which mirror this) after
+    // real-world testing linked the shorter delay to media_server-side
+    // connection state that outlived hrecord's own process: a completely
+    // separate app (Rakarrack) later hit "SoundPlayNode::FillNextBuffer:
+    // RequestBuffer failed" -- a producer failing to push a buffer through
+    // a connection the Mixer still considered live -- after an hrecord
+    // hijack/restore cycle, clearing only once Media Services were fully
+    // restarted. Consistent with the Mixer's own internal connection state
+    // not having fully settled before hrecord immediately reused it.
+    snooze(100000);
 
     media_format fmt = appOutput.format;
     media_output newAppOutput;
@@ -986,10 +996,11 @@ void UndoHijack(BMediaRoster* roster, AudioTapNode* tap, const media_node& appNo
         roster->Disconnect(appNode.node, tapInput.source, tap->Node().node, tapInput.destination);
     }
     // Same settle delay HijackAppIntoTap gives itself between its own
-    // Disconnect and Connect -- this is the mirror-image operation and
-    // was missing it, an asymmetry worth closing regardless of whether
-    // it's the whole story behind reconnect failures seen in practice.
-    snooze(20000);
+    // Disconnect and Connect (see its comment for why it's 100ms) -- this
+    // is the mirror-image operation and was missing it, an asymmetry
+    // worth closing regardless of whether it's the whole story behind
+    // reconnect failures seen in practice.
+    snooze(100000);
     media_format restoreFmt = originalAppOutput.format;
     media_output restoredOutput;
     media_input restoredInput;
@@ -1018,12 +1029,15 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
     }
     roster->ReleaseNode(tap->Node());
     // Same settle delay HijackAppIntoTap gives itself between its own
-    // Disconnect and Connect -- this is the mirror-image operation and
-    // was missing it, an asymmetry worth closing regardless of whether
-    // it's the whole story behind reconnect failures seen in practice
-    // ("BMediaRoster::NodeIDFor: failed", "Bad port ID" -- consistent
-    // with reconnecting before the app's own side has settled).
-    snooze(20000);
+    // Disconnect and Connect (see its comment for why it's 100ms) -- this
+    // is the mirror-image operation and was missing it, an asymmetry
+    // worth closing regardless of whether it's the whole story behind
+    // reconnect failures seen in practice ("BMediaRoster::NodeIDFor:
+    // failed", "Bad port ID", and a downstream app hitting
+    // "SoundPlayNode::FillNextBuffer: RequestBuffer failed" after this
+    // exact reconnect -- all consistent with reconnecting before the
+    // Mixer's own side of the old connection has fully settled).
+    snooze(100000);
 
     // Reconnect the app straight to the Mixer, letting it hand back a fresh
     // input -- we didn't retain the app's original destination.id, and the
@@ -1830,7 +1844,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.7";
+	    const char* localVersion = "v1.9.8";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),

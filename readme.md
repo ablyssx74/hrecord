@@ -409,6 +409,28 @@ tapped app between runs is the workaround. It's plausible the same
 app-side degradation also explains cases 2 and 3 below, though that's not
 separately confirmed.
 
+**Cases 2 and 3 got a second, independent data point: they're
+`media_server`-side, confirmed from outside hrecord entirely.** After an
+`hrecord --allaudio --realtime --audioonly` session hijacked and restored
+Rakarrack, a *later, separate* launch of Rakarrack (hrecord not even
+running) started printing Haiku's own `SoundPlayNode::FillNextBuffer:
+RequestBuffer failed` -- the Media Kit's internal `BSoundPlayer`
+implementation failing to push a buffer through a connection the Mixer
+still considered live. Same family of symptom as cases 2/3 (a connection
+the Mixer thinks is fine turning out not to be), just observed this time
+from the *other* app's side instead of hrecord's. It only cleared once
+Media Services were fully restarted -- exactly the same fix documented
+below for the "stale" Mixer connection issue, and consistent with the
+corruption living in `media_server` itself rather than in either app's
+own process state.
+
+Following this, the settle delay between `Disconnect` and `Connect` in
+`HijackAppIntoTap`/`UndoHijack`/`RestoreHijackedApp` (previously a flat
+20ms) was widened to 100ms, on the theory that the Mixer's own internal
+connection state may not have been fully settling in the shorter window
+before hrecord reused it. Unconfirmed pending real-world retesting --
+recorded here as the current experiment in progress, not a verified fix.
+
 ## Known issue: "stale" Mixer connection
 
 Occasionally (usually after repeatedly closing and reopening whatever app is
