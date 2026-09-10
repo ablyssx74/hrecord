@@ -41,8 +41,9 @@ whatever an earlier run left behind in `/boot/home`.
   "--realtime: lower monitoring latency" below.
 - `hrecord start --experimental` — caps how long a tap can hold a source's
   buffer back, relative to that source's own buffer size, instead of the
-  flat 50ms `--realtime` otherwise uses for every source alike. Unconfirmed
-  experiment aimed at very small hardware buffer settings. See
+  flat 50ms `--realtime` otherwise uses for every source alike. Real-world
+  tested at 48kHz / 128-frame buffers with Rakarrack, the very small
+  hardware buffer setting this targets -- came back clean. See
   "--experimental: capping buffer holds relative to the source's own
   buffer size" below.
 - `hrecord start --experimental-screen-capture` — reuses a cached capture
@@ -713,7 +714,9 @@ unnecessary for that bug (`--experimental` went back to being a no-op).
 That finding doesn't rule this mechanism out for a *different* symptom
 -- audible clicking during monitoring, not a Media Kit error message --
 so it's being tried again on its own merits rather than treated as
-already disproven. Unconfirmed pending real-world testing.
+already disproven. **Confirmed working:** real-world testing at 48kHz /
+128-frame buffers with Rakarrack -- exactly the small-buffer scenario
+this was aimed at -- came back clean.
 
 **The periodic (`t+Ns: source #N backlog: ...`) logging that used to print
 every ~2 seconds has been removed.** It was added specifically to catch a
