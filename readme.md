@@ -70,7 +70,11 @@ whatever an earlier run left behind in `/boot/home`.
   `RCServer` is built on. No effect under `--audioonly`. Can't be combined
   with `--experimental-screen-capture` (alternative engines, not
   stackable) — `--experimental-screen-capture` wins if both are passed.
-  Unconfirmed experiment, not yet real-world tested. See
+  Real-world tested: mouse responsiveness "almost identical to native
+  mouse motion" and remarkably low `app_server` CPU cost, the best of the
+  three capture modes on both fronts -- but dragging a window around
+  visibly fragmented it in the recording, a mitigation for which
+  (untested as of this writing) is also in place. See
   "--screen-capture-rcserver-method: blind uniform-tile capture" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
@@ -295,13 +299,16 @@ reading it all at once.
   never the *read* -- `GetBitmap()` still has to ask `app_server` for the
   tile's current pixels before there's anything to compare, so an unchanged
   tile costs one IPC round trip plus a `memcmp`, not zero.
-- The trade-off: because tiles cycle round-robin rather than all being
-  current every frame, any single tile can be up to a full cycle old
-  (screen area ÷ tiles refreshed per frame) at the moment it's composited.
-  Unlike the window-aware mode, which always refreshes every window's full
-  region every single frame, this mode has no equivalent freshness
-  guarantee for any specific piece of the screen -- content changing faster
-  than the tile grid cycles back to it will visibly lag behind.
+- The trade-off, confirmed in real-world testing: because tiles cycle
+  round-robin rather than all being current every frame, any single tile
+  can be up to a full cycle old at the moment it's composited. Unlike the
+  window-aware mode, which always refreshes every window's full region
+  every single frame, this mode has no equivalent freshness guarantee for
+  any specific piece of the screen -- a *static* desktop looks perfect
+  (nothing to catch up on), but dragging a window around visibly broke it
+  into fragments: both where the window used to be and where it currently
+  is sat half-stale until their tiles came back around in rotation. See
+  "chasing motion" below for the mitigation this led to.
 
 The mouse cursor is a special case here for the same reason it is under
 `--experimental-screen-capture`: it moves every frame, so relying on
@@ -323,21 +330,50 @@ different ways, not something that composes. Passing both keeps
 confirmation (see above); that's a tie-break for an unlikely combination,
 not a claim that one approach is strictly better than the other.
 
-**Unconfirmed, not yet tested on real hardware.** Open questions this
-mode's design doesn't answer on its own:
+**Real-world confirmation.** Mouse responsiveness while recording was
+described as "almost, if not identical to native mouse motion" -- by far
+the best of the three capture modes on that front -- and `app_server`'s own
+CPU cost stayed remarkably low. Recording a static desktop (no windows
+being moved) came out "fairly decent." The one real problem found: actively
+dragging a window around visibly broke it into fragments in the recording,
+exactly the round-robin staleness trade-off above predicts.
 
-- Whether the round-robin cadence (whole grid once per second) is actually
-  a good default, too slow, or needlessly fast for typical desktop use --
-  chosen as a starting point, not measured.
-- Whether `memcmp`'s own cost across every tile, every frame, ends up
+**Chasing motion: a mitigation for the fragmentation, pending re-testing.**
+Two additions target the dragging case specifically, without touching the
+confirmed-good steady-state behavior:
+
+1. *Spatial contagion.* Whenever a tile's `memcmp` finds it actually
+   changed, its four immediate neighbors get refreshed right away too,
+   rather than waiting for their own turn in the rotation -- a changed tile
+   is likely sitting right at the leading or trailing edge of whatever just
+   moved, so its neighbors are probably mid-transition as well. This is
+   what's meant to close the fragment gap along a moving window's edge from
+   one frame to the next, instead of leaving it to catch up over an entire
+   cycle.
+2. *Adaptive burst.* An internal multiplier scales the per-frame tile
+   budget up while a meaningful fraction of this frame's sampled tiles
+   actually changed (real motion happening right now -- a drag, a resize, a
+   fast scroll), and lets it decay back down a step at a time once things
+   go quiet. The confirmed low steady-state cost is only spent while
+   there's something worth chasing; a static desktop keeps costing exactly
+   what it already measured at.
+
+Neither of these makes any freshness guarantee the way the window-aware
+mode's per-frame refresh does -- they're both still statistical, chasing
+*detected* motion rather than provably eliminating staleness. Not yet
+re-tested against real hardware.
+
+**Unconfirmed, still open:**
+
+- Whether the mitigation above actually closes the fragmentation
+  noticeably, only partially, or not at all -- pending re-testing.
+- Whether the round-robin cadence (whole grid once per second, before any
+  burst) is actually a good baseline, too slow, or needlessly fast for
+  typical desktop use -- chosen as a starting point, not measured.
+- Whether `memcmp`'s own cost across every tile, every frame -- now
+  compounded by the neighbor-chase's extra reads during a burst -- ends up
   cheaper or more expensive in practice than `--experimental-screen-capture`'s
-  unconditional-paste approach -- in principle it should win on a mostly
-  static desktop and lose on a very busy one, but that's a real-world
-  question, not a settled one.
-- Whether the visible lag on fast-changing content outside the tracked
-  cursor region (see the trade-off above) is noticeable enough in practice
-  to matter for a screen recording, as opposed to RCServer's own live
-  remote-desktop use case where it was designed to be acceptable.
+  unconditional-paste approach during active motion specifically.
 
 ## How desktop-audio capture works
 

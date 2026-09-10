@@ -225,6 +225,14 @@ bool g_screenCaptureRcserverMethod = false;
 // mSquareSize (sources/RCServer/ScreenServer.cpp).
 const int kRcserverTileSize = 100;
 
+// How far the adaptive burst multiplier (see rcserverBurstMultiplier's own
+// comment) can ramp the per-frame tile budget above the baseline
+// once-per-second cadence, and how much churn (the fraction of this
+// frame's sampled tiles that actually changed) is enough to ramp it up
+// another notch rather than let it decay back down.
+const int kRcserverMaxBurstMultiplier = 8;
+const double kRcserverChurnThreshold = 0.12;
+
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
 // tracking uses, via get_window_info()/BPrivate::get_window_order()).
@@ -2182,6 +2190,18 @@ int main(int argc, char* argv[]) {
     int rcserverNextTile = 0;
     bool rcserverNeedsSeed = true;
 
+    // Adaptive burst multiplier for the tile round-robin, addressing a
+    // real-world-confirmed gap: a plain fixed-rate round-robin only
+    // refreshes each tile once per cycle, so a *moving* window's old and
+    // new positions both sit half-stale mid-drag -- visible as the frame
+    // breaking into fragments right where a window is actively being
+    // dragged around, not just at its final rest position. Ramped up
+    // while recent tiles are showing a lot of churn (active
+    // dragging/resizing/scrolling), decayed back down once things go
+    // quiet again, so the steady-state low CPU cost stays exactly what it
+    // was -- see the main loop's own comment for the full mechanism.
+    int rcserverBurstMultiplier = 1;
+
     if (!audioOnly) {
         const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!codec) {
@@ -2281,7 +2301,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.18";
+	    const char* localVersion = "v1.9.19";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2390,26 +2410,80 @@ int main(int argc, char* argv[]) {
                     int tilesY = (height + kRcserverTileSize - 1) / kRcserverTileSize;
                     int totalTiles = tilesX * tilesY;
                     if (totalTiles > 0) {
-                        // Cycle the whole grid roughly once per second,
-                        // regardless of profile fps -- RCServer's own
-                        // round-robin has no fixed frame boundary to work
-                        // within, this is this mode's own approximation of
-                        // "continuously cycling."
-                        int tilesPerFrame = (totalTiles + profile.fps - 1) / profile.fps;
-                        if (tilesPerFrame < 1) tilesPerFrame = 1;
+                        // A tiny local helper (capture-by-reference lambda,
+                        // not a free function -- it's only ever used right
+                        // here) that refreshes one grid cell by (col, row)
+                        // and reports whether it actually changed. Shared
+                        // between the round-robin loop below and the
+                        // neighbor-chase it triggers on a hit.
+                        auto refreshCell = [&](int col, int row) -> bool {
+                            int tLeft = col * kRcserverTileSize;
+                            int tTop = row * kRcserverTileSize;
+                            int tRight = std::min(tLeft + kRcserverTileSize, width) - 1;
+                            int tBottom = std::min(tTop + kRcserverTileSize, height) - 1;
+                            return RefreshScreenTileIfChanged(BRect(tLeft, tTop, tRight, tBottom),
+                                screen, screenBitmap, width, height);
+                        };
 
+                        // Baseline: cycle the whole grid roughly once per
+                        // second, regardless of profile fps -- RCServer's
+                        // own round-robin has no fixed frame boundary to
+                        // work within, this is this mode's own
+                        // approximation of "continuously cycling." The
+                        // adaptive burst multiplier (see its own comment
+                        // above) scales this up while there's real churn.
+                        int baseTilesPerFrame = (totalTiles + profile.fps - 1) / profile.fps;
+                        if (baseTilesPerFrame < 1) baseTilesPerFrame = 1;
+                        int tilesPerFrame = baseTilesPerFrame * rcserverBurstMultiplier;
+                        if (tilesPerFrame > totalTiles) tilesPerFrame = totalTiles;
+
+                        int changedCount = 0;
                         for (int t = 0; t < tilesPerFrame; t++) {
                             int tileIndex = rcserverNextTile % totalTiles;
                             int tileCol = tileIndex % tilesX;
                             int tileRow = tileIndex / tilesX;
-                            int tileLeft = tileCol * kRcserverTileSize;
-                            int tileTop = tileRow * kRcserverTileSize;
-                            int tileRight = std::min(tileLeft + kRcserverTileSize, width) - 1;
-                            int tileBottom = std::min(tileTop + kRcserverTileSize, height) - 1;
-                            BRect tileRect(tileLeft, tileTop, tileRight, tileBottom);
-                            RefreshScreenTileIfChanged(tileRect, screen, screenBitmap,
-                                width, height);
+
+                            if (refreshCell(tileCol, tileRow)) {
+                                changedCount++;
+                                // Spatial contagion: a changed tile is
+                                // likely sitting right at the leading or
+                                // trailing edge of whatever just moved
+                                // (dragging/resizing a window, scrolling),
+                                // so its immediate neighbors are probably
+                                // mid-transition too. Refresh them right
+                                // now instead of waiting for their own turn
+                                // in the rotation -- this is what actually
+                                // closes the fragment gap along a moving
+                                // window's edge, frame to frame, rather
+                                // than leaving it to catch up over an
+                                // entire cycle.
+                                static const int kOffsets[4][2] =
+                                    { {1, 0}, {-1, 0}, {0, 1}, {0, -1} };
+                                for (auto& off : kOffsets) {
+                                    int nCol = tileCol + off[0];
+                                    int nRow = tileRow + off[1];
+                                    if (nCol < 0 || nCol >= tilesX
+                                            || nRow < 0 || nRow >= tilesY)
+                                        continue;
+                                    refreshCell(nCol, nRow);
+                                }
+                            }
                             rcserverNextTile = (rcserverNextTile + 1) % totalTiles;
+                        }
+
+                        // Ramp the burst multiplier up while a meaningful
+                        // fraction of this frame's sampled tiles actually
+                        // changed (real on-screen motion happening right
+                        // now), and let it decay back down a step at a
+                        // time once things go quiet -- so the confirmed
+                        // low steady-state cost only gets spent while
+                        // there's something worth chasing.
+                        double changedFraction = (double)changedCount / tilesPerFrame;
+                        if (changedFraction > kRcserverChurnThreshold) {
+                            if (rcserverBurstMultiplier < kRcserverMaxBurstMultiplier)
+                                rcserverBurstMultiplier++;
+                        } else if (rcserverBurstMultiplier > 1) {
+                            rcserverBurstMultiplier--;
                         }
                     }
                 }
