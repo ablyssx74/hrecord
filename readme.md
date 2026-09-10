@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--experimental-screen-capture] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -45,6 +45,14 @@ whatever an earlier run left behind in `/boot/home`.
   experiment aimed at very small hardware buffer settings. See
   "--experimental: capping buffer holds relative to the source's own
   buffer size" below.
+- `hrecord start --experimental-screen-capture` — reuses a cached,
+  already-converted background between frames instead of reconverting the
+  whole screen every time, only freshly capturing the screen regions
+  actually covered by a window (or the mouse cursor) each frame. No effect
+  under `--audioonly` (there's no video to capture). Unconfirmed
+  experiment; the default full-frame capture path is completely unaffected
+  unless this flag is passed. See "--experimental-screen-capture:
+  window-aware capture" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -97,6 +105,77 @@ contends with it every time hrecord asks for a frame. That's an
 architectural property of `app_server` itself, not something fixable from
 outside it. The profiles get you the rest of the way there by controlling
 how often and how expensively that contention happens.
+
+## `--experimental-screen-capture`: window-aware capture
+
+The default path reads the whole screen and reruns `sws_scale`'s
+colorspace conversion over every pixel, every single frame, regardless of
+how much of the screen actually changed since the last one. That's simple
+and always correct, but wasteful on a desktop where windows only cover
+part of the screen -- the bare wallpaper/Deskbar area gets reconverted for
+no reason, every frame.
+
+**What this mode does and doesn't skip.** It still reads the *whole*
+screen every frame -- `BScreen` has no partial-capture primitive, so that
+IPC/memory-copy cost isn't avoidable either way. It still encodes the
+*whole* composited frame every time -- MJPEG is intra-only, so there's no
+such thing as "only encode the part that changed" the way H.264/VP9's
+delta frames work; every output frame is a complete, independent JPEG
+image regardless. What it skips is the `sws_scale` conversion cost for the
+part of the screen that's genuinely static: a cached, already-converted
+background is reused every frame, and only the screen regions actually
+covered by a window -- plus a small region around the mouse cursor, see
+below -- get freshly converted each time. The size of the win scales with
+how much of the screen is bare desktop; a screen full of maximized windows
+won't see much of one.
+
+**Two things this deliberately does *not* do, because doing them would be
+wrong, not just less efficient:**
+
+1. It never skips re-converting a window just because its *frame*
+   (position/size) hasn't moved. A window's content changes for reasons
+   that have nothing to do with its frame -- a blinking cursor, scrolling
+   text, a VU meter, a video playing -- so every tracked window's pixels
+   are freshly captured and converted every single frame, unconditionally.
+   Only the true background (the area no window covers) is cached, and
+   only until the window layout itself changes (a window opens, closes,
+   minimizes, restores, moves, resizes, or changes z-order).
+2. It never ignores the mouse cursor just because it isn't a window.
+   `BScreen::ReadBitmap()` bakes the cursor into the captured pixels, but
+   nothing in the window list reports the cursor's own position, so a
+   generous fixed-size box around wherever it currently is gets refreshed
+   every frame too, exactly like a window's own region -- otherwise the
+   cursor would visibly freeze in place except when some window's frame
+   happened to change.
+
+Window tracking uses the same private Haiku Window Kit API
+[hDesktop](https://github.com/ablyssx74/hDesktop) uses for its own
+minimize/maximize/open/close detection: `BPrivate::get_window_order()`
+enumerates window tokens for the active workspace, and `get_window_info()`
+resolves each token to its frame and state (minimized, which workspaces,
+window feel). Minimized windows and non-normal windows (menus, tooltips,
+the Deskbar itself) are excluded, matching what a viewer would actually
+expect "the apps" to mean.
+
+**A trade-off worth knowing:** while a window is actively being dragged or
+resized, its frame changes on every single frame by definition, so the
+background gets rebuilt every frame during that -- no visual artifacts,
+just no speedup for that specific moment. That's the correct choice (never
+risk a stale background sliver under a moving window), not a bug.
+
+**Unconfirmed pending real-world testing**, including two specific
+assumptions worth flagging if something looks visibly wrong:
+
+- Overlapping windows are composited in the order `get_window_order()`
+  returns them, assumed front-to-back (topmost first) and reversed before
+  painting. If two overlapping windows composite with the wrong one on
+  top, this assumption is inverted -- the fix is a one-line change to stop
+  reversing that order.
+- `client_window_info`'s frame fields are read as `window_left`/
+  `window_top`/`window_right`/`window_bottom`. If this doesn't match the
+  actual struct on a given Haiku build, it'll fail to compile rather than
+  silently misbehave -- the fix is matching whatever field names that
+  build's `<WindowInfo.h>` actually declares.
 
 ## How desktop-audio capture works
 
