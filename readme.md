@@ -389,13 +389,20 @@ already-current buffer (the fallback reads kept it fresh throughout). This
 makes the mode self-adapt across the whole spectrum: cheap and granular on
 a mostly-static desktop (the confirmed win), and never meaningfully worse
 than the default path's own cost on something as demanding as a full-screen
-visualizer, instead of getting stuck paying for the worst of both. Not yet
-re-tested against real hardware.
+visualizer, instead of getting stuck paying for the worst of both.
+
+Real-world re-test against projectM: "a little better," not a full fix --
+`app_server` stayed comfortably in the 60-80% range and the mouse remained
+"almost native responsive" throughout, but this capture mode's real
+strength is confirmed to be static desktop/window content specifically,
+not full-screen continuous animation. That's a fair, expected
+characterization of what blind uniform-tile capture is fundamentally suited
+for, not a bug to keep chasing -- `--experimental-screen-capture` (or the
+default path) remain the better choice for recording something like a
+visualizer.
 
 **Unconfirmed, still open:**
 
-- Whether the high-churn fallback above actually fixes the projectM-style
-  slowdown, or just reduces it -- pending re-testing.
 - Whether the round-robin cadence (whole grid once per second, before any
   burst) is actually a good baseline, too slow, or needlessly fast for
   typical desktop use -- chosen as a starting point, not measured.
