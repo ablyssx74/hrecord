@@ -28,7 +28,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <ctime>
-#include <cmath> // floor()/ceil() -- CompositeScreenRegion (see --experimental-screen-capture)
+#include <cmath> // floor()/ceil() -- RefreshScreenRegion (see --experimental-screen-capture)
 #include <cstdlib> // free() -- EnumerateVisibleWindows' get_window_info()/get_window_order() results
 
 extern "C" {
@@ -121,15 +121,34 @@ const VideoProfile kVideoProfiles[3] = {
 // of the screen: the bare wallpaper/Deskbar area gets reconverted for no
 // reason every single frame.
 //
-// This mode still reads the *whole* screen every frame (BScreen has no
-// partial-capture primitive, so that IPC/memory-copy cost isn't avoidable
-// either way) and still encodes the *whole* composited frame every time
-// (MJPEG is intra-only -- there's no such thing as "only encode the part
-// that changed," unlike H.264/VP9's delta frames). What it skips is the
-// sws_scale conversion cost for the part of the screen that's genuinely
-// static: a cached, already-converted background is reused every frame,
-// and only the screen regions actually covered by a window (plus the
-// mouse cursor -- see below) get freshly converted each time.
+// This mode still encodes the *whole* composited frame every time (MJPEG
+// is intra-only -- there's no such thing as "only encode the part that
+// changed," unlike H.264/VP9's delta frames). But it does NOT re-read the
+// whole screen every frame: BScreen::GetBitmap()'s own bounds parameter is
+// a genuine partial-capture primitive (confirmed by reading RemoteControl's
+// RCServer, which is built on exactly this), so only the screen regions
+// actually covered by a window (plus the mouse cursor -- see below) get
+// freshly read from app_server each frame; the rest of the screen (the
+// bare wallpaper/Deskbar area) is a cached buffer, only re-read in full
+// when the window layout itself changes. That cheap, bounded read is the
+// real win here -- confirmed against real hardware to make mouse
+// responsiveness noticeably better while recording, roughly the
+// difference between hrecord's default capture and how RemoteControl's
+// own RCClient feels.
+//
+// Conversion (the BGRA capture buffer -> the encoder's YUV pixel format)
+// is a completely separate concern from capture, and happens exactly
+// once per frame, over the whole composited buffer at once -- identical
+// in shape to the default path's own conversion step. An earlier version
+// of this mode ran its own independent sws_scale per window/cursor
+// region instead, which read cheaply but produced a visible seam/halo
+// right at each region's own edge (a small region scaled in isolation
+// has no visibility into the real pixels just outside it). Pasting each
+// region's raw captured pixels directly into the cached buffer with a
+// plain memcpy, then running one single full-frame convert, keeps the
+// cheap-read win while producing output identical in kind to the trusted
+// default path -- no seam, because there's only one scale operation
+// covering the whole frame, with full context everywhere.
 //
 // Two things this deliberately does NOT do, because doing them would be
 // wrong, not just less efficient:
@@ -226,62 +245,43 @@ static bool WindowLayoutChanged(const std::vector<TrackedWindowRect>& a,
     return false;
 }
 
-// Reads ONE screen-space rectangle directly from app_server -- not the
-// whole screen -- and composites it into the correspondingly-scaled
-// rectangle of dstFrame's YUV planes, in place. Used for both window
-// regions and the cursor region. dstFrame must already hold valid data
-// everywhere outside this rectangle (the caller is responsible for that,
-// e.g. via a prior full-frame or cached-background copy); this only ever
-// touches the pixels within the scaled rectangle it's given.
+// Refreshes one screen-space rectangle within screenBitmap -- a
+// persistent, full native-resolution BGRA buffer -- with freshly
+// captured pixels. Used for both window regions and the cursor region,
+// every single frame, so screenBitmap always holds genuinely current
+// pixels for every window/cursor region even though its background
+// portion is only refreshed when the window layout changes (see the
+// section comment above). A plain BGRA-to-BGRA byte copy, no color-space
+// conversion -- that happens exactly once per frame, for the whole
+// composited buffer at once, in the main loop below.
 //
-// This used to sub-rectangle out of an already-captured, whole-screen
-// BBitmap -- reasoning that BScreen had no partial-capture primitive, so
-// the read cost wasn't avoidable either way. That assumption was wrong.
-// Real-world testing (htop showing app_server itself pinned near 100% of
-// one core, identically with or without this whole mode) confirmed the
-// *read* is the dominant cost, not the sws_scale conversion this mode
-// already skips for the background -- and looking at how RemoteControl's
-// RCServer (https://github.com/HaikuArchives/RemoteControl) stays low-CPU
-// while still delivering a live capture showed why: it never reads the
-// whole screen either, calling BScreen::GetBitmap() with a small bounds
-// rectangle per tile, over and over, instead. BScreen::GetBitmap()'s own
-// bounds parameter genuinely limits what app_server captures and
-// transfers -- this does the same thing per window/cursor region, which
-// is what actually reaches the real bottleneck the sws_scale-only
-// version never could.
-//
-// A bitmap sized to exactly match the requested rectangle (via
-// GetBitmap()'s own auto-sizing) is used rather than reading into a
-// reused, larger canvas at some computed offset -- deliberately, to
-// sidestep an unconfirmed question about whether BScreen positions a
-// partial capture at the destination bitmap's own origin or at the
-// requested rectangle's absolute screen position. With an exact-sized
-// destination those two possibilities are identical, so it doesn't
-// matter which one is actually true.
-//
-// Destination coordinates are rounded outward to even numbers before use
-// -- YUV420P's chroma planes are half-resolution in both dimensions, so
-// an odd offset there would misalign chroma sampling right at the
-// rectangle's own edge. Rounding outward (rather than to nearest) means
-// this can very slightly over-convert by up to 1px per side rather than
-// ever under-convert and leave a real edge pixel stale.
-//
-// The scale here is deliberately SWS_FAST_BILINEAR regardless of the
-// recording profile's own algorithm (SWS_BILINEAR/SWS_BICUBIC under
-// --medium/--high): scaling a small region in isolation, with no
-// visibility into the real pixels just outside it, can produce a visibly
+// This used to run its own independent sws_scale call per region,
+// writing directly into the scaled output frame. That created a real,
+// reported artifact: scaling a small region in isolation, with no
+// visibility into the real pixels just outside it, produces a visibly
 // different result right at its own edge than the same algorithm would
-// produce as part of one continuous full-frame scale (nothing to blend
-// against at the boundary but whatever's already sitting in the cached
-// background there) -- a soft seam/halo around window borders, reported
-// in real-world testing. A cheaper, sharper filter doesn't blend across
-// that boundary the same way a wider sampling kernel does, so it's less
-// prone to this specific artifact, at the cost of a slightly less smooth
-// look on downscaled window content specifically (not the recording as a
-// whole). Unconfirmed whether this fully resolves it pending re-testing.
-static void CompositeScreenRegion(BRect srcRectNative, BScreen& screen,
-        int nativeWidth, int nativeHeight, int outWidth, int outHeight,
-        AVPixelFormat pixFmt, SwsContext** ioSwsCtx, AVFrame* dstFrame) {
+// produce as part of one continuous full-frame scale -- a soft seam/halo
+// right around window borders. Switching the per-region filter to
+// SWS_FAST_BILINEAR didn't fully fix it. Since a real user's own testing
+// (htop) already showed the *read* was the actual bottleneck, not the
+// scale, there was never a reason to also split the scale step -- this
+// now does the cheap part (small, bounded reads, still the real win) and
+// leaves the scale as one single full-frame call, identical in behavior
+// to the default (non-experimental) path's own conversion, which is why
+// the seam can't happen here: there's only one scale operation covering
+// the whole frame, with full context everywhere.
+//
+// Reads only this rectangle directly from app_server via
+// BScreen::GetBitmap()'s own bounds parameter -- not the whole screen --
+// into a bitmap sized to exactly match it (via GetBitmap()'s own
+// auto-sizing), rather than into screenBitmap directly at some computed
+// offset. Deliberately, to sidestep an unconfirmed question about
+// whether BScreen positions a partial capture at the destination
+// bitmap's own origin or at the requested rectangle's absolute screen
+// position. With an exact-sized destination those two possibilities are
+// identical, so it doesn't matter which one is actually true.
+static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* screenBitmap,
+        int nativeWidth, int nativeHeight) {
     int srcX = (int)floor(srcRectNative.left);
     int srcY = (int)floor(srcRectNative.top);
     int srcRight = (int)ceil(srcRectNative.right) + 1;
@@ -297,50 +297,23 @@ static void CompositeScreenRegion(BRect srcRectNative, BScreen& screen,
     if (srcRight <= srcX || srcBottom <= srcY)
         return; // degenerate (fully off-screen) -- nothing to do
 
-    int srcW = srcRight - srcX;
-    int srcH = srcBottom - srcY;
-
     BRect captureRect(srcX, srcY, srcRight - 1, srcBottom - 1);
     BBitmap* regionBitmap = nullptr;
     if (screen.GetBitmap(&regionBitmap, false, &captureRect) != B_OK || regionBitmap == nullptr)
         return;
 
-    double scaleX = (double)outWidth / nativeWidth;
-    double scaleY = (double)outHeight / nativeHeight;
+    int rowBytes = (srcRight - srcX) * 4; // BGRA/RGB32 -- 4 bytes per pixel
+    uint8_t* srcRow = (uint8_t*)regionBitmap->Bits();
+    uint8_t* dstRow = (uint8_t*)screenBitmap->Bits()
+        + (size_t)srcY * screenBitmap->BytesPerRow() + (size_t)srcX * 4;
+    int srcStride = (int)regionBitmap->BytesPerRow();
+    int dstStride = (int)screenBitmap->BytesPerRow();
 
-    int dstX = (int)(srcX * scaleX) & ~1;
-    int dstY = (int)(srcY * scaleY) & ~1;
-    int dstRight = ((int)ceil(srcRight * scaleX) + 1) & ~1;
-    int dstBottom = ((int)ceil(srcBottom * scaleY) + 1) & ~1;
-    if (dstRight > outWidth) dstRight = outWidth & ~1;
-    if (dstBottom > outHeight) dstBottom = outHeight & ~1;
-    if (dstRight <= dstX || dstBottom <= dstY) {
-        delete regionBitmap;
-        return;
+    for (int row = srcY; row < srcBottom; row++) {
+        memcpy(dstRow, srcRow, rowBytes);
+        srcRow += srcStride;
+        dstRow += dstStride;
     }
-
-    int dstW = dstRight - dstX;
-    int dstH = dstBottom - dstY;
-
-    uint8_t* srcPlanes[4] = { (uint8_t*)regionBitmap->Bits(), nullptr, nullptr, nullptr };
-    int srcLinesizes[4] = { (int)regionBitmap->BytesPerRow(), 0, 0, 0 };
-
-    // YUV420P: Y is full resolution, U/V are half resolution in both
-    // dimensions -- dstX/dstY are already even (rounded above), so
-    // halving them lands exactly on a chroma sample, not between two.
-    uint8_t* dstPlanes[4] = {
-        dstFrame->data[0] + (size_t)dstY * dstFrame->linesize[0] + dstX,
-        dstFrame->data[1] + (size_t)(dstY / 2) * dstFrame->linesize[1] + dstX / 2,
-        dstFrame->data[2] + (size_t)(dstY / 2) * dstFrame->linesize[2] + dstX / 2,
-        nullptr
-    };
-    int dstLinesizes[4] = {
-        dstFrame->linesize[0], dstFrame->linesize[1], dstFrame->linesize[2], 0
-    };
-
-    *ioSwsCtx = sws_getCachedContext(*ioSwsCtx, srcW, srcH, AV_PIX_FMT_BGRA,
-        dstW, dstH, pixFmt, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-    sws_scale(*ioSwsCtx, srcPlanes, srcLinesizes, 0, srcH, dstPlanes, dstLinesizes);
 
     delete regionBitmap;
 }
@@ -2049,14 +2022,13 @@ int main(int argc, char* argv[]) {
     BBitmap* screenBitmap = nullptr;
     struct SwsContext* swsCtx = nullptr;
 
-    // --experimental-screen-capture: a cached, already-converted
-    // background frame (reused every frame the window layout hasn't
-    // changed) plus its own separate SwsContext, and one more SwsContext
-    // shared across the per-frame window/cursor region composites (see
-    // CompositeScreenRegion above). Only allocated when the flag is on.
-    AVFrame* backgroundFrame = nullptr;
-    struct SwsContext* backgroundSwsCtx = nullptr;
-    struct SwsContext* regionSwsCtx = nullptr;
+    // --experimental-screen-capture: which windows (by token + frame) were
+    // captured last frame, and whether the cached background portion of
+    // screenBitmap needs a full-screen re-read this frame (see the main
+    // loop below and RefreshScreenRegion's own comment above). No separate
+    // SwsContext here -- the experimental path shares the same swsCtx the
+    // default path uses, since both now do exactly one full-frame convert
+    // per frame.
     std::vector<TrackedWindowRect> lastTrackedWindows;
     bool backgroundNeedsRebuild = true;
 
@@ -2128,19 +2100,6 @@ int main(int argc, char* argv[]) {
             return -1;
         }
 
-        if (g_experimentalScreenCapture) {
-            backgroundFrame = av_frame_alloc();
-            backgroundFrame->format = videoCodecCtx->pix_fmt;
-            backgroundFrame->width = outWidth;
-            backgroundFrame->height = outHeight;
-            if (av_image_alloc(backgroundFrame->data, backgroundFrame->linesize, outWidth,
-                    outHeight, videoCodecCtx->pix_fmt, 32) < 0) {
-                std::cerr << "[-] Error: Could not allocate the cached background frame."
-                    << std::endl;
-                return -1;
-            }
-        }
-
         // Allocate the capture bitmap once and reuse it every frame via
         // ReadBitmap() below, instead of calling GetBitmap() per frame.
         // GetBitmap() allocates a brand-new BBitmap (and the shared memory
@@ -2172,7 +2131,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.16";
+	    const char* localVersion = "v1.9.17";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2204,25 +2163,15 @@ int main(int argc, char* argv[]) {
                 if (backgroundNeedsRebuild
                         || WindowLayoutChanged(currentWindows, lastTrackedWindows)) {
                     // Layout changed (or this is the first frame): a
-                    // full-screen read and full-frame convert, the same
-                    // cost the default path always pays -- but only paid
-                    // here when the window layout actually changes, not
-                    // every single frame.
-                    if (screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK) {
-                        void* pixelBuffer = screenBitmap->Bits();
-                        backgroundSwsCtx = sws_getCachedContext(backgroundSwsCtx, width, height,
-                            AV_PIX_FMT_BGRA, outWidth, outHeight, videoCodecCtx->pix_fmt,
-                            profile.swsFlags, nullptr, nullptr, nullptr);
-                        uint8_t* bgSrcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-                        int bgSrcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                        sws_scale(backgroundSwsCtx, bgSrcData, bgSrcLinesize, 0, height,
-                            backgroundFrame->data, backgroundFrame->linesize);
-                    }
+                    // full-screen read straight into screenBitmap, the
+                    // same cost the default path always pays -- but only
+                    // paid here when the window layout actually changes,
+                    // not every single frame. No conversion yet; that
+                    // happens once below, after the per-region refreshes.
+                    screen.ReadBitmap(screenBitmap, false, &screenFrame);
                     lastTrackedWindows = currentWindows;
                     backgroundNeedsRebuild = false;
                 }
-
-                av_frame_copy(encodingFrame, backgroundFrame);
 
                 // Every tracked window's own pixels, unconditionally,
                 // every frame -- see the section comment above for why
@@ -2230,10 +2179,10 @@ int main(int argc, char* argv[]) {
                 // above (window content changes for reasons that have
                 // nothing to do with a window's own frame). Each call
                 // reads only that window's own rectangle directly from
-                // app_server -- see CompositeScreenRegion's own comment.
+                // app_server and pastes it into screenBitmap -- see
+                // RefreshScreenRegion's own comment.
                 for (const auto& win : currentWindows) {
-                    CompositeScreenRegion(win.frame, screen, width, height, outWidth, outHeight,
-                        videoCodecCtx->pix_fmt, &regionSwsCtx, encodingFrame);
+                    RefreshScreenRegion(win.frame, screen, screenBitmap, width, height);
                 }
 
                 // Same reasoning for the mouse cursor: BScreen bakes it
@@ -2246,8 +2195,24 @@ int main(int argc, char* argv[]) {
                 get_mouse(&cursorPos, &cursorButtons);
                 BRect cursorRect(cursorPos.x - 8, cursorPos.y - 8,
                     cursorPos.x + 32, cursorPos.y + 32);
-                CompositeScreenRegion(cursorRect, screen, width, height, outWidth, outHeight,
-                    videoCodecCtx->pix_fmt, &regionSwsCtx, encodingFrame);
+                RefreshScreenRegion(cursorRect, screen, screenBitmap, width, height);
+
+                // Exactly one full-frame convert per frame, identical to
+                // the default path below -- screenBitmap by this point
+                // holds the cached background plus every freshly-pasted
+                // window/cursor region, so there's only ever one scale
+                // operation with full context everywhere, which is what
+                // eliminates the per-region seam artifact by construction.
+                {
+                    void* pixelBuffer = screenBitmap->Bits();
+                    swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
+                        outWidth, outHeight, videoCodecCtx->pix_fmt,
+                        profile.swsFlags, nullptr, nullptr, nullptr);
+                    uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
+                    int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+                    sws_scale(swsCtx, srcData, srcLinesize, 0, height,
+                        encodingFrame->data, encodingFrame->linesize);
+                }
 
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
                 encodingFrame->pts = currentPresentationTime;
@@ -2351,12 +2316,6 @@ int main(int argc, char* argv[]) {
         av_frame_free(&encodingFrame);
         avcodec_free_context(&videoCodecCtx);
         if (swsCtx) sws_freeContext(swsCtx);
-        if (backgroundFrame) {
-            av_freep(&backgroundFrame->data);
-            av_frame_free(&backgroundFrame);
-        }
-        if (backgroundSwsCtx) sws_freeContext(backgroundSwsCtx);
-        if (regionSwsCtx) sws_freeContext(regionSwsCtx);
         delete screenBitmap;
         screenBitmap = nullptr;
     }

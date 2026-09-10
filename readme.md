@@ -45,12 +45,17 @@ whatever an earlier run left behind in `/boot/home`.
   experiment aimed at very small hardware buffer settings. See
   "--experimental: capping buffer holds relative to the source's own
   buffer size" below.
-- `hrecord start --experimental-screen-capture` — reuses a cached,
-  already-converted background between frames instead of reconverting the
-  whole screen every time, only freshly capturing the screen regions
-  actually covered by a window (or the mouse cursor) each frame. No effect
-  under `--audioonly` (there's no video to capture). Unconfirmed
-  experiment; the default full-frame capture path is completely unaffected
+- `hrecord start --experimental-screen-capture` — reuses a cached capture
+  buffer between frames instead of re-reading the whole screen every time,
+  only freshly reading the screen regions actually covered by a window (or
+  the mouse cursor) each frame, then converting the whole composited
+  buffer once per frame. No effect under `--audioonly` (there's no video
+  to capture). Real-world tested: noticeably better mouse responsiveness
+  while recording. An earlier version also had a confirmed window-border
+  artifact; this version composites regions via plain `memcpy` and
+  converts the whole frame in a single pass instead, expected to eliminate
+  that artifact by construction but not yet re-confirmed against real
+  hardware. The default full-frame capture path is completely unaffected
   unless this flag is passed. See "--experimental-screen-capture:
   window-aware capture" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
@@ -173,22 +178,39 @@ window feel). Minimized windows and non-normal windows (menus, tooltips,
 the Deskbar itself) are excluded, matching what a viewer would actually
 expect "the apps" to mean.
 
-**Window-border artifacts, also found in real-world testing, and a first
-mitigation.** Scaling a small region in isolation, with no visibility into
-the real pixels just outside it, can produce a visibly different result
-right at its own edge than the same algorithm would produce as part of
-one continuous full-frame scale -- a soft seam/halo right around window
-borders. Each window/cursor region's own scale now deliberately uses
-`SWS_FAST_BILINEAR` regardless of the recording profile's own algorithm
-(`SWS_BILINEAR`/`SWS_BICUBIC` under `--medium`/`--high`): a cheaper,
-sharper filter doesn't blend across that boundary the same way a wider
-sampling kernel does, trading a slightly less smooth look on downscaled
-window content specifically (not the recording as a whole) for less of
-this specific artifact. Unconfirmed whether this fully resolves it pending
-re-testing; if visible artifacts remain, the next thing to try is padding
-each region's *capture* rectangle by a few extra pixels (giving the
-scaler real neighboring context) while still only pasting the original,
-unpadded rectangle into the output frame.
+**Real-world confirmation: the bounded-read fix above is a genuine win.**
+One real user's testing described mouse responsiveness while recording as
+roughly 50% better than the default path, "feels like what using
+[RemoteControl's] RClient would behave as" -- consistent with the
+`app_server`-contention theory above, since small, frequent capture
+requests interleave with `app_server`'s other work far better than one
+big request per frame does. Worth noting honestly: `htop` still shows
+`app_server` itself pinned near 95% of one core either way -- this mode
+was never expected to lower that number (the same total screen area gets
+read either way, just in smaller pieces), only to change how that cost is
+felt while recording, and real-world testing confirms it does.
+
+**Window-border artifacts, also found in real-world testing, and now
+addressed at the actual cause rather than just mitigated -- pending
+re-testing.** Scaling a small region in
+isolation, with no visibility into the real pixels just outside it, can
+produce a visibly different result right at its own edge than the same
+algorithm would produce as part of one continuous full-frame scale -- a
+soft seam/halo right around window borders. A first attempt mitigated
+this by switching each region's own `sws_scale` call to
+`SWS_FAST_BILINEAR`, but real-world testing confirmed the artifacts
+remained -- switching filters couldn't fix a problem caused by splitting
+the scale operation itself. The actual fix: capture still happens per
+region (that bounded read is the real, confirmed win above), but each
+region's raw captured pixels are now pasted directly into the persistent
+capture buffer with a plain `memcpy` -- no color-space conversion -- and
+`sws_scale` runs exactly *once* per frame, over the whole composited
+buffer at once, identical in shape to the default path's own conversion
+step. In theory there's no seam because there's no longer more than one
+scale operation per frame; the region-level compositing and the
+frame-level color conversion are now fully separate steps, which is what
+the earlier per-region-scale design conflated. Not yet re-confirmed
+against real hardware.
 
 **A trade-off worth knowing:** while a window is actively being dragged or
 resized, its frame changes on every single frame by definition, so the
