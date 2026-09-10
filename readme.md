@@ -334,7 +334,7 @@ being moved) came out "fairly decent." The one real problem found: actively
 dragging a window around visibly broke it into fragments in the recording,
 exactly the round-robin staleness trade-off above predicts.
 
-**Chasing motion: a mitigation for the fragmentation, pending re-testing.**
+**Chasing motion: a mitigation for the fragmentation, confirmed helping.**
 Two additions target the dragging case specifically, without touching the
 confirmed-good steady-state behavior:
 
@@ -354,15 +354,48 @@ confirmed-good steady-state behavior:
    there's something worth chasing; a static desktop keeps costing exactly
    what it already measured at.
 
-Neither of these makes any freshness guarantee the way the window-aware
-mode's per-frame refresh does -- they're both still statistical, chasing
-*detected* motion rather than provably eliminating staleness. Not yet
+Real-world re-test: fragmentation is noticeably less, and dragging a window
+slowly showed none at all -- mouse responsiveness stayed "same, good and
+fluid" throughout, confirming the mitigation doesn't cost the steady-state
+win to get there. Neither addition makes any freshness guarantee the way
+the window-aware mode's per-frame refresh does, though -- they're both
+still statistical, chasing *detected* motion rather than provably
+eliminating staleness, so fast dragging can likely still show some
+fragmenting.
+
+**High-churn fallback: when tiling stops paying for itself at all.**
+Testing against a full-screen animated visualizer (projectM) surfaced a
+different, more severe case than window dragging: near-*continuous*,
+screen-wide change, where almost no tile is ever skippable. The recording
+came out effectively updating only 2-3 times per second even though frames
+were still being written at the target rate -- the round-robin, maxed out
+on its own burst multiplier, was spending hundreds of small `GetBitmap()`
+calls (each with `app_server`'s own fixed per-call overhead) to cover
+ground one plain full-screen `ReadBitmap()` would've covered in a single
+call, and the capture loop was falling behind its own per-frame budget
+trying anyway. Raising the target fps wouldn't have helped -- the loop
+wasn't fps-limited, it was per-call-overhead-limited; asking for more
+frames per second just means hitting that same wall more often.
+
+The fix: when a tile-scan pass finds more than 60% of its sampled tiles
+changed in one go -- a much higher bar than the burst-ramp threshold above,
+meant to catch only genuinely pathological churn -- the next ~1 second of
+frames (tied to the profile's own fps) falls back to a plain full-screen
+`ReadBitmap()`, identical in cost to the default path, instead of
+continuing to ramp the tile machinery harder. After the cooldown, it tries
+granular tiling again; if the screen is still that busy, it re-triggers
+immediately, if not, it resumes normal round-robin operation with an
+already-current buffer (the fallback reads kept it fresh throughout). This
+makes the mode self-adapt across the whole spectrum: cheap and granular on
+a mostly-static desktop (the confirmed win), and never meaningfully worse
+than the default path's own cost on something as demanding as a full-screen
+visualizer, instead of getting stuck paying for the worst of both. Not yet
 re-tested against real hardware.
 
 **Unconfirmed, still open:**
 
-- Whether the mitigation above actually closes the fragmentation
-  noticeably, only partially, or not at all -- pending re-testing.
+- Whether the high-churn fallback above actually fixes the projectM-style
+  slowdown, or just reduces it -- pending re-testing.
 - Whether the round-robin cadence (whole grid once per second, before any
   burst) is actually a good baseline, too slow, or needlessly fast for
   typical desktop use -- chosen as a starting point, not measured.
@@ -370,6 +403,9 @@ re-tested against real hardware.
   compounded by the neighbor-chase's extra reads during a burst -- ends up
   cheaper or more expensive in practice than `--experimental-screen-capture`'s
   unconditional-paste approach during active motion specifically.
+- Whether fast (not slow) window dragging still shows some residual
+  fragmentation despite the chase-and-burst mitigation -- only slow
+  dragging has been confirmed fragment-free so far.
 
 ## How desktop-audio capture works
 
