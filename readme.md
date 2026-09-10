@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -38,9 +38,13 @@ whatever an earlier run left behind in `/boot/home`.
   with or without `--allaudio`/`--audioonly`. Worth it for genuinely
   real-time use (e.g. playing an instrument live through effects, such as
   rakarrack, while recording); a casual recording doesn't need it. See
-  "--realtime: lower monitoring latency" below. (`--experimental` is still
-  accepted for backward compatibility but is a no-op now -- its tuning is
-  part of `--realtime`'s own defaults.)
+  "--realtime: lower monitoring latency" below.
+- `hrecord start --experimental` — caps how long a tap can hold a source's
+  buffer back, relative to that source's own buffer size, instead of the
+  flat 50ms `--realtime` otherwise uses for every source alike. Unconfirmed
+  experiment aimed at very small hardware buffer settings. See
+  "--experimental: capping buffer holds relative to the source's own
+  buffer size" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -316,7 +320,7 @@ ceiling is a reasonable bet for a real-time use case:
 |---|---|---|
 | Audio-tap ring buffer (`--allaudio`, per source) | 2s | 0.07s |
 | Audio-tap ring buffer (single-tap) | 0.5s | 0.07s |
-| BSoundPlayer buffer size requested | (default) | ~256 frames |
+| BSoundPlayer buffer size requested | (default) | ~128 frames |
 
 The BSoundPlayer buffer size is only a hint -- the Mixer can renegotiate it
 away -- but matching an already-tuned driver's own scale gives it the best
@@ -346,9 +350,54 @@ adding. Fixed by decoupling them: the snooze cap is a single, generous
 blocking this thread too long -- never needed to scale with a latency
 target), leaving ring buffer size as the real, and only, latency dial.
 Retested at a gentler 0.07s (up from 0.03s) with three simultaneous
-sources and confirmed clean, so that's `--realtime`'s own default now --
-`--experimental` is no longer a separate flag (still accepted, but a
-no-op, purely so an existing invocation doesn't break).
+sources and confirmed clean, so that's `--realtime`'s own default now.
+
+**Buffer size retuned again, 256 frames -> 128.** Same real user,
+retuning their own driver further still (`play_buffer_frames` 128,
+Cortex reporting ~7ms of latency) -- confirmed lower latency, with only
+occasional clicks/pops rather than a clean zero. `--realtime`'s own
+BSoundPlayer buffer-size hint was updated to match (128 frames, up from
+256) for the same reason as the original 256: matching the scale of an
+already-tuned driver gives the Mixer the best chance of actually
+honoring the hint. `--experimental` was revived (previously a no-op
+after its old tuning got folded into `--realtime`'s own defaults) to
+try to close the remaining occasional clicks/pops at this tighter
+setting -- see its own section below.
+
+### `--experimental`: capping buffer holds relative to the source's own buffer size
+
+`PaceToRealTime`'s backpressure (see above) works by deliberately
+delaying `buffer->Recycle()`, holding a buffer back for up to 50ms as
+the signal that tells a fast producer to slow down. That 50ms cap was
+picked as a generous, mode-independent safety valve, not tuned against
+any particular buffer size -- fine at 256 frames (~5.3ms @ 48kHz,
+roughly a 9x hold-to-period ratio), but at 128 frames (~2.7ms) that
+ratio nearly doubles to ~18x. A hold that much longer than a source's
+own natural buffer period is plausibly enough to strain a small
+hardware buffer's own headroom, heard as occasional clicks/pops even
+though nothing is being dropped or logged as an error.
+
+`--experimental` caps the hold at roughly 2x *that source's own* buffer
+duration instead of the flat 50ms, whenever that's tighter -- a 128-frame
+buffer gets roughly a 5.3ms cap. This is deliberately not the same
+mistake as the v1.8.1 regression documented above: a flat, *smaller*
+cap applied to every source alike is what broke correction speed there.
+This cap only tightens for sources whose own buffers are small and
+frequent to begin with, and for exactly those sources, correction
+*opportunity* scales right along with the tighter cap, since
+`BufferReceived` fires again just as often. A source with large,
+infrequent buffers keeps the full 50ms, identical to every other mode.
+
+This exact idea was tried once before, gated behind `--experimental`,
+for a different symptom entirely: a Rakarrack-side
+`SoundPlayNode::FillNextBuffer: RequestBuffer failed` flood. That one
+turned out to be caused by stale `media_server` state left over from
+earlier testing, not by pacing timing, so the change was reverted as
+unnecessary for that bug (`--experimental` went back to being a no-op).
+That finding doesn't rule this mechanism out for a *different* symptom
+-- audible clicking during monitoring, not a Media Kit error message --
+so it's being tried again on its own merits rather than treated as
+already disproven. Unconfirmed pending real-world testing.
 
 **The periodic (`t+Ns: source #N backlog: ...`) logging that used to print
 every ~2 seconds has been removed.** It was added specifically to catch a
