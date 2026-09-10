@@ -51,13 +51,12 @@ whatever an earlier run left behind in `/boot/home`.
   the mouse cursor) each frame, then converting the whole composited
   buffer once per frame. No effect under `--audioonly` (there's no video
   to capture). Real-world tested: noticeably better mouse responsiveness
-  while recording. An earlier version also had a confirmed window-border
-  artifact; this version composites regions via plain `memcpy` and
-  converts the whole frame in a single pass instead, expected to eliminate
-  that artifact by construction but not yet re-confirmed against real
-  hardware. The default full-frame capture path is completely unaffected
-  unless this flag is passed. See "--experimental-screen-capture:
-  window-aware capture" below.
+  while recording, and no window-border artifacts (an earlier version had
+  a confirmed one; fixed by compositing regions via plain `memcpy` and
+  converting the whole frame in a single pass instead of scaling each
+  region independently). The default full-frame capture path is
+  completely unaffected unless this flag is passed. See
+  "--experimental-screen-capture: window-aware capture" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -191,8 +190,8 @@ read either way, just in smaller pieces), only to change how that cost is
 felt while recording, and real-world testing confirms it does.
 
 **Window-border artifacts, also found in real-world testing, and now
-addressed at the actual cause rather than just mitigated -- pending
-re-testing.** Scaling a small region in
+confirmed fixed at the actual cause rather than just mitigated.** Scaling
+a small region in
 isolation, with no visibility into the real pixels just outside it, can
 produce a visibly different result right at its own edge than the same
 algorithm would produce as part of one continuous full-frame scale -- a
@@ -206,11 +205,11 @@ region's raw captured pixels are now pasted directly into the persistent
 capture buffer with a plain `memcpy` -- no color-space conversion -- and
 `sws_scale` runs exactly *once* per frame, over the whole composited
 buffer at once, identical in shape to the default path's own conversion
-step. In theory there's no seam because there's no longer more than one
-scale operation per frame; the region-level compositing and the
-frame-level color conversion are now fully separate steps, which is what
-the earlier per-region-scale design conflated. Not yet re-confirmed
-against real hardware.
+step. There's no seam because there's no longer more than one scale
+operation per frame; the region-level compositing and the frame-level
+color conversion are now fully separate steps, which is what the earlier
+per-region-scale design conflated. Confirmed against real hardware: the
+artifacts are gone.
 
 **A trade-off worth knowing:** while a window is actively being dragged or
 resized, its frame changes on every single frame by definition, so the
