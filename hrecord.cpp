@@ -233,6 +233,14 @@ const int kRcserverTileSize = 100;
 const int kRcserverMaxBurstMultiplier = 8;
 const double kRcserverChurnThreshold = 0.12;
 
+// Above this fraction of sampled tiles changing in one pass, tiling has
+// stopped paying for itself -- see rcserverFallbackFramesRemaining's own
+// comment for why and what happens instead. Deliberately much higher than
+// kRcserverChurnThreshold above: that one asks "is anything worth
+// chasing harder," this one asks "is almost everything changing anyway,"
+// a different, much rarer condition.
+const double kRcserverFallbackChurnThreshold = 0.6;
+
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
 // tracking uses, via get_window_info()/BPrivate::get_window_order()).
@@ -2202,6 +2210,21 @@ int main(int argc, char* argv[]) {
     // was -- see the main loop's own comment for the full mechanism.
     int rcserverBurstMultiplier = 1;
 
+    // High-churn fallback: real-world testing with a full-screen animated
+    // visualizer (projectM) showed the round-robin -- even maxed out on
+    // its own burst multiplier -- struggling to keep up, because tiling
+    // only pays off when *most* tiles are skippable. When almost
+    // everything on screen is changing at once, hundreds of small
+    // GetBitmap() calls (each with app_server's own fixed per-call
+    // overhead) cost more in aggregate than one plain full-screen
+    // ReadBitmap() covering the same area, and the capture loop can fall
+    // behind its own per-frame budget trying anyway. When a tile-scan
+    // pass finds churn this severe, the next several frames use a plain
+    // full-screen read instead -- identical in cost to the default
+    // path -- for a fixed cooldown window before trying granular tiling
+    // again. >0 while that cooldown is in effect.
+    int rcserverFallbackFramesRemaining = 0;
+
     if (!audioOnly) {
         const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!codec) {
@@ -2301,7 +2324,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.19";
+	    const char* localVersion = "v1.9.20";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2405,6 +2428,13 @@ int main(int argc, char* argv[]) {
                     // background build; the default path's every frame).
                     screen.ReadBitmap(screenBitmap, false, &screenFrame);
                     rcserverNeedsSeed = false;
+                } else if (rcserverFallbackFramesRemaining > 0) {
+                    // See rcserverFallbackFramesRemaining's own comment:
+                    // near-everything is changing right now, so one big
+                    // read costs less overall than the many small reads
+                    // tiling would need to cover the same ground.
+                    screen.ReadBitmap(screenBitmap, false, &screenFrame);
+                    rcserverFallbackFramesRemaining--;
                 } else {
                     int tilesX = (width + kRcserverTileSize - 1) / kRcserverTileSize;
                     int tilesY = (height + kRcserverTileSize - 1) / kRcserverTileSize;
@@ -2471,15 +2501,27 @@ int main(int argc, char* argv[]) {
                             rcserverNextTile = (rcserverNextTile + 1) % totalTiles;
                         }
 
-                        // Ramp the burst multiplier up while a meaningful
-                        // fraction of this frame's sampled tiles actually
-                        // changed (real on-screen motion happening right
-                        // now), and let it decay back down a step at a
-                        // time once things go quiet -- so the confirmed
-                        // low steady-state cost only gets spent while
-                        // there's something worth chasing.
                         double changedFraction = (double)changedCount / tilesPerFrame;
-                        if (changedFraction > kRcserverChurnThreshold) {
+                        if (changedFraction > kRcserverFallbackChurnThreshold) {
+                            // Tiling has stopped paying for itself this
+                            // frame -- see rcserverFallbackFramesRemaining's
+                            // own comment. Drop straight to a plain
+                            // full-screen read for a cooldown window
+                            // instead of continuing to ramp the burst
+                            // multiplier, which would only mean paying for
+                            // even more small reads to cover ground a
+                            // single big one already would.
+                            rcserverFallbackFramesRemaining = profile.fps;
+                            rcserverBurstMultiplier = 1;
+                        } else if (changedFraction > kRcserverChurnThreshold) {
+                            // Ramp the burst multiplier up while a
+                            // meaningful (but not overwhelming) fraction of
+                            // this frame's sampled tiles actually changed
+                            // (real on-screen motion happening right now),
+                            // and let it decay back down a step at a time
+                            // once things go quiet -- so the confirmed low
+                            // steady-state cost only gets spent while
+                            // there's something worth chasing.
                             if (rcserverBurstMultiplier < kRcserverMaxBurstMultiplier)
                                 rcserverBurstMultiplier++;
                         } else if (rcserverBurstMultiplier > 1) {
