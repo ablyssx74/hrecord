@@ -1,7 +1,7 @@
 # hrecord Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
-VERSION = 1.9.13
+VERSION = 1.9.15
 PACKAGE_DIR := build/package
 DUMMY_PC_PATH := $(shell pwd)/build/pkgconfig
 
@@ -34,8 +34,12 @@ endif
 
 export PKG_CONFIG_PATH := $(DUMMY_PC_PATH):/boot/home/config/non-packaged/lib/pkgconfig:/boot/home/config/non-packaged/lib$(LIB_ARCH_DIR)/pkgconfig:/boot/system/develop/lib$(LIB_ARCH_DIR)/pkgconfig:
 
-CXXFLAGS = -std=c++17 -O3 -Wall -rdynamic 
-INCLUDES = -I/boot/home/config/non-packaged/include -I/boot/system/develop/headers
+CXXFLAGS = -std=c++17 -O3 -Wall -rdynamic
+# private/interface and private/app hold <WindowInfo.h> (get_window_info(),
+# BPrivate::get_window_order()) -- used by --experimental-screen-capture's
+# window tracking, the same private Window Kit API hDesktop uses.
+INCLUDES = -I/boot/home/config/non-packaged/include -I/boot/system/develop/headers \
+           -I/boot/system/develop/headers/private/interface -I/boot/system/develop/headers/private/app
 LIB_PATH = -L/boot/system/lib$(LIB_ARCH_DIR) -L/boot/system/develop/lib$(LIB_ARCH_DIR) -L/boot/home/config/non-packaged/lib$(LIB_ARCH_DIR) 
 
 EXTRA_LIBS = $(shell $(PKG_CONFIG_CMD) --libs libavformat libavcodec libavutil libswscale libswresample) \

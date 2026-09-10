@@ -4,6 +4,7 @@
  */
 
 #include <InterfaceKit.h> // Pulls in BApplication, BScreen, BBitmap
+#include <WindowInfo.h> // Private Window Kit API -- see EnumerateVisibleWindows()
 #include <StorageKit.h>
 #include <SupportKit.h>   // Pulls in system_time()
 #include <MediaRoster.h>
@@ -27,6 +28,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <ctime>
+#include <cmath> // floor()/ceil() -- CompositeScreenRegion (see --experimental-screen-capture)
+#include <cstdlib> // free() -- EnumerateVisibleWindows' get_window_info()/get_window_order() results
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -45,7 +48,7 @@ bool g_running = true;
 
 // Set once from the --realtime CLI flag (see main()). When true, the
 // audio-tap ring buffers and the buffer size requested from BSoundPlayer
-// are tuned smaller (256 frames / ~0.07s), trading away some of the
+// are tuned smaller (128 frames / ~0.07s), trading away some of the
 // safety margin against buffering-jitter glitches for lower monitoring
 // latency -- worth it for a genuinely real-time use case (e.g. playing
 // guitar live through rakarrack while recording), not something a casual
@@ -54,10 +57,32 @@ bool g_running = true;
 // buffer settings. These numbers were originally gated behind a separate
 // --experimental flag pending real-world testing; confirmed clean with
 // three simultaneous sources on a driver hand-tuned to
-// play_buffer_frames 256, so they're --realtime's own defaults now.
-// --experimental is still accepted on the command line (a no-op, purely
-// so an existing invocation doesn't break) -- see main().
+// play_buffer_frames 256, so they became --realtime's own defaults --
+// later retuned again to 128 frames, matching the same user's own
+// driver being retuned further still (7ms latency reported, down from
+// 256's own headroom).
 bool g_realtimeAudio = false;
+
+// Set once from the --experimental CLI flag (see main()). When true,
+// PaceToRealTime's backpressure hold on a buffer is capped relative to
+// that source's own buffer duration instead of the flat 50ms
+// --realtime otherwise uses. Reintroduced for the same real user's
+// occasional clicks/pops reported at a hand-tuned 48kHz/128-frame
+// driver setting (~2.7ms per buffer) -- a 50ms hold is roughly 18x that
+// buffer's own period, a lot more than an already-tight buffer's own
+// pool can necessarily absorb. This exact idea was tried once before
+// (see git history: "v1.9.9: --experimental caps buffer holds for
+// small-buffer producers") for a different symptom (a Rakarrack-side
+// "SoundPlayNode::FillNextBuffer: RequestBuffer failed" flood) that
+// turned out to be caused by stale media_server state, not pacing
+// timing, so it was reverted as unnecessary for that bug -- but that
+// finding doesn't rule it out for *this* one (audible clicking, not a
+// Media Kit error message), so it's worth testing again on its own
+// merits rather than assuming it's already been disproven. See
+// PaceToRealTime's own comment for the mechanism and how this avoids
+// the *other*, confirmed-bad cap regression (v1.8.1's flat, smaller
+// cap for every source alike).
+bool g_experimentalAudio = false;
 
 // ============================================================================
 // Screen recording quality profiles
@@ -85,6 +110,194 @@ const VideoProfile kVideoProfiles[3] = {
     { "medium", 24, 1600, SWS_BILINEAR,      10 },
     { "high",   30, 0,    SWS_BICUBIC,        3 },
 };
+
+// ============================================================================
+// --experimental-screen-capture: window-aware capture
+//
+// The default path re-reads the whole screen and re-runs sws_scale's
+// colorspace conversion over every pixel, every frame, regardless of how
+// much of the screen actually changed since the last one -- simple and
+// always correct, but wasteful on a desktop where windows only cover part
+// of the screen: the bare wallpaper/Deskbar area gets reconverted for no
+// reason every single frame.
+//
+// This mode still reads the *whole* screen every frame (BScreen has no
+// partial-capture primitive, so that IPC/memory-copy cost isn't avoidable
+// either way) and still encodes the *whole* composited frame every time
+// (MJPEG is intra-only -- there's no such thing as "only encode the part
+// that changed," unlike H.264/VP9's delta frames). What it skips is the
+// sws_scale conversion cost for the part of the screen that's genuinely
+// static: a cached, already-converted background is reused every frame,
+// and only the screen regions actually covered by a window (plus the
+// mouse cursor -- see below) get freshly converted each time.
+//
+// Two things this deliberately does NOT do, because doing them would be
+// wrong, not just less efficient:
+//   - It does not skip re-converting a window just because its *frame*
+//     (position/size) hasn't moved. A window's own content can change for
+//     any reason that has nothing to do with its frame -- a blinking
+//     cursor, scrolling text, a VU meter, a video playing -- so every
+//     tracked window's pixels are freshly captured and converted every
+//     single frame, unconditionally. Only the true background (the area
+//     no window covers) is cached, and only until the window layout
+//     itself changes.
+//   - It does not ignore the mouse cursor just because it isn't a window.
+//     BScreen::ReadBitmap() bakes the cursor into the captured pixels, but
+//     the cursor's own position isn't reported by anything in the window
+//     list, so a small region around wherever it currently is gets
+//     refreshed every frame too, exactly like a window's own region --
+//     otherwise the cursor would visibly freeze in place except when some
+//     window's frame happens to change.
+//
+// A consequence worth knowing: while a window is actively being dragged
+// or resized, its frame changes on every single frame by definition, so
+// the background gets rebuilt every frame during that -- no visual
+// artifacts, just no speedup for that specific moment. That's the correct
+// trade-off (never risk a stale background under a moving window), not a
+// bug to fix.
+bool g_experimentalScreenCapture = false;
+
+// One tracked window's on-screen rectangle, from Haiku's private Window
+// Kit API (client_window_info -- the same struct hDesktop's own window
+// tracking uses, via get_window_info()/BPrivate::get_window_order()).
+struct TrackedWindowRect {
+    int32 token;
+    BRect frame; // screen coordinates, native (unscaled) resolution
+};
+
+// Enumerates currently-visible, normal application windows on the active
+// workspace: BPrivate::get_window_order() returns every window's token
+// for that workspace, then get_window_info() resolves each token to its
+// frame/state. Minimized windows and non-normal windows (menus, tooltips,
+// the Deskbar itself, etc. -- anything not B_NORMAL_WINDOW_FEEL) are
+// skipped, matching what a viewer would actually expect "the apps" to
+// mean.
+//
+// Order note: get_window_order() is assumed here to return tokens
+// front-to-back (topmost first), so this reverses that order before
+// returning -- callers should composite in the returned order (back to
+// front) for overlapping windows to layer correctly. Unconfirmed against
+// real hardware; if overlapping windows composite with the wrong one on
+// top, this assumption is inverted and the fix is to stop reversing here.
+static void EnumerateVisibleWindows(std::vector<TrackedWindowRect>* outWindows) {
+    outWindows->clear();
+
+    int32 workspace = current_workspace();
+    int32* tokens = nullptr;
+    int32 tokenCount = 0;
+    if (BPrivate::get_window_order(workspace, &tokens, &tokenCount) != B_OK
+            || tokens == nullptr) {
+        return;
+    }
+
+    for (int32 i = 0; i < tokenCount; i++) {
+        client_window_info* info = get_window_info(tokens[i]);
+        if (info == nullptr)
+            continue;
+
+        if (!info->is_mini && info->feel == B_NORMAL_WINDOW_FEEL
+                && (info->workspaces & (1 << workspace)) != 0) {
+            BRect frame(info->window_left, info->window_top,
+                info->window_right, info->window_bottom);
+            if (frame.IsValid())
+                outWindows->push_back({ tokens[i], frame });
+        }
+        free(info);
+    }
+    free(tokens);
+
+    std::reverse(outWindows->begin(), outWindows->end());
+}
+
+// True if the tracked window set differs from last time in membership,
+// order, or any frame -- the signal to rebuild the cached background.
+// Z-order-only differences (same windows, same frames, different front-
+// to-back order) also count, conservatively: cheap to check, and the
+// alternative (silently keeping a background from before a z-order
+// change) risks a stale sliver behind whichever window used to be on top.
+static bool WindowLayoutChanged(const std::vector<TrackedWindowRect>& a,
+        const std::vector<TrackedWindowRect>& b) {
+    if (a.size() != b.size())
+        return true;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i].token != b[i].token || a[i].frame != b[i].frame)
+            return true;
+    }
+    return false;
+}
+
+// Converts one screen-space rectangle (native resolution, from
+// screenBitmap's own pixel buffer) into the correspondingly-scaled
+// rectangle of dstFrame's YUV planes, in place -- used for both window
+// regions and the cursor region. dstFrame must already hold valid data
+// everywhere outside this rectangle (the caller is responsible for that,
+// e.g. via a prior full-frame or cached-background copy); this only ever
+// touches the pixels within the scaled rectangle it's given.
+//
+// Destination coordinates are rounded outward to even numbers before use
+// -- YUV420P's chroma planes are half-resolution in both dimensions, so
+// an odd offset there would misalign chroma sampling right at the
+// rectangle's own edge. Rounding outward (rather than to nearest) means
+// this can very slightly over-convert by up to 1px per side rather than
+// ever under-convert and leave a real edge pixel stale.
+static void CompositeScreenRegion(BRect srcRectNative, BBitmap* screenBitmap,
+        int nativeWidth, int nativeHeight, int outWidth, int outHeight,
+        AVPixelFormat pixFmt, int swsFlags, SwsContext** ioSwsCtx, AVFrame* dstFrame) {
+    int srcX = (int)floor(srcRectNative.left);
+    int srcY = (int)floor(srcRectNative.top);
+    int srcRight = (int)ceil(srcRectNative.right) + 1;
+    int srcBottom = (int)ceil(srcRectNative.bottom) + 1;
+
+    // Clamp to the actual captured buffer -- a window can report a frame
+    // that's partially (or, for a window dragged off-screen, entirely)
+    // outside the screen's own bounds.
+    if (srcX < 0) srcX = 0;
+    if (srcY < 0) srcY = 0;
+    if (srcRight > nativeWidth) srcRight = nativeWidth;
+    if (srcBottom > nativeHeight) srcBottom = nativeHeight;
+    if (srcRight <= srcX || srcBottom <= srcY)
+        return; // degenerate (fully off-screen) -- nothing to do
+
+    int srcW = srcRight - srcX;
+    int srcH = srcBottom - srcY;
+
+    double scaleX = (double)outWidth / nativeWidth;
+    double scaleY = (double)outHeight / nativeHeight;
+
+    int dstX = (int)(srcX * scaleX) & ~1;
+    int dstY = (int)(srcY * scaleY) & ~1;
+    int dstRight = ((int)ceil(srcRight * scaleX) + 1) & ~1;
+    int dstBottom = ((int)ceil(srcBottom * scaleY) + 1) & ~1;
+    if (dstRight > outWidth) dstRight = outWidth & ~1;
+    if (dstBottom > outHeight) dstBottom = outHeight & ~1;
+    if (dstRight <= dstX || dstBottom <= dstY)
+        return;
+
+    int dstW = dstRight - dstX;
+    int dstH = dstBottom - dstY;
+
+    uint8_t* srcPixels = (uint8_t*)screenBitmap->Bits()
+        + (size_t)srcY * screenBitmap->BytesPerRow() + (size_t)srcX * 4;
+    uint8_t* srcPlanes[4] = { srcPixels, nullptr, nullptr, nullptr };
+    int srcLinesizes[4] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+
+    // YUV420P: Y is full resolution, U/V are half resolution in both
+    // dimensions -- dstX/dstY are already even (rounded above), so
+    // halving them lands exactly on a chroma sample, not between two.
+    uint8_t* dstPlanes[4] = {
+        dstFrame->data[0] + (size_t)dstY * dstFrame->linesize[0] + dstX,
+        dstFrame->data[1] + (size_t)(dstY / 2) * dstFrame->linesize[1] + dstX / 2,
+        dstFrame->data[2] + (size_t)(dstY / 2) * dstFrame->linesize[2] + dstX / 2,
+        nullptr
+    };
+    int dstLinesizes[4] = {
+        dstFrame->linesize[0], dstFrame->linesize[1], dstFrame->linesize[2], 0
+    };
+
+    *ioSwsCtx = sws_getCachedContext(*ioSwsCtx, srcW, srcH, AV_PIX_FMT_BGRA,
+        dstW, dstH, pixFmt, swsFlags, nullptr, nullptr, nullptr);
+    sws_scale(*ioSwsCtx, srcPlanes, srcLinesizes, 0, srcH, dstPlanes, dstLinesizes);
+}
 
 // Guards every write to the shared AVFormatContext (avformat_write_header,
 // av_interleaved_write_frame, av_write_trailer) since the video frames are
@@ -522,14 +735,14 @@ media_raw_audio_format MixBusFormat() {
     fmt.channel_count = kMixBusChannels;
     fmt.format = media_raw_audio_format::B_AUDIO_FLOAT;
     fmt.byte_order = B_MEDIA_HOST_ENDIAN;
-    // Under --realtime, request 256 frames -- confirmed in testing to
-    // work cleanly, matching how far a real user of this project hand-
-    // tuned their own driver (play_buffer_frames 256). This is only a
-    // hint (the Mixer may renegotiate it away entirely), but matching the
-    // same scale as an already-tuned driver gives it the best chance of
-    // being honored.
+    // Under --realtime, request 128 frames -- matching how far a real
+    // user of this project hand-tuned their own driver
+    // (play_buffer_frames 128, down from 256, confirmed lower latency
+    // with only occasional clicks/pops). This is only a hint (the Mixer
+    // may renegotiate it away entirely), but matching the same scale as
+    // an already-tuned driver gives it the best chance of being honored.
     fmt.buffer_size = g_realtimeAudio
-        ? (size_t)(kMixBusChannels * sizeof(float) * 256) : 4096;
+        ? (size_t)(kMixBusChannels * sizeof(float) * 128) : 4096;
     return fmt;
 }
 
@@ -772,21 +985,42 @@ public:
             // right at startup) corrects gradually over a few calls
             // instead of blocking this thread -- and anything else it
             // needs to handle, a stop request included -- for one long
-            // stretch. This is *not* a latency dial: it doesn't scale
-            // down with --realtime/--experimental (a real user's testing
-            // showed --experimental's previous, tighter cap turning
-            // *zero* drops into millions -- a smaller cap means slower
-            // correction per call, which a source that's persistently
-            // running even slightly ahead of real time, not just
-            // bursting once, never fully recovers from before the next
-            // buffer arrives; combined with --experimental's smaller
-            // ring having far less room to absorb that shortfall, drift
-            // compounded across the whole session instead of clearing).
-            // A single generous cap lets correction actually keep up
-            // during normal operation regardless of mode; ring buffer
-            // size (see SetupAllAudioTaps / SetupDesktopAudioTap) is the
-            // actual latency dial.
-            const bigtime_t kMaxSnooze = 50000; // 50ms
+            // stretch. This is *not* a latency dial: a flat, *smaller*
+            // cap applied to every source alike doesn't scale down well
+            // (a real user's testing showed the old --experimental's
+            // tighter flat cap turning *zero* drops into millions -- a
+            // smaller cap means slower correction per call, which a
+            // source that's persistently running even slightly ahead of
+            // real time, not just bursting once, never fully recovers
+            // from before the next buffer arrives; combined with that
+            // mode's smaller ring having far less room to absorb the
+            // shortfall, drift compounded across the whole session
+            // instead of clearing). A single generous cap lets
+            // correction actually keep up during normal operation
+            // regardless of mode; ring buffer size (see
+            // SetupAllAudioTaps / SetupDesktopAudioTap) is the actual
+            // latency dial.
+            bigtime_t kMaxSnooze = 50000; // 50ms
+
+            // --experimental: cap the hold at roughly 2x *this buffer's
+            // own* duration instead, when that's tighter than 50ms.
+            // Different from the flat-smaller-cap regression above:
+            // this only tightens the ceiling for sources whose buffers
+            // are themselves small and frequent (e.g. a 128-frame/48kHz
+            // buffer, ~2.7ms, gets roughly a 5.3ms cap) -- and for
+            // exactly those sources, correction *opportunity* scales
+            // right along with the tighter cap, since BufferReceived
+            // fires again just as often. A source with large, infrequent
+            // buffers keeps the full 50ms, identical to every other
+            // mode. Unconfirmed pending real-world testing; see
+            // g_experimentalAudio's own comment for what motivated
+            // trying this again.
+            if (g_experimentalAudio) {
+                bigtime_t relativeCap = bufferDurationUs * 2;
+                if (relativeCap < kMaxSnooze)
+                    kMaxSnooze = relativeCap;
+            }
+
             snooze(std::min(aheadBy, kMaxSnooze));
         }
     }
@@ -1129,11 +1363,11 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     tap->SetPlaybackRing(&g_playbackRing);
 
     if (g_realtimeAudio && bytesPerFrame > 0) {
-        // Same rationale as MixBusFormat(): request ~256 frames, matching
+        // Same rationale as MixBusFormat(): request ~128 frames, matching
         // the scale of an already-tuned driver, rather than leaving
         // whatever buffer_size the app itself happened to negotiate with
         // the Mixer originally.
-        negotiated.buffer_size = (size_t)bytesPerFrame * 256;
+        negotiated.buffer_size = (size_t)bytesPerFrame * 128;
     }
 
     BSoundPlayer* player = new BSoundPlayer(&negotiated, "hrecord Playback", PlaybackCallback,
@@ -1503,6 +1737,7 @@ int main(int argc, char* argv[]) {
     bool allAudio = false;
     bool realtimeAudio = false;
     bool experimentalAudio = false;
+    bool experimentalScreenCapture = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -1520,6 +1755,8 @@ int main(int argc, char* argv[]) {
             realtimeAudio = true;
         } else if (strcmp(argv[i], "--experimental") == 0) {
             experimentalAudio = true;
+        } else if (strcmp(argv[i], "--experimental-screen-capture") == 0) {
+            experimentalScreenCapture = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -1530,18 +1767,27 @@ int main(int argc, char* argv[]) {
             profileIndex = 2;
         } else {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
-                "[--allaudio] [--realtime] [--experimental] [--list-audio-inputs]" << std::endl;
+                "[--allaudio] [--realtime] [--experimental] [--experimental-screen-capture] "
+                "[--list-audio-inputs]" << std::endl;
             return 0;
         }
     }
 
-    // --experimental's own tuning was folded into --realtime's defaults
-    // after confirming it clean in testing (see g_realtimeAudio above);
-    // it's still accepted here as a no-op purely so an existing
-    // invocation that includes it doesn't break.
-    if (experimentalAudio && !realtimeAudio) {
-        std::cout << "[i] --experimental now requires nothing extra -- its tuning is part of "
-            "--realtime's own defaults. Add --realtime to get it." << std::endl;
+    if (experimentalScreenCapture && audioOnly) {
+        std::cout << "[i] --experimental-screen-capture only affects video capture; ignored "
+            "under --audioonly." << std::endl;
+        experimentalScreenCapture = false;
+    }
+
+    // Read by the main capture loop (section 7) -- window-aware capture,
+    // see the section comment above EnumerateVisibleWindows() for the
+    // full design and its known trade-offs.
+    g_experimentalScreenCapture = experimentalScreenCapture;
+    if (g_experimentalScreenCapture) {
+        std::cout << "[i] --experimental-screen-capture: reusing a cached background between "
+            "frames and only freshly capturing window (and cursor) regions -- an unconfirmed "
+            "experiment, default full-frame capture is unaffected without this flag (see "
+            "readme.md)." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -1552,10 +1798,17 @@ int main(int argc, char* argv[]) {
         std::cout << "[i] --realtime: using tighter audio buffers for lower monitoring "
             "latency. Best paired with a sound driver already tuned for low latency (see "
             "readme.md) -- this doesn't change the driver's own buffer settings." << std::endl;
-        if (experimentalAudio) {
-            std::cout << "[i] --experimental is redundant now (its tuning is already part of "
-                "--realtime) but harmless to keep passing." << std::endl;
-        }
+    }
+
+    // Read by PaceToRealTime() -- see g_experimentalAudio's own comment
+    // for what this changes and why it's a separate, unconfirmed opt-in
+    // rather than folded into --realtime's defaults.
+    g_experimentalAudio = experimentalAudio;
+    if (g_experimentalAudio) {
+        std::cout << "[i] --experimental: capping how long a tap can hold a source's buffer "
+            "back, relative to that source's own buffer size, instead of a flat 50ms for "
+            "everyone -- an unconfirmed experiment aimed at very small hardware buffer "
+            "settings (see readme.md)." << std::endl;
     }
 
     const VideoProfile& profile = kVideoProfiles[profileIndex];
@@ -1750,6 +2003,17 @@ int main(int argc, char* argv[]) {
     BBitmap* screenBitmap = nullptr;
     struct SwsContext* swsCtx = nullptr;
 
+    // --experimental-screen-capture: a cached, already-converted
+    // background frame (reused every frame the window layout hasn't
+    // changed) plus its own separate SwsContext, and one more SwsContext
+    // shared across the per-frame window/cursor region composites (see
+    // CompositeScreenRegion above). Only allocated when the flag is on.
+    AVFrame* backgroundFrame = nullptr;
+    struct SwsContext* backgroundSwsCtx = nullptr;
+    struct SwsContext* regionSwsCtx = nullptr;
+    std::vector<TrackedWindowRect> lastTrackedWindows;
+    bool backgroundNeedsRebuild = true;
+
     if (!audioOnly) {
         const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!codec) {
@@ -1818,6 +2082,19 @@ int main(int argc, char* argv[]) {
             return -1;
         }
 
+        if (g_experimentalScreenCapture) {
+            backgroundFrame = av_frame_alloc();
+            backgroundFrame->format = videoCodecCtx->pix_fmt;
+            backgroundFrame->width = outWidth;
+            backgroundFrame->height = outHeight;
+            if (av_image_alloc(backgroundFrame->data, backgroundFrame->linesize, outWidth,
+                    outHeight, videoCodecCtx->pix_fmt, 32) < 0) {
+                std::cerr << "[-] Error: Could not allocate the cached background frame."
+                    << std::endl;
+                return -1;
+            }
+        }
+
         // Allocate the capture bitmap once and reuse it every frame via
         // ReadBitmap() below, instead of calling GetBitmap() per frame.
         // GetBitmap() allocates a brand-new BBitmap (and the shared memory
@@ -1849,7 +2126,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.13";
+	    const char* localVersion = "v1.9.15";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -1877,13 +2154,58 @@ int main(int argc, char* argv[]) {
             if (screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK) {
                 void* pixelBuffer = screenBitmap->Bits();
 
-                swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                                              outWidth, outHeight, videoCodecCtx->pix_fmt,
-                                              profile.swsFlags, nullptr, nullptr, nullptr);
+                if (g_experimentalScreenCapture) {
+                    std::vector<TrackedWindowRect> currentWindows;
+                    EnumerateVisibleWindows(&currentWindows);
 
-                uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-                int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
+                    if (backgroundNeedsRebuild
+                            || WindowLayoutChanged(currentWindows, lastTrackedWindows)) {
+                        backgroundSwsCtx = sws_getCachedContext(backgroundSwsCtx, width, height,
+                            AV_PIX_FMT_BGRA, outWidth, outHeight, videoCodecCtx->pix_fmt,
+                            profile.swsFlags, nullptr, nullptr, nullptr);
+                        uint8_t* bgSrcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
+                        int bgSrcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+                        sws_scale(backgroundSwsCtx, bgSrcData, bgSrcLinesize, 0, height,
+                            backgroundFrame->data, backgroundFrame->linesize);
+                        lastTrackedWindows = currentWindows;
+                        backgroundNeedsRebuild = false;
+                    }
+
+                    av_frame_copy(encodingFrame, backgroundFrame);
+
+                    // Every tracked window's own pixels, unconditionally,
+                    // every frame -- see the section comment above for why
+                    // this can never be gated on the layout-changed check
+                    // above (window content changes for reasons that have
+                    // nothing to do with a window's own frame).
+                    for (const auto& win : currentWindows) {
+                        CompositeScreenRegion(win.frame, screenBitmap, width, height, outWidth,
+                            outHeight, videoCodecCtx->pix_fmt, profile.swsFlags, &regionSwsCtx,
+                            encodingFrame);
+                    }
+
+                    // Same reasoning for the mouse cursor: BScreen bakes it
+                    // into the captured pixels, but it isn't a window, so
+                    // nothing above ever refreshes it otherwise. A
+                    // generous fixed-size box around its current position
+                    // covers any cursor glyph regardless of exact shape.
+                    BPoint cursorPos;
+                    uint32 cursorButtons;
+                    get_mouse(&cursorPos, &cursorButtons);
+                    BRect cursorRect(cursorPos.x - 8, cursorPos.y - 8,
+                        cursorPos.x + 32, cursorPos.y + 32);
+                    CompositeScreenRegion(cursorRect, screenBitmap, width, height, outWidth,
+                        outHeight, videoCodecCtx->pix_fmt, profile.swsFlags, &regionSwsCtx,
+                        encodingFrame);
+                } else {
+                    swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
+                                                  outWidth, outHeight, videoCodecCtx->pix_fmt,
+                                                  profile.swsFlags, nullptr, nullptr, nullptr);
+
+                    uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
+                    int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+                    sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
+                }
 
                 // PTS is determined by actual elapsed real-world microseconds
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
@@ -1966,6 +2288,12 @@ int main(int argc, char* argv[]) {
         av_frame_free(&encodingFrame);
         avcodec_free_context(&videoCodecCtx);
         if (swsCtx) sws_freeContext(swsCtx);
+        if (backgroundFrame) {
+            av_freep(&backgroundFrame->data);
+            av_frame_free(&backgroundFrame);
+        }
+        if (backgroundSwsCtx) sws_freeContext(backgroundSwsCtx);
+        if (regionSwsCtx) sws_freeContext(regionSwsCtx);
         delete screenBitmap;
         screenBitmap = nullptr;
     }
