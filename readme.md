@@ -119,38 +119,54 @@ and always correct, but wasteful on a desktop where windows only cover
 part of the screen -- the bare wallpaper/Deskbar area gets reconverted for
 no reason, every frame.
 
-**What this mode does and doesn't skip.** It still reads the *whole*
-screen every frame -- `BScreen` has no partial-capture primitive, so that
-IPC/memory-copy cost isn't avoidable either way. It still encodes the
-*whole* composited frame every time -- MJPEG is intra-only, so there's no
-such thing as "only encode the part that changed" the way H.264/VP9's
-delta frames work; every output frame is a complete, independent JPEG
-image regardless. What it skips is the `sws_scale` conversion cost for the
-part of the screen that's genuinely static: a cached, already-converted
-background is reused every frame, and only the screen regions actually
-covered by a window -- plus a small region around the mouse cursor, see
-below -- get freshly converted each time. The size of the win scales with
-how much of the screen is bare desktop; a screen full of maximized windows
-won't see much of one.
+**First version only fixed half the problem.** It skipped the `sws_scale`
+conversion cost for the static background (a cached, already-converted
+background reused every frame, only the screen regions actually covered
+by a window -- plus a small region around the mouse cursor, see below --
+freshly converted each time), but it still called `BScreen::ReadBitmap()`
+for the *whole screen* every single frame regardless, on the assumption
+that `BScreen` had no partial-capture primitive. Real-world testing
+showed that assumption was the actual problem: `htop` showed `app_server`
+itself pinned near 100% of one core, identically with or without this
+mode, and a brief improvement in mouse responsiveness faded after about a
+second back to the same sluggishness the default path has. The `sws_scale`
+cost this mode targeted was real, but small next to the cost of the
+*read* itself -- reading is where nearly all the CPU time actually goes.
+
+**BScreen does support a genuine partial capture, via `ReadBitmap()`'s own
+`bounds` parameter** -- confirmed by looking at how
+[RemoteControl](https://github.com/HaikuArchives/RemoteControl)'s
+`RCServer` (a free Haiku screen-sharing tool one real user found stayed
+low-CPU while still delivering a live, responsive capture) achieves that:
+it never reads the whole screen either, calling `BScreen::GetBitmap()`
+with a small bounds rectangle for one tile at a time, cycling through the
+whole screen tile by tile. This mode now does the same thing per tracked
+window (and the cursor) instead of per uniform tile: each region gets its
+own small, exactly-sized `BScreen::GetBitmap()` call, and the *whole
+screen* is only ever read when the window layout actually changes (the
+same "background rebuild" trigger as before). That's the fix that
+actually reaches the real bottleneck the `sws_scale`-only version never
+could.
 
 **Two things this deliberately does *not* do, because doing them would be
 wrong, not just less efficient:**
 
-1. It never skips re-converting a window just because its *frame*
+1. It never skips re-capturing a window just because its *frame*
    (position/size) hasn't moved. A window's content changes for reasons
    that have nothing to do with its frame -- a blinking cursor, scrolling
-   text, a VU meter, a video playing -- so every tracked window's pixels
-   are freshly captured and converted every single frame, unconditionally.
-   Only the true background (the area no window covers) is cached, and
-   only until the window layout itself changes (a window opens, closes,
+   text, a VU meter, a video playing -- so every tracked window's own
+   region is freshly captured and converted every single frame,
+   unconditionally, via its own small `BScreen::GetBitmap()` call. Only
+   the true background (the area no window covers) is cached, and only
+   until the window layout itself changes (a window opens, closes,
    minimizes, restores, moves, resizes, or changes z-order).
 2. It never ignores the mouse cursor just because it isn't a window.
-   `BScreen::ReadBitmap()` bakes the cursor into the captured pixels, but
-   nothing in the window list reports the cursor's own position, so a
-   generous fixed-size box around wherever it currently is gets refreshed
-   every frame too, exactly like a window's own region -- otherwise the
-   cursor would visibly freeze in place except when some window's frame
-   happened to change.
+   `BScreen` bakes the cursor into whatever it captures, but nothing in
+   the window list reports the cursor's own position, so a generous
+   fixed-size box around wherever it currently is gets its own fresh
+   capture every frame too, exactly like a window's own region --
+   otherwise the cursor would visibly freeze in place except when some
+   window's frame happened to change.
 
 Window tracking uses the same private Haiku Window Kit API
 [hDesktop](https://github.com/ablyssx74/hDesktop) uses for its own
@@ -161,14 +177,31 @@ window feel). Minimized windows and non-normal windows (menus, tooltips,
 the Deskbar itself) are excluded, matching what a viewer would actually
 expect "the apps" to mean.
 
+**Window-border artifacts, also found in real-world testing, and a first
+mitigation.** Scaling a small region in isolation, with no visibility into
+the real pixels just outside it, can produce a visibly different result
+right at its own edge than the same algorithm would produce as part of
+one continuous full-frame scale -- a soft seam/halo right around window
+borders. Each window/cursor region's own scale now deliberately uses
+`SWS_FAST_BILINEAR` regardless of the recording profile's own algorithm
+(`SWS_BILINEAR`/`SWS_BICUBIC` under `--medium`/`--high`): a cheaper,
+sharper filter doesn't blend across that boundary the same way a wider
+sampling kernel does, trading a slightly less smooth look on downscaled
+window content specifically (not the recording as a whole) for less of
+this specific artifact. Unconfirmed whether this fully resolves it pending
+re-testing; if visible artifacts remain, the next thing to try is padding
+each region's *capture* rectangle by a few extra pixels (giving the
+scaler real neighboring context) while still only pasting the original,
+unpadded rectangle into the output frame.
+
 **A trade-off worth knowing:** while a window is actively being dragged or
 resized, its frame changes on every single frame by definition, so the
 background gets rebuilt every frame during that -- no visual artifacts,
 just no speedup for that specific moment. That's the correct choice (never
 risk a stale background sliver under a moving window), not a bug.
 
-**Unconfirmed pending real-world testing**, including two specific
-assumptions worth flagging if something looks visibly wrong:
+**Unconfirmed pending real-world testing**, including assumptions worth
+flagging if something looks visibly wrong:
 
 - Overlapping windows are composited in the order `get_window_order()`
   returns them, assumed front-to-back (topmost first) and reversed before
@@ -180,6 +213,20 @@ assumptions worth flagging if something looks visibly wrong:
   actual struct on a given Haiku build, it'll fail to compile rather than
   silently misbehave -- the fix is matching whatever field names that
   build's `<WindowInfo.h>` actually declares.
+- Each region is captured into a bitmap sized to exactly match it (via
+  `GetBitmap()`'s own auto-sizing), rather than read into a reused, larger
+  canvas at some computed offset -- deliberately, to sidestep an
+  unconfirmed question about whether `BScreen` positions a partial capture
+  at the destination bitmap's own origin or at the requested rectangle's
+  absolute screen position. With an exact-sized destination those two
+  possibilities are identical, so it doesn't matter which one is actually
+  true -- but it does mean a small `BBitmap` allocation happens per
+  region, per frame, rather than reusing one long-lived buffer the way the
+  default path's own screen-sized bitmap does. RemoteControl's own design
+  does the same thing, continuously, for tiles as small as 100x100px, so
+  this is expected to be cheap -- small allocations were never the
+  bottleneck the very first fix in this project (removing a *screen-sized*
+  per-frame allocation) addressed; only a large one was.
 
 ## How desktop-audio capture works
 
