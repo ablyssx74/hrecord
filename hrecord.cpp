@@ -176,6 +176,55 @@ const VideoProfile kVideoProfiles[3] = {
 // bug to fix.
 bool g_experimentalScreenCapture = false;
 
+// ============================================================================
+// --screen-capture-rcserver-method: blind uniform-tile capture
+//
+// A second, independent alternative to the default path, built to answer a
+// direct question: does --experimental-screen-capture's speedup actually
+// depend on knowing which regions are windows, or would any scheme that
+// reads the screen in small bounded pieces get a similar win? This mode
+// throws away all window-kit knowledge and uses the technique RemoteControl's
+// own RCServer is actually built on (read straight from its source): divide
+// the screen into a fixed grid of small tiles, and round-robin through them
+// continuously -- a handful of tiles get freshly read via
+// BScreen::GetBitmap() every frame, cycling through the whole screen over
+// several frames, rather than reading it all at once.
+//
+// Where this differs from --experimental-screen-capture, deliberately:
+//   - No window tracking, no private Window Kit API, no concept of "window"
+//     at all -- just a uniform grid over the whole screen. Simpler, and
+//     doesn't depend on client_window_info's field layout matching between
+//     Haiku builds (see the readme's own unconfirmed-assumptions list for
+//     --experimental-screen-capture).
+//   - Change detection is byte-level, not structural: each freshly read tile
+//     is memcmp()'d against whatever's cached there from its last read, and
+//     the (comparatively expensive) memcpy paste into the persistent capture
+//     buffer only happens when the bytes actually differ. This can, in
+//     principle, skip work --experimental-screen-capture can't: a window
+//     whose frame hasn't moved but is genuinely fully static (no blinking
+//     cursor, no video, nothing) still gets an unconditional fresh capture +
+//     paste there every frame; here, a tile over that same static content
+//     would come up unchanged in the memcmp and get skipped entirely.
+//   - The trade-off: because tiles cycle round-robin rather than all being
+//     current every frame, any single tile can be up to a full cycle old
+//     (screen area / tiles refreshed per frame) at the moment it's
+//     composited -- unlike the window-aware mode, which always refreshes
+//     every window's full region every single frame, this mode has no
+//     equivalent guarantee for any specific piece of the screen.
+//
+// The mouse cursor is a special case here for the same reason it is in
+// --experimental-screen-capture: it moves every frame, so relying on
+// whichever tile it happens to be sitting in to come up in the round-robin
+// rotation would make it look laggy/stale. Instead the cursor's own region
+// gets an unconditional refresh (reusing RefreshScreenRegion, the same
+// helper the window-aware mode uses) every single frame, on top of the
+// tile rotation.
+bool g_screenCaptureRcserverMethod = false;
+
+// Tile edge length, in native pixels -- matches RCServer's own default
+// mSquareSize (sources/RCServer/ScreenServer.cpp).
+const int kRcserverTileSize = 100;
+
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
 // tracking uses, via get_window_info()/BPrivate::get_window_order()).
@@ -316,6 +365,69 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     }
 
     delete regionBitmap;
+}
+
+// The --screen-capture-rcserver-method counterpart to RefreshScreenRegion
+// above: captures one grid tile the same way (a small, exactly-sized
+// BScreen::GetBitmap() read), but only pastes it into screenBitmap when its
+// pixels actually differ from what's cached there -- a byte-level
+// memcmp() against the previous capture of that same tile, the technique
+// RCServer's own ScreenShot.cpp/ScreenServer.cpp use (CompareBitmaps).
+// Note this only ever skips the *paste*, never the *read*: GetBitmap()
+// still has to ask app_server for the tile's current pixels before there's
+// anything to compare, so an unchanged tile costs one IPC round trip plus
+// a memcmp, not zero. Returns true if the tile's pixels differed and
+// screenBitmap was updated, false if the tile was degenerate (fully
+// off-screen) or genuinely unchanged.
+static bool RefreshScreenTileIfChanged(BRect tileRectNative, BScreen& screen,
+        BBitmap* screenBitmap, int nativeWidth, int nativeHeight) {
+    int srcX = (int)tileRectNative.left;
+    int srcY = (int)tileRectNative.top;
+    int srcRight = (int)tileRectNative.right + 1;
+    int srcBottom = (int)tileRectNative.bottom + 1;
+
+    if (srcX < 0) srcX = 0;
+    if (srcY < 0) srcY = 0;
+    if (srcRight > nativeWidth) srcRight = nativeWidth;
+    if (srcBottom > nativeHeight) srcBottom = nativeHeight;
+    if (srcRight <= srcX || srcBottom <= srcY)
+        return false; // degenerate (fully off-screen) -- nothing to do
+
+    BRect captureRect(srcX, srcY, srcRight - 1, srcBottom - 1);
+    BBitmap* tileBitmap = nullptr;
+    if (screen.GetBitmap(&tileBitmap, false, &captureRect) != B_OK || tileBitmap == nullptr)
+        return false;
+
+    int rowBytes = (srcRight - srcX) * 4; // BGRA/RGB32 -- 4 bytes per pixel
+    int newStride = (int)tileBitmap->BytesPerRow();
+    int cachedStride = (int)screenBitmap->BytesPerRow();
+    uint8_t* cachedBase = (uint8_t*)screenBitmap->Bits()
+        + (size_t)srcY * cachedStride + (size_t)srcX * 4;
+
+    bool changed = false;
+    uint8_t* newRow = (uint8_t*)tileBitmap->Bits();
+    uint8_t* cachedRow = cachedBase;
+    for (int row = srcY; row < srcBottom; row++) {
+        if (memcmp(cachedRow, newRow, rowBytes) != 0) {
+            changed = true;
+            break;
+        }
+        newRow += newStride;
+        cachedRow += cachedStride;
+    }
+
+    if (changed) {
+        newRow = (uint8_t*)tileBitmap->Bits();
+        cachedRow = cachedBase;
+        for (int row = srcY; row < srcBottom; row++) {
+            memcpy(cachedRow, newRow, rowBytes);
+            newRow += newStride;
+            cachedRow += cachedStride;
+        }
+    }
+
+    delete tileBitmap;
+    return changed;
 }
 
 // Guards every write to the shared AVFormatContext (avformat_write_header,
@@ -1757,6 +1869,7 @@ int main(int argc, char* argv[]) {
     bool realtimeAudio = false;
     bool experimentalAudio = false;
     bool experimentalScreenCapture = false;
+    bool screenCaptureRcserverMethod = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -1776,6 +1889,8 @@ int main(int argc, char* argv[]) {
             experimentalAudio = true;
         } else if (strcmp(argv[i], "--experimental-screen-capture") == 0) {
             experimentalScreenCapture = true;
+        } else if (strcmp(argv[i], "--screen-capture-rcserver-method") == 0) {
+            screenCaptureRcserverMethod = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -1787,7 +1902,7 @@ int main(int argc, char* argv[]) {
         } else {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
                 "[--allaudio] [--realtime] [--experimental] [--experimental-screen-capture] "
-                "[--list-audio-inputs]" << std::endl;
+                "[--screen-capture-rcserver-method] [--list-audio-inputs]" << std::endl;
             return 0;
         }
     }
@@ -1797,6 +1912,22 @@ int main(int argc, char* argv[]) {
             "under --audioonly." << std::endl;
         experimentalScreenCapture = false;
     }
+    if (screenCaptureRcserverMethod && audioOnly) {
+        std::cout << "[i] --screen-capture-rcserver-method only affects video capture; ignored "
+            "under --audioonly." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
+    if (experimentalScreenCapture && screenCaptureRcserverMethod) {
+        // Two alternative video-capture engines -- doesn't make sense to run
+        // both at once. --experimental-screen-capture wins since it's the
+        // one with real-world confirmation so far (see readme.md); this is
+        // just a sane tie-break for an unlikely combination, not a
+        // statement that one is strictly better than the other.
+        std::cout << "[i] --experimental-screen-capture and --screen-capture-rcserver-method "
+            "are alternative capture engines; can't use both at once. Keeping "
+            "--experimental-screen-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
 
     // Read by the main capture loop (section 7) -- window-aware capture,
     // see the section comment above EnumerateVisibleWindows() for the
@@ -1804,9 +1935,19 @@ int main(int argc, char* argv[]) {
     g_experimentalScreenCapture = experimentalScreenCapture;
     if (g_experimentalScreenCapture) {
         std::cout << "[i] --experimental-screen-capture: reusing a cached background between "
-            "frames and only freshly capturing window (and cursor) regions -- an unconfirmed "
-            "experiment, default full-frame capture is unaffected without this flag (see "
-            "readme.md)." << std::endl;
+            "frames and only freshly capturing window (and cursor) regions -- default "
+            "full-frame capture is unaffected without this flag (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- blind uniform-tile
+    // capture, see g_screenCaptureRcserverMethod's own comment above for
+    // the full design and how it differs from --experimental-screen-capture.
+    g_screenCaptureRcserverMethod = screenCaptureRcserverMethod;
+    if (g_screenCaptureRcserverMethod) {
+        std::cout << "[i] --screen-capture-rcserver-method: round-robin tile capture with "
+            "byte-level change detection (RemoteControl RCServer's own technique) -- an "
+            "unconfirmed experiment, default full-frame capture is unaffected without this "
+            "flag (see readme.md)." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -2032,6 +2173,15 @@ int main(int argc, char* argv[]) {
     std::vector<TrackedWindowRect> lastTrackedWindows;
     bool backgroundNeedsRebuild = true;
 
+    // --screen-capture-rcserver-method: round-robin cursor into the tile
+    // grid (see kRcserverTileSize/g_screenCaptureRcserverMethod's own
+    // comment above), and whether the very first frame still needs its
+    // one-time full-screen seed read before tile-level memcmp diffing
+    // against RefreshScreenTileIfChanged has anything valid to compare
+    // against.
+    int rcserverNextTile = 0;
+    bool rcserverNeedsSeed = true;
+
     if (!audioOnly) {
         const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!codec) {
@@ -2131,7 +2281,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.17";
+	    const char* localVersion = "v1.9.18";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2203,6 +2353,81 @@ int main(int argc, char* argv[]) {
                 // window/cursor region, so there's only ever one scale
                 // operation with full context everywhere, which is what
                 // eliminates the per-region seam artifact by construction.
+                {
+                    void* pixelBuffer = screenBitmap->Bits();
+                    swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
+                        outWidth, outHeight, videoCodecCtx->pix_fmt,
+                        profile.swsFlags, nullptr, nullptr, nullptr);
+                    uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
+                    int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+                    sws_scale(swsCtx, srcData, srcLinesize, 0, height,
+                        encodingFrame->data, encodingFrame->linesize);
+                }
+
+                bigtime_t currentPresentationTime = system_time() - recordingStartTime;
+                encodingFrame->pts = currentPresentationTime;
+
+                std::lock_guard<std::mutex> lock(g_muxMutex);
+                if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                    while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
+                        av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
+                        pkt->stream_index = videoStream->index;
+                        av_interleaved_write_frame(fmtCtx, pkt);
+                        av_packet_unref(pkt);
+                    }
+                }
+            } else if (g_screenCaptureRcserverMethod) {
+                if (rcserverNeedsSeed) {
+                    // One-time full-screen read to give every tile a valid
+                    // starting state to diff against -- the same one-time
+                    // cost the other two paths also pay on their own first
+                    // frame (--experimental-screen-capture's own first
+                    // background build; the default path's every frame).
+                    screen.ReadBitmap(screenBitmap, false, &screenFrame);
+                    rcserverNeedsSeed = false;
+                } else {
+                    int tilesX = (width + kRcserverTileSize - 1) / kRcserverTileSize;
+                    int tilesY = (height + kRcserverTileSize - 1) / kRcserverTileSize;
+                    int totalTiles = tilesX * tilesY;
+                    if (totalTiles > 0) {
+                        // Cycle the whole grid roughly once per second,
+                        // regardless of profile fps -- RCServer's own
+                        // round-robin has no fixed frame boundary to work
+                        // within, this is this mode's own approximation of
+                        // "continuously cycling."
+                        int tilesPerFrame = (totalTiles + profile.fps - 1) / profile.fps;
+                        if (tilesPerFrame < 1) tilesPerFrame = 1;
+
+                        for (int t = 0; t < tilesPerFrame; t++) {
+                            int tileIndex = rcserverNextTile % totalTiles;
+                            int tileCol = tileIndex % tilesX;
+                            int tileRow = tileIndex / tilesX;
+                            int tileLeft = tileCol * kRcserverTileSize;
+                            int tileTop = tileRow * kRcserverTileSize;
+                            int tileRight = std::min(tileLeft + kRcserverTileSize, width) - 1;
+                            int tileBottom = std::min(tileTop + kRcserverTileSize, height) - 1;
+                            BRect tileRect(tileLeft, tileTop, tileRight, tileBottom);
+                            RefreshScreenTileIfChanged(tileRect, screen, screenBitmap,
+                                width, height);
+                            rcserverNextTile = (rcserverNextTile + 1) % totalTiles;
+                        }
+                    }
+                }
+
+                // Same reasoning as --experimental-screen-capture: the
+                // cursor moves every frame and isn't reported by anything
+                // the tile grid can key off, so it needs its own
+                // unconditional refresh every frame rather than waiting
+                // for its tile to come up in rotation.
+                BPoint cursorPos;
+                uint32 cursorButtons;
+                get_mouse(&cursorPos, &cursorButtons);
+                BRect cursorRect(cursorPos.x - 8, cursorPos.y - 8,
+                    cursorPos.x + 32, cursorPos.y + 32);
+                RefreshScreenRegion(cursorRect, screen, screenBitmap, width, height);
+
+                // Exactly one full-frame convert per frame, identical in
+                // shape to both other capture paths.
                 {
                     void* pixelBuffer = screenBitmap->Bits();
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,

@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--experimental-screen-capture] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -57,6 +57,17 @@ whatever an earlier run left behind in `/boot/home`.
   region independently). The default full-frame capture path is
   completely unaffected unless this flag is passed. See
   "--experimental-screen-capture: window-aware capture" below.
+- `hrecord start --screen-capture-rcserver-method` — an alternative,
+  independent capture engine: no window tracking at all, just a fixed grid
+  of small tiles round-robined across frames, each freshly read and only
+  pasted into the capture buffer when a byte-level `memcmp` against its
+  previous capture shows it actually changed. The technique
+  [RemoteControl](https://github.com/HaikuArchives/RemoteControl)'s own
+  `RCServer` is built on. No effect under `--audioonly`. Can't be combined
+  with `--experimental-screen-capture` (alternative engines, not
+  stackable) — `--experimental-screen-capture` wins if both are passed.
+  Unconfirmed experiment, not yet real-world tested. See
+  "--screen-capture-rcserver-method: blind uniform-tile capture" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -244,6 +255,85 @@ flagging if something looks visibly wrong:
   this is expected to be cheap -- small allocations were never the
   bottleneck the very first fix in this project (removing a *screen-sized*
   per-frame allocation) addressed; only a large one was.
+
+## `--screen-capture-rcserver-method`: blind uniform-tile capture
+
+A second, independent alternative to the default path, built to answer a
+direct question raised after testing `--experimental-screen-capture`: does
+its speedup actually depend on knowing which regions are windows, or would
+any scheme that reads the screen in small bounded pieces get a similar win?
+This mode throws away all window-kit knowledge and uses the technique
+[RemoteControl](https://github.com/HaikuArchives/RemoteControl)'s own
+`RCServer` is actually built on (read straight from its source,
+`sources/RCServer/ScreenShot.cpp`/`ScreenServer.cpp`): divide the screen
+into a fixed grid of small tiles (100x100px, matching RCServer's own
+default `mSquareSize`), and round-robin through them continuously -- a
+handful of tiles get freshly read via `BScreen::GetBitmap()` every frame,
+cycling through the whole screen roughly once per second, rather than
+reading it all at once.
+
+**How this differs from `--experimental-screen-capture`, deliberately:**
+
+- No window tracking, no private Window Kit API, no concept of "window" at
+  all -- just a uniform grid over the whole screen. Simpler, and doesn't
+  depend on `client_window_info`'s field layout matching between Haiku
+  builds (see the unconfirmed-assumptions list above).
+- Change detection is byte-level, not structural: each freshly read tile is
+  `memcmp()`'d against whatever's cached there from its last read (the same
+  technique RCServer's own `CompareBitmaps` uses), and the paste into the
+  persistent capture buffer only happens when the bytes actually differ.
+  This can, in principle, skip work `--experimental-screen-capture` can't:
+  a window whose frame hasn't moved but is genuinely fully static (no
+  blinking cursor, no video, nothing changing) still gets an unconditional
+  fresh capture *and* paste there every frame under the window-aware mode;
+  here, a tile over that same static content would come up unchanged in the
+  `memcmp` and get skipped entirely. Note this only ever skips the *paste*,
+  never the *read* -- `GetBitmap()` still has to ask `app_server` for the
+  tile's current pixels before there's anything to compare, so an unchanged
+  tile costs one IPC round trip plus a `memcmp`, not zero.
+- The trade-off: because tiles cycle round-robin rather than all being
+  current every frame, any single tile can be up to a full cycle old
+  (screen area ÷ tiles refreshed per frame) at the moment it's composited.
+  Unlike the window-aware mode, which always refreshes every window's full
+  region every single frame, this mode has no equivalent freshness
+  guarantee for any specific piece of the screen -- content changing faster
+  than the tile grid cycles back to it will visibly lag behind.
+
+The mouse cursor is a special case here for the same reason it is under
+`--experimental-screen-capture`: it moves every frame, so relying on
+whichever tile it happens to be sitting in to come up in the round-robin
+rotation would make it look laggy/stale. Instead the cursor's own region
+gets an unconditional refresh (reusing the same helper the window-aware
+mode uses for its own cursor handling) every single frame, on top of the
+tile rotation.
+
+Exactly one full-frame `sws_scale` still runs per frame, over the whole
+composited capture buffer at once -- identical in shape to both other
+capture paths, for the same reason: MJPEG is intra-only, so the whole frame
+gets encoded every time regardless of how much of it actually changed.
+
+Can't be combined with `--experimental-screen-capture` -- they're
+alternative capture engines answering the same underlying question two
+different ways, not something that composes. Passing both keeps
+`--experimental-screen-capture`, since it already has real-world
+confirmation (see above); that's a tie-break for an unlikely combination,
+not a claim that one approach is strictly better than the other.
+
+**Unconfirmed, not yet tested on real hardware.** Open questions this
+mode's design doesn't answer on its own:
+
+- Whether the round-robin cadence (whole grid once per second) is actually
+  a good default, too slow, or needlessly fast for typical desktop use --
+  chosen as a starting point, not measured.
+- Whether `memcmp`'s own cost across every tile, every frame, ends up
+  cheaper or more expensive in practice than `--experimental-screen-capture`'s
+  unconditional-paste approach -- in principle it should win on a mostly
+  static desktop and lose on a very busy one, but that's a real-world
+  question, not a settled one.
+- Whether the visible lag on fast-changing content outside the tracked
+  cursor region (see the trade-off above) is noticeable enough in practice
+  to matter for a screen recording, as opposed to RCServer's own live
+  remote-desktop use case where it was designed to be acceptable.
 
 ## How desktop-audio capture works
 
