@@ -10,7 +10,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -71,10 +71,22 @@ whatever an earlier run left behind in `/boot/home`.
   stackable) — `--experimental-screen-capture` wins if both are passed.
   Real-world tested: mouse responsiveness "almost identical to native
   mouse motion" and remarkably low `app_server` CPU cost, the best of the
-  three capture modes on both fronts -- but dragging a window around
-  visibly fragmented it in the recording, a mitigation for which
+  capture modes tested so far on both fronts -- but dragging a window
+  around visibly fragmented it in the recording, a mitigation for which
   (untested as of this writing) is also in place. See
   "--screen-capture-rcserver-method: blind uniform-tile capture" below.
+- `hrecord start --hybrid-capture` — a fourth capture engine testing a
+  specific hypothesis: `--experimental-screen-capture`'s window-aware
+  design with `--screen-capture-rcserver-method`'s small, fixed-size
+  reads. Reads each tracked window through a grid of small tiles instead
+  of one call per window, keeping full per-frame correctness (no
+  round-robin, no drag fragmentation, no visualizer slowdown case) while
+  testing whether the smaller call size alone closes the mouse-
+  responsiveness gap. Can't be combined with `--experimental-screen-capture`
+  or `--screen-capture-rcserver-method` (alternative engines, not
+  stackable) — `--hybrid-capture` wins if more than one is passed.
+  Unconfirmed, not yet real-world tested. See "--hybrid-capture:
+  window-aware capture, rcserver-sized reads" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -416,6 +428,65 @@ visualizer.
 - Whether fast (not slow) window dragging still shows some residual
   fragmentation despite the chase-and-burst mitigation -- only slow
   dragging has been confirmed fragment-free so far.
+
+## `--hybrid-capture`: window-aware capture, rcserver-sized reads
+
+A direct test of a specific hypothesis raised after comparing the two
+modes above. Both do small, bounded reads instead of reading the whole
+screen -- so why did `--screen-capture-rcserver-method`'s mouse
+responsiveness ("almost identical to native mouse motion") beat
+`--experimental-screen-capture`'s so clearly? The likely answer:
+`--experimental-screen-capture`'s own reads aren't actually bounded in
+*size* -- `RefreshScreenRegion` captures a tracked window's entire
+rectangle in one `BScreen::GetBitmap()` call, so a large or maximized
+window means one large read, every single frame, which is exactly the
+kind of `app_server` contention the whole design was meant to avoid.
+`--screen-capture-rcserver-method` never issues a call bigger than a
+fixed 100x100 tile, no matter what's on screen, and that small, uniform
+call size is the most likely explanation for it interleaving so much
+better with input handling.
+
+**The design: identical to `--experimental-screen-capture`, one change.**
+Same window tracking, same per-frame full-window refresh (unconditional,
+every tracked window, every frame -- the correctness guarantee that
+avoids `--screen-capture-rcserver-method`'s own round-robin staleness and
+drag-fragmentation trade-offs entirely), same shared background buffer,
+same single full-frame `sws_scale`. The only change: each tracked
+window's own rectangle is now read through a grid of small, fixed-size
+tiles (`RefreshScreenRegionTiled`, reusing the same `kRcserverTileSize`
+constant `--screen-capture-rcserver-method` uses) instead of one
+`BScreen::GetBitmap()` call sized to the whole window. Same total bytes
+read every frame, same artifact-free compositing (still a plain `memcpy`
+paste per tile into the shared buffer, still one shared `sws_scale` --
+no per-tile scaling, so no seam risk), just chunked into many small calls
+instead of one large one.
+
+If the hypothesis above is right, this should combine
+`--screen-capture-rcserver-method`'s mouse feel with
+`--experimental-screen-capture`'s already-confirmed artifact-free
+correctness, without either mode's own known weakness: no round-robin
+staleness, no drag fragmentation, no full-screen-visualizer pathological
+case (this never touches the screen-wide blind tiling
+`--screen-capture-rcserver-method` does -- only tracked windows and the
+cursor get tiled). The cursor itself is still refreshed with a single
+plain `RefreshScreenRegion` call, unchanged -- its own capture rectangle
+is already smaller than one tile, so there's nothing to gain from
+chunking it further.
+
+**Unconfirmed, not yet real-world tested.** Open questions:
+
+- Whether the hypothesis is actually correct -- that call *size*, not
+  just call *count* or the presence of window tracking, is what drove
+  the mouse-responsiveness difference. If some other factor was actually
+  responsible, this mode won't close the gap.
+- Whether chunking a window's read into many small tiles costs more in
+  aggregate IPC overhead than one large read does for typical window
+  sizes (not the full-screen worst case `--screen-capture-rcserver-method`'s
+  own high-churn fallback exists for) -- plausible either way, not
+  measured.
+- Whether the `app_server` CPU-load characteristics carry over the same
+  way call-size reduction did for `--screen-capture-rcserver-method`, or
+  behave differently once window tracking is layered back in.
 
 ## How desktop-audio capture works
 

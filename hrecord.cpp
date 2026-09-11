@@ -389,6 +389,40 @@ const double kRcserverChurnThreshold = 0.12;
 // a different, much rarer condition.
 const double kRcserverFallbackChurnThreshold = 0.6;
 
+// ============================================================================
+// --hybrid-capture: window-aware capture, rcserver-sized reads
+//
+// Real-world testing of both modes above surfaced a specific hypothesis
+// for why --screen-capture-rcserver-method's mouse responsiveness beat
+// --experimental-screen-capture's, despite both doing small, bounded
+// reads: --experimental-screen-capture's own reads aren't actually
+// bounded in size -- RefreshScreenRegion captures a tracked window's
+// *entire* rectangle in one BScreen::GetBitmap() call, so a large or
+// maximized window means one large read, every single frame, which is
+// exactly the kind of app_server contention the whole design was meant
+// to avoid. --screen-capture-rcserver-method never issues a call bigger
+// than a fixed 100x100 tile, no matter what's on screen, and that small,
+// uniform call size is the most likely explanation for it interleaving
+// so much better with input handling.
+//
+// This mode is the direct test of that hypothesis: identical to
+// --experimental-screen-capture's own architecture (window tracking,
+// per-frame full-window refresh for correctness, one shared background
+// buffer, one full-frame sws_scale) -- the only change is that each
+// tracked window's own region is captured through a grid of small,
+// fixed-size tiles (RefreshScreenRegionTiled, reusing
+// kRcserverTileSize) instead of one BScreen::GetBitmap() call sized to
+// the whole window. Same total bytes read, same per-frame correctness
+// guarantee (no round-robin, no staleness risk, no drag fragmentation,
+// no visualizer pathological case -- this never touches the
+// screen-wide blind tiling --screen-capture-rcserver-method does), just
+// chunked into many small calls instead of one large one. If the
+// hypothesis above is right, this should combine
+// --screen-capture-rcserver-method's mouse feel with
+// --experimental-screen-capture's already-confirmed artifact-free
+// correctness. Unconfirmed pending real-world testing.
+bool g_hybridCapture = false;
+
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
 // tracking uses, via get_window_info()/BPrivate::get_window_order()).
@@ -529,6 +563,38 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     }
 
     delete regionBitmap;
+}
+
+// The --hybrid-capture counterpart to RefreshScreenRegion above: covers
+// the exact same rectangle, with the exact same per-frame correctness
+// guarantee (called unconditionally, every frame, for every tracked
+// window -- nothing here is skipped or deferred), but through a grid of
+// small, fixed-size (kRcserverTileSize) tiles instead of one
+// BScreen::GetBitmap() call sized to the whole rectangle. See
+// g_hybridCapture's own comment for why this specific change is the one
+// being tested.
+static void RefreshScreenRegionTiled(BRect srcRectNative, BScreen& screen,
+        BBitmap* screenBitmap, int nativeWidth, int nativeHeight) {
+    int left = (int)floor(srcRectNative.left);
+    int top = (int)floor(srcRectNative.top);
+    int right = (int)ceil(srcRectNative.right) + 1;
+    int bottom = (int)ceil(srcRectNative.bottom) + 1;
+
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > nativeWidth) right = nativeWidth;
+    if (bottom > nativeHeight) bottom = nativeHeight;
+    if (right <= left || bottom <= top)
+        return; // degenerate (fully off-screen) -- nothing to do
+
+    for (int tileTop = top; tileTop < bottom; tileTop += kRcserverTileSize) {
+        int tileBottom = std::min(tileTop + kRcserverTileSize, bottom);
+        for (int tileLeft = left; tileLeft < right; tileLeft += kRcserverTileSize) {
+            int tileRight = std::min(tileLeft + kRcserverTileSize, right);
+            RefreshScreenRegion(BRect(tileLeft, tileTop, tileRight - 1, tileBottom - 1),
+                screen, screenBitmap, nativeWidth, nativeHeight);
+        }
+    }
 }
 
 // The --screen-capture-rcserver-method counterpart to RefreshScreenRegion
@@ -2036,6 +2102,7 @@ int main(int argc, char* argv[]) {
     bool realtimeAudio = false;
     bool experimentalScreenCapture = false;
     bool screenCaptureRcserverMethod = false;
+    bool hybridCapture = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -2055,6 +2122,8 @@ int main(int argc, char* argv[]) {
             experimentalScreenCapture = true;
         } else if (strcmp(argv[i], "--screen-capture-rcserver-method") == 0) {
             screenCaptureRcserverMethod = true;
+        } else if (strcmp(argv[i], "--hybrid-capture") == 0) {
+            hybridCapture = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -2066,7 +2135,8 @@ int main(int argc, char* argv[]) {
         } else {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
                 "[--allaudio] [--realtime] [--experimental-screen-capture] "
-                "[--screen-capture-rcserver-method] [--list-audio-inputs]" << std::endl;
+                "[--screen-capture-rcserver-method] [--hybrid-capture] "
+                "[--list-audio-inputs]" << std::endl;
             return 0;
         }
     }
@@ -2081,12 +2151,33 @@ int main(int argc, char* argv[]) {
             "under --audioonly." << std::endl;
         screenCaptureRcserverMethod = false;
     }
+    if (hybridCapture && audioOnly) {
+        std::cout << "[i] --hybrid-capture only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        hybridCapture = false;
+    }
+
+    // Three alternative video-capture engines -- doesn't make sense to run
+    // more than one at once. --hybrid-capture wins over both if explicitly
+    // requested (it's the newest, built specifically to test a hypothesis
+    // about --experimental-screen-capture's own weak point -- see its own
+    // comment); otherwise --experimental-screen-capture wins over
+    // --screen-capture-rcserver-method since it has real-world confirmation
+    // --hybrid-capture doesn't have yet. Just a sane tie-break for an
+    // unlikely combination, not a statement that one is strictly better
+    // than the others in general.
+    if (hybridCapture && experimentalScreenCapture) {
+        std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
+            "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
+        experimentalScreenCapture = false;
+    }
+    if (hybridCapture && screenCaptureRcserverMethod) {
+        std::cout << "[i] --hybrid-capture and --screen-capture-rcserver-method are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--hybrid-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
     if (experimentalScreenCapture && screenCaptureRcserverMethod) {
-        // Two alternative video-capture engines -- doesn't make sense to run
-        // both at once. --experimental-screen-capture wins since it's the
-        // one with real-world confirmation so far (see readme.md); this is
-        // just a sane tie-break for an unlikely combination, not a
-        // statement that one is strictly better than the other.
         std::cout << "[i] --experimental-screen-capture and --screen-capture-rcserver-method "
             "are alternative capture engines; can't use both at once. Keeping "
             "--experimental-screen-capture." << std::endl;
@@ -2112,6 +2203,18 @@ int main(int argc, char* argv[]) {
             "byte-level change detection (RemoteControl RCServer's own technique) -- an "
             "unconfirmed experiment, default full-frame capture is unaffected without this "
             "flag (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- window-aware capture
+    // with rcserver-sized reads, see g_hybridCapture's own comment above
+    // for the full design and the hypothesis it's testing.
+    g_hybridCapture = hybridCapture;
+    if (g_hybridCapture) {
+        std::cout << "[i] --hybrid-capture: window-aware capture (like "
+            "--experimental-screen-capture) but reading each window through small, "
+            "fixed-size tiles (like --screen-capture-rcserver-method) instead of one call "
+            "per window -- an unconfirmed experiment, default full-frame capture is "
+            "unaffected without this flag (see readme.md)." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -2478,7 +2581,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.10.1";
+	    const char* localVersion = "v1.10.2";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2503,7 +2606,7 @@ int main(int argc, char* argv[]) {
         while (g_running) {
             bigtime_t loopIterationStart = system_time();
 
-            if (g_experimentalScreenCapture) {
+            if (g_experimentalScreenCapture || g_hybridCapture) {
                 std::vector<TrackedWindowRect> currentWindows;
                 EnumerateVisibleWindows(&currentWindows);
 
@@ -2527,9 +2630,15 @@ int main(int argc, char* argv[]) {
                 // nothing to do with a window's own frame). Each call
                 // reads only that window's own rectangle directly from
                 // app_server and pastes it into screenBitmap -- see
-                // RefreshScreenRegion's own comment.
+                // RefreshScreenRegion's own comment. Under --hybrid-capture,
+                // that same rectangle is instead read through a grid of
+                // small, fixed-size tiles (RefreshScreenRegionTiled) --
+                // see g_hybridCapture's own comment for why.
                 for (const auto& win : currentWindows) {
-                    RefreshScreenRegion(win.frame, screen, screenBitmap, width, height);
+                    if (g_hybridCapture)
+                        RefreshScreenRegionTiled(win.frame, screen, screenBitmap, width, height);
+                    else
+                        RefreshScreenRegion(win.frame, screen, screenBitmap, width, height);
                 }
 
                 // Same reasoning for the mouse cursor: BScreen bakes it
