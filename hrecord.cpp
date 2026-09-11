@@ -6,6 +6,8 @@
 #include <InterfaceKit.h> // Pulls in BApplication, BScreen, BBitmap
 #include <WindowInfo.h> // Private Window Kit API -- see EnumerateVisibleWindows()
 #include <StorageKit.h>
+#include <Path.h> // BPath -- DetectRealtimeAudioSettings' own settings-dir resolution
+#include <FindDirectory.h> // find_directory()/B_USER_SETTINGS_DIRECTORY, same use
 #include <SupportKit.h>   // Pulls in system_time()
 #include <MediaRoster.h>
 #include <MediaAddOn.h>
@@ -30,6 +32,8 @@
 #include <ctime>
 #include <cmath> // floor()/ceil() -- RefreshScreenRegion (see --experimental-screen-capture)
 #include <cstdlib> // free() -- EnumerateVisibleWindows' get_window_info()/get_window_order() results
+#include <cstdio> // fopen()/fread() -- DetectRealtimeAudioSettings' own settings-file read
+#include <dirent.h> // opendir()/readdir() -- DetectRealtimeAudioSettings' /dev/audio/hmulti scan
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -46,43 +50,187 @@ extern "C" {
 
 bool g_running = true;
 
-// Set once from the --realtime CLI flag (see main()). When true, the
-// audio-tap ring buffers and the buffer size requested from BSoundPlayer
-// are tuned smaller (128 frames / ~0.07s), trading away some of the
-// safety margin against buffering-jitter glitches for lower monitoring
-// latency -- worth it for a genuinely real-time use case (e.g. playing
-// guitar live through rakarrack while recording), not something a casual
-// recording needs, and only useful alongside a driver already tuned for
-// low latency (see readme.md) -- this doesn't touch the driver's own
-// buffer settings. These numbers were originally gated behind a separate
-// --experimental flag pending real-world testing; confirmed clean with
-// three simultaneous sources on a driver hand-tuned to
-// play_buffer_frames 256, so they became --realtime's own defaults --
-// later retuned again to 128 frames, matching the same user's own
-// driver being retuned further still (7ms latency reported, down from
-// 256's own headroom).
+// ============================================================================
+// Real-time audio: auto-detected from the user's own driver settings
+//
+// Previously two separate opt-in flags: --realtime (tighter audio buffers,
+// a 128-frame hint to the Mixer) and --experimental (capping
+// PaceToRealTime's backpressure hold relative to a buffer's own duration
+// instead of a flat 50ms). Both were confirmed working through real-world
+// testing -- including the exact use case that motivated them, playing
+// guitar live through rakarrack while recording, on a driver hand-tuned
+// for real-time monitoring (48kHz, 128-frame buffers). That confirmation
+// is what makes requiring the user to remember and pass two separate
+// flags on every recording, on a system that's *already* tuned this way,
+// an unnecessary step: the driver's own settings file already says
+// whether real-time buffers are in play, so hrecord now reads that file
+// itself instead of asking the user to declare it twice. This reuses the
+// exact same driver catalog and detection technique as this project's own
+// companion app, RealTimeGUI (github.com/ablyssx74/RealTimeGUI), which
+// reads and writes the very same files -- see DetectRealtimeAudioSettings
+// below.
+//
+// --experimental's own mechanism is now unconditional, confirmed-safe
+// default behavior (see PaceToRealTime) rather than a separate toggle --
+// it only ever *tightens* the backpressure cap when a buffer's own real,
+// live-negotiated duration genuinely warrants it, never loosens beyond
+// the existing 50ms ceiling, so there was never a real-time-specific
+// reason to gate it behind anything once it was confirmed safe.
+// ============================================================================
+
+// True once real-time audio buffers are actually in effect -- either
+// auto-detected (see DetectRealtimeAudioSettings) or forced on via
+// --realtime as a manual fallback for a driver this app doesn't have
+// cataloged. Read by MixBusFormat()/the ring-sizing code in
+// SetupDesktopAudioTap and SetupAllAudioTaps.
 bool g_realtimeAudio = false;
 
-// Set once from the --experimental CLI flag (see main()). When true,
-// PaceToRealTime's backpressure hold on a buffer is capped relative to
-// that source's own buffer duration instead of the flat 50ms
-// --realtime otherwise uses. Reintroduced for the same real user's
-// occasional clicks/pops reported at a hand-tuned 48kHz/128-frame
-// driver setting (~2.7ms per buffer) -- a 50ms hold is roughly 18x that
-// buffer's own period, a lot more than an already-tight buffer's own
-// pool can necessarily absorb. This exact idea was tried once before
-// (see git history: "v1.9.9: --experimental caps buffer holds for
-// small-buffer producers") for a different symptom (a Rakarrack-side
-// "SoundPlayNode::FillNextBuffer: RequestBuffer failed" flood) that
-// turned out to be caused by stale media_server state, not pacing
-// timing, so it was reverted as unnecessary for that bug -- but that
-// finding doesn't rule it out for *this* one (audible clicking, not a
-// Media Kit error message), so it's worth testing again on its own
-// merits rather than assuming it's already been disproven. See
-// PaceToRealTime's own comment for the mechanism and how this avoids
-// the *other*, confirmed-bad cap regression (v1.8.1's flat, smaller
-// cap for every source alike).
-bool g_experimentalAudio = false;
+// The exact play buffer frame count to request from the Mixer/BSoundPlayer
+// when g_realtimeAudio is true -- the value actually read from the active
+// driver's own settings file (e.g. play_buffer_frames for hda) when
+// auto-detected, or 128 as a generic fallback when --realtime is forced
+// on manually without a cataloged driver to read from. Matching the scale
+// of whatever the driver itself is actually configured for gives this
+// hint the best chance of being honored, rather than assuming everyone's
+// tuned to the same number the very first real-world test happened to
+// use.
+int32 g_realtimeBufferFrames = 128;
+
+// ----------------------------------------------------------------------------
+// Driver catalog for real-time detection: which drivers expose a *play*
+// buffer frame count in their own settings file, and what it's called.
+// Deliberately a small subset of RealTimeGUI's own full catalog -- hrecord
+// only ever needs the play side (the tapped/mixed audio gets played back
+// locally via BSoundPlayer, see SetupDesktopAudioTap's own "hrecord
+// Playback" BSoundPlayer -- record_buffer_frames-style keys, where a
+// driver has them, are irrelevant here), and only for drivers actually
+// confirmed to expose one. Every entry below was confirmed the same way
+// RealTimeGUI's catalog was: reading that driver's own settings file and
+// publish_devices()/make_device_names() source directly in haiku/haiku's
+// src/add-ons/kernel/drivers/audio/ tree, not assumed by pattern-matching
+// driver names against their own devfs path (unreliable -- usb_audio's
+// own devfs segment is "usb", not "usb_audio", for instance).
+// ----------------------------------------------------------------------------
+struct RealtimeDriverProfile {
+    const char* devfsSegment;     // subdirectory name under /dev/audio/hmulti/
+    const char* settingsFileName; // exact filename under ~/config/settings/kernel/drivers/
+    const char* framesKey;        // settings-file key controlling play buffer size
+};
+
+const RealtimeDriverProfile kRealtimeDriverProfiles[] = {
+    { "hda", "hda.settings", "play_buffer_frames" },
+    { "auich", "auich.settings", "buffer_frames" },
+    { "es1370", "es1370.settings", "buffer_frames" },
+    { "echo", "echo.settings", "buffer_frames" },
+    { "emuxki", "emuxki.settings", "buffer_frames" },
+    { "ice1712", "ice1712.settings", "buffer_size" },
+};
+const int32 kRealtimeDriverProfileCount =
+    sizeof(kRealtimeDriverProfiles) / sizeof(kRealtimeDriverProfiles[0]);
+
+// Reads a driver settings file's full contents, or an empty string if it
+// doesn't exist.
+static std::string ReadDriverSettingsFile(const std::string& path) {
+    std::string result;
+    FILE* f = fopen(path.c_str(), "r");
+    if (f == nullptr)
+        return result;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        result.append(buf, n);
+    fclose(f);
+    return result;
+}
+
+// Finds `key`'s value on the first genuinely ACTIVE (uncommented) line in
+// `content`. A commented-out line is inert to the driver either way, and
+// -- per RealTimeGUI's own confirmed real-world finding -- may just be a
+// worked example embedded inside a header comment, not a real disabled
+// setting (hda.settings's own header shows "#     play_buffer_frames
+// 1024" purely as documentation), so this never even looks at one.
+// Returns true and fills *outValue if an active match was found.
+static bool FindActiveSettingValue(const std::string& content, const char* key,
+        int32* outValue) {
+    std::string keyStr(key);
+    size_t lineStart = 0;
+    while (lineStart < content.size()) {
+        size_t lineEnd = content.find('\n', lineStart);
+        if (lineEnd == std::string::npos)
+            lineEnd = content.size();
+
+        const std::string& line = content; // search within lineStart..lineEnd
+        size_t firstNonSpace = lineStart;
+        while (firstNonSpace < lineEnd
+                && (line[firstNonSpace] == ' ' || line[firstNonSpace] == '\t'))
+            firstNonSpace++;
+
+        if (firstNonSpace < lineEnd && line[firstNonSpace] != '#'
+                && lineEnd - firstNonSpace >= keyStr.size()
+                && line.compare(firstNonSpace, keyStr.size(), keyStr) == 0) {
+            size_t afterKey = firstNonSpace + keyStr.size();
+            if (afterKey >= lineEnd || line[afterKey] == ' ' || line[afterKey] == '\t') {
+                *outValue = atol(line.c_str() + afterKey);
+                return true;
+            }
+        }
+
+        lineStart = lineEnd + 1;
+    }
+    return false;
+}
+
+// Scans /dev/audio/hmulti/ (the same place every Haiku audio driver
+// publishes itself -- confirmed the same way RealTimeGUI's own catalog
+// was, by reading each driver's own publish path directly) for the first
+// published device this app has a real-time profile for, then checks
+// whether *that driver's own* settings file has a genuinely active play
+// buffer frame count set. Returns true and fills *outFrames if so -- the
+// mere presence of an active line is itself strong evidence real-time
+// buffers are actually in play, since every cataloged driver ships that
+// key fully commented out by default.
+static bool DetectRealtimeAudioSettings(int32* outFrames) {
+    DIR* dir = opendir("/dev/audio/hmulti");
+    if (dir == nullptr)
+        return false;
+
+    const RealtimeDriverProfile* profile = nullptr;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        for (int32 i = 0; i < kRealtimeDriverProfileCount; i++) {
+            if (strcmp(entry->d_name, kRealtimeDriverProfiles[i].devfsSegment) == 0) {
+                profile = &kRealtimeDriverProfiles[i];
+                break;
+            }
+        }
+        if (profile != nullptr)
+            break;
+    }
+    closedir(dir);
+
+    if (profile == nullptr)
+        return false;
+
+    BPath settingsDirPath;
+    std::string settingsDir;
+    if (find_directory(B_USER_SETTINGS_DIRECTORY, &settingsDirPath) == B_OK) {
+        settingsDirPath.Append("kernel/drivers");
+        settingsDir = settingsDirPath.Path();
+    } else {
+        // Fallback matching every driver's own settings-file header comment
+        // ("This file should be moved to ~/config/settings/kernel/drivers/").
+        settingsDir = "/boot/home/config/settings/kernel/drivers";
+    }
+
+    std::string targetPath = settingsDir + "/" + profile->settingsFileName;
+    std::string content = ReadDriverSettingsFile(targetPath);
+    if (content.empty())
+        return false;
+
+    return FindActiveSettingValue(content, profile->framesKey, outFrames);
+}
 
 // ============================================================================
 // Screen recording quality profiles
@@ -882,14 +1030,14 @@ media_raw_audio_format MixBusFormat() {
     fmt.channel_count = kMixBusChannels;
     fmt.format = media_raw_audio_format::B_AUDIO_FLOAT;
     fmt.byte_order = B_MEDIA_HOST_ENDIAN;
-    // Under --realtime, request 128 frames -- matching how far a real
-    // user of this project hand-tuned their own driver
-    // (play_buffer_frames 128, down from 256, confirmed lower latency
-    // with only occasional clicks/pops). This is only a hint (the Mixer
-    // may renegotiate it away entirely), but matching the same scale as
-    // an already-tuned driver gives it the best chance of being honored.
+    // Under real-time mode, request g_realtimeBufferFrames -- the exact
+    // frame count read from the active driver's own settings file when
+    // auto-detected (see DetectRealtimeAudioSettings), or 128 as a
+    // generic fallback otherwise. This is only a hint (the Mixer may
+    // renegotiate it away entirely), but matching the same scale as an
+    // already-tuned driver gives it the best chance of being honored.
     fmt.buffer_size = g_realtimeAudio
-        ? (size_t)(kMixBusChannels * sizeof(float) * 128) : 4096;
+        ? (size_t)(kMixBusChannels * sizeof(float) * g_realtimeBufferFrames) : 4096;
     return fmt;
 }
 
@@ -1149,24 +1297,27 @@ public:
             // latency dial.
             bigtime_t kMaxSnooze = 50000; // 50ms
 
-            // --experimental: cap the hold at roughly 2x *this buffer's
-            // own* duration instead, when that's tighter than 50ms.
-            // Different from the flat-smaller-cap regression above:
-            // this only tightens the ceiling for sources whose buffers
-            // are themselves small and frequent (e.g. a 128-frame/48kHz
-            // buffer, ~2.7ms, gets roughly a 5.3ms cap) -- and for
-            // exactly those sources, correction *opportunity* scales
-            // right along with the tighter cap, since BufferReceived
-            // fires again just as often. A source with large, infrequent
-            // buffers keeps the full 50ms, identical to every other
-            // mode. Unconfirmed pending real-world testing; see
-            // g_experimentalAudio's own comment for what motivated
-            // trying this again.
-            if (g_experimentalAudio) {
-                bigtime_t relativeCap = bufferDurationUs * 2;
-                if (relativeCap < kMaxSnooze)
-                    kMaxSnooze = relativeCap;
-            }
+            // Also cap the hold at roughly 2x *this buffer's own*
+            // duration, when that's tighter than 50ms. Different from
+            // the flat-smaller-cap regression above: this only tightens
+            // the ceiling for sources whose buffers are themselves small
+            // and frequent (e.g. a 128-frame/48kHz buffer, ~2.7ms, gets
+            // roughly a 5.3ms cap) -- and for exactly those sources,
+            // correction *opportunity* scales right along with the
+            // tighter cap, since BufferReceived fires again just as
+            // often. A source with large, infrequent buffers keeps the
+            // full 50ms, identical to every other case. Was gated behind
+            // a separate --experimental flag pending real-world testing;
+            // confirmed clean (real-time guitar monitoring through
+            // rakarrack), so this is now always-on rather than a
+            // separate toggle -- it only ever tightens the cap when the
+            // buffer's own live-negotiated duration genuinely warrants
+            // it, never loosens beyond the 50ms ceiling above, so there
+            // was never a real-time-specific reason to gate it once
+            // confirmed safe.
+            bigtime_t relativeCap = bufferDurationUs * 2;
+            if (relativeCap < kMaxSnooze)
+                kMaxSnooze = relativeCap;
 
             snooze(std::min(aheadBy, kMaxSnooze));
         }
@@ -1510,11 +1661,11 @@ bool SetupDesktopAudioTap(BMediaRoster* roster, AudioTapHandles* handles,
     tap->SetPlaybackRing(&g_playbackRing);
 
     if (g_realtimeAudio && bytesPerFrame > 0) {
-        // Same rationale as MixBusFormat(): request ~128 frames, matching
-        // the scale of an already-tuned driver, rather than leaving
-        // whatever buffer_size the app itself happened to negotiate with
-        // the Mixer originally.
-        negotiated.buffer_size = (size_t)bytesPerFrame * 128;
+        // Same rationale as MixBusFormat(): request g_realtimeBufferFrames,
+        // matching the scale of an already-tuned driver, rather than
+        // leaving whatever buffer_size the app itself happened to
+        // negotiate with the Mixer originally.
+        negotiated.buffer_size = (size_t)bytesPerFrame * g_realtimeBufferFrames;
     }
 
     BSoundPlayer* player = new BSoundPlayer(&negotiated, "hrecord Playback", PlaybackCallback,
@@ -1883,7 +2034,6 @@ int main(int argc, char* argv[]) {
     bool audioOnly = false;
     bool allAudio = false;
     bool realtimeAudio = false;
-    bool experimentalAudio = false;
     bool experimentalScreenCapture = false;
     bool screenCaptureRcserverMethod = false;
     bool stopRequested = false;
@@ -1901,8 +2051,6 @@ int main(int argc, char* argv[]) {
             allAudio = true;
         } else if (strcmp(argv[i], "--realtime") == 0) {
             realtimeAudio = true;
-        } else if (strcmp(argv[i], "--experimental") == 0) {
-            experimentalAudio = true;
         } else if (strcmp(argv[i], "--experimental-screen-capture") == 0) {
             experimentalScreenCapture = true;
         } else if (strcmp(argv[i], "--screen-capture-rcserver-method") == 0) {
@@ -1917,7 +2065,7 @@ int main(int argc, char* argv[]) {
             profileIndex = 2;
         } else {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
-                "[--allaudio] [--realtime] [--experimental] [--experimental-screen-capture] "
+                "[--allaudio] [--realtime] [--experimental-screen-capture] "
                 "[--screen-capture-rcserver-method] [--list-audio-inputs]" << std::endl;
             return 0;
         }
@@ -1969,22 +2117,28 @@ int main(int argc, char* argv[]) {
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
     // SetupDesktopAudioTap and SetupAllAudioTaps -- must be set before any
     // of those run, which the audio-tap setup below (section 5a) does.
-    g_realtimeAudio = realtimeAudio;
-    if (g_realtimeAudio) {
-        std::cout << "[i] --realtime: using tighter audio buffers for lower monitoring "
-            "latency. Best paired with a sound driver already tuned for low latency (see "
-            "readme.md) -- this doesn't change the driver's own buffer settings." << std::endl;
-    }
-
-    // Read by PaceToRealTime() -- see g_experimentalAudio's own comment
-    // for what this changes and why it's a separate, unconfirmed opt-in
-    // rather than folded into --realtime's defaults.
-    g_experimentalAudio = experimentalAudio;
-    if (g_experimentalAudio) {
-        std::cout << "[i] --experimental: capping how long a tap can hold a source's buffer "
-            "back, relative to that source's own buffer size, instead of a flat 50ms for "
-            "everyone -- an unconfirmed experiment aimed at very small hardware buffer "
-            "settings (see readme.md)." << std::endl;
+    //
+    // Auto-detected first: if the currently active audio driver has its
+    // own settings file with a genuinely active play buffer frame count
+    // set (see DetectRealtimeAudioSettings above), that's taken as
+    // authoritative evidence real-time buffers are already in play, and
+    // hrecord matches that exact frame count -- no flag needed. --realtime
+    // remains as a manual fallback for a driver this app doesn't have
+    // cataloged yet (see readme.md), forcing the same behavior on with a
+    // generic 128-frame guess instead of a confirmed number.
+    int32 detectedFrames = 0;
+    if (DetectRealtimeAudioSettings(&detectedFrames)) {
+        g_realtimeAudio = true;
+        g_realtimeBufferFrames = detectedFrames;
+        std::cout << "[i] Real-time audio settings detected (" << detectedFrames
+            << "-frame play buffers) -- using tighter audio buffers automatically. See "
+            "readme.md for how this was detected." << std::endl;
+    } else if (realtimeAudio) {
+        g_realtimeAudio = true;
+        g_realtimeBufferFrames = 128;
+        std::cout << "[i] --realtime: forcing tighter audio buffers (128-frame hint) -- no "
+            "auto-detected real-time driver setting was found for the active audio driver "
+            "(see readme.md)." << std::endl;
     }
 
     const VideoProfile& profile = kVideoProfiles[profileIndex];
@@ -2324,7 +2478,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.9.21";
+	    const char* localVersion = "v1.10.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
