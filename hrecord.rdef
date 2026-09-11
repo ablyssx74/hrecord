@@ -3,10 +3,10 @@ resource app_signature "application/x-vnd.hrecord";
 resource app_version {
     major  = 1,
     minor  = 10,
-    middle = 2,
+    middle = 3,
     variety = B_APPV_DEVELOPMENT,
     internal = 0,
-    short_info = "hrecord v1.10.2",
+    short_info = "hrecord v1.10.3",
     long_info = "Haiku Recorder - Screen, Desktop Audio & Real-Time Mixing"
 };
 
