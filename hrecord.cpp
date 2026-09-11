@@ -424,43 +424,52 @@ const double kRcserverFallbackChurnThreshold = 0.6;
 bool g_hybridCapture = false;
 
 // ============================================================================
-// --tiled-capture: default correctness, rcserver-sized reads, no window
-// tracking at all
+// Default capture: the whole screen, every frame, through small,
+// rcserver-sized tiles -- no window tracking, no caching
 //
-// A second, more isolated test of the same hypothesis --hybrid-capture is
-// testing (does read call *size* alone explain
-// --screen-capture-rcserver-method's mouse-responsiveness edge?), with
-// window tracking removed from the equation entirely rather than kept.
-// Where --hybrid-capture is --experimental-screen-capture's own
-// architecture with tile-sized reads swapped in, this mode is the
-// *default* path's own architecture with tile-sized reads swapped in
-// instead: every single frame, the whole screen gets refreshed through a
-// grid of small, fixed-size tiles (reusing RefreshScreenRegionTiled, the
-// same helper --hybrid-capture uses, just applied to the full screen
-// rect instead of per-window rects) -- no window API, no background
-// caching, no layout-change detection, no persistent state carried
-// between frames at all. Every tile is read fresh and pasted every
-// frame, exactly matching the default path's own "every pixel current,
-// every frame" guarantee -- so, unlike --screen-capture-rcserver-method,
-// there's no round-robin staleness risk and no drag-fragmentation
-// trade-off, and unlike --hybrid-capture/--experimental-screen-capture,
-// no dependency on Haiku's private Window Kit API at all. The cursor
-// needs no special handling here either, for the same reason: it's
-// wherever it is, and every tile refreshes every frame regardless, so
-// there's nothing that could ever leave it stale.
+// This used to be an opt-in experiment (--tiled-capture, testing the same
+// hypothesis --hybrid-capture does -- does read call *size* alone explain
+// --screen-capture-rcserver-method's mouse-responsiveness edge? -- with
+// window tracking removed from the equation entirely rather than kept).
+// Real-world testing confirmed it: every single frame, the whole screen
+// gets refreshed through a grid of small, fixed-size tiles (reusing
+// RefreshScreenRegionTiled, the same helper --hybrid-capture uses for
+// window regions, just applied to the full screen rect instead) -- no
+// window API, no background caching, no layout-change detection, no
+// persistent state carried between frames at all. Every tile is read
+// fresh and pasted every frame, exactly matching the original default's
+// own "every pixel current, every frame" guarantee -- so, unlike
+// --screen-capture-rcserver-method, there's no round-robin staleness risk
+// and no drag-fragmentation trade-off, and unlike --hybrid-capture/
+// --experimental-screen-capture, no dependency on Haiku's private Window
+// Kit API at all. The cursor needs no special handling either, for the
+// same reason: it's wherever it is, and every tile refreshes every frame
+// regardless, so there's nothing that could ever leave it stale.
 //
-// The trade-off against --hybrid-capture: this mode can't skip anything
-// the way a cached background can -- the entire screen is re-read via
-// small tiles every single frame, rather than only tracked-window
-// regions being read fresh while the background is cached until the
-// window layout changes. On a desktop with a lot of empty
-// wallpaper/Deskbar area, --hybrid-capture should have less total read
-// work per frame than this mode does; this mode's own bet is that the
-// smaller, uniform call size matters more to app_server contention (and
-// therefore mouse responsiveness) than the raw amount of screen area
-// read. Unconfirmed pending real-world testing.
+// With this confirmed and promoted to the default, the *original*
+// default -- one plain BScreen::ReadBitmap() call covering the whole
+// screen, every frame, no tiling at all -- moved behind its own explicit
+// opt-in flag, --raw-capture (see g_rawCapture below), rather than being
+// removed: the simplest possible code path, with the fewest moving parts
+// and the least IPC overhead per frame (one call instead of many small
+// ones), in case tiling's own overhead ever turns out to matter on some
+// specific piece of hardware.
+//
+// --tiled-capture itself is still accepted as an explicit flag (an
+// inert confirmation of the default, for anyone who typed it out of
+// habit) -- see main() for how it's now handled.
 // ============================================================================
-bool g_tiledCapture = false;
+
+// The original default capture path, now opt-in only: one plain
+// BScreen::ReadBitmap() call covering the whole screen, every frame, no
+// tiling, no window tracking, no caching -- the simplest possible code
+// path this project has ever shipped. Kept available via --raw-capture
+// as a fallback now that tiled reads are the default, in case tiling's
+// own per-frame IPC-call overhead (many small GetBitmap() calls instead
+// of one big ReadBitmap()) ever turns out to matter more than the
+// responsiveness win it was confirmed to bring on the hardware this was
+// tested against.
+bool g_rawCapture = false;
 
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
@@ -2142,7 +2151,8 @@ int main(int argc, char* argv[]) {
     bool experimentalScreenCapture = false;
     bool screenCaptureRcserverMethod = false;
     bool hybridCapture = false;
-    bool tiledCapture = false;
+    bool tiledCapture = false; // now the default; accepted as an inert, explicit confirmation
+    bool rawCapture = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -2166,6 +2176,8 @@ int main(int argc, char* argv[]) {
             hybridCapture = true;
         } else if (strcmp(argv[i], "--tiled-capture") == 0) {
             tiledCapture = true;
+        } else if (strcmp(argv[i], "--raw-capture") == 0) {
+            rawCapture = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -2178,7 +2190,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
                 "[--allaudio] [--realtime] [--experimental-screen-capture] "
                 "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
-                "[--list-audio-inputs]" << std::endl;
+                "[--raw-capture] [--list-audio-inputs]" << std::endl;
             return 0;
         }
     }
@@ -2198,36 +2210,34 @@ int main(int argc, char* argv[]) {
             "--audioonly." << std::endl;
         hybridCapture = false;
     }
-    if (tiledCapture && audioOnly) {
-        std::cout << "[i] --tiled-capture only affects video capture; ignored under "
+    if (rawCapture && audioOnly) {
+        std::cout << "[i] --raw-capture only affects video capture; ignored under "
             "--audioonly." << std::endl;
+        rawCapture = false;
+    }
+    if (tiledCapture) {
+        // --tiled-capture is the default now -- accepted so it doesn't
+        // hit the "unknown flag" usage error below, but it doesn't drive
+        // any behavior of its own anymore. Worth a one-time note so
+        // passing it isn't silently confusing.
+        std::cout << "[i] --tiled-capture: this is the default now, so this flag doesn't "
+            "change anything on its own; pass it if you like for clarity. See readme.md for "
+            "what changed and why, and --raw-capture if you want the original "
+            "one-read-per-frame behavior back." << std::endl;
         tiledCapture = false;
     }
 
-    // Four alternative video-capture engines -- doesn't make sense to run
-    // more than one at once. Newest wins when explicitly combined --
-    // --tiled-capture over --hybrid-capture over --experimental-screen-capture
-    // over --screen-capture-rcserver-method -- on the theory that whichever
-    // was added most recently is also whichever the user most likely meant
-    // to actually test. Just a sane tie-break for an unlikely combination,
-    // not a statement that one is strictly better than the others in
-    // general.
-    if (tiledCapture && hybridCapture) {
-        std::cout << "[i] --tiled-capture and --hybrid-capture are alternative capture "
-            "engines; can't use both at once. Keeping --tiled-capture." << std::endl;
-        hybridCapture = false;
-    }
-    if (tiledCapture && experimentalScreenCapture) {
-        std::cout << "[i] --tiled-capture and --experimental-screen-capture are alternative "
-            "capture engines; can't use both at once. Keeping --tiled-capture." << std::endl;
-        experimentalScreenCapture = false;
-    }
-    if (tiledCapture && screenCaptureRcserverMethod) {
-        std::cout << "[i] --tiled-capture and --screen-capture-rcserver-method are "
-            "alternative capture engines; can't use both at once. Keeping "
-            "--tiled-capture." << std::endl;
-        screenCaptureRcserverMethod = false;
-    }
+    // Three alternative video-capture engines, plus --raw-capture as a
+    // fourth fallback to the *original* default -- doesn't make sense to
+    // run more than one at once. Newest wins when explicitly combined:
+    // --hybrid-capture over --experimental-screen-capture over
+    // --screen-capture-rcserver-method over --raw-capture, on the theory
+    // that whichever was added most recently is also whichever the user
+    // most likely meant to actually test. Just a sane tie-break for an
+    // unlikely combination, not a statement that one is strictly better
+    // than the others in general. (Tiled reads are the default now,
+    // handled by falling through when none of these four are set --
+    // see the main loop below.)
     if (hybridCapture && experimentalScreenCapture) {
         std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
             "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
@@ -2239,11 +2249,28 @@ int main(int argc, char* argv[]) {
             "--hybrid-capture." << std::endl;
         screenCaptureRcserverMethod = false;
     }
+    if (hybridCapture && rawCapture) {
+        std::cout << "[i] --hybrid-capture and --raw-capture are alternative capture "
+            "engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
+        rawCapture = false;
+    }
     if (experimentalScreenCapture && screenCaptureRcserverMethod) {
         std::cout << "[i] --experimental-screen-capture and --screen-capture-rcserver-method "
             "are alternative capture engines; can't use both at once. Keeping "
             "--experimental-screen-capture." << std::endl;
         screenCaptureRcserverMethod = false;
+    }
+    if (experimentalScreenCapture && rawCapture) {
+        std::cout << "[i] --experimental-screen-capture and --raw-capture are alternative "
+            "capture engines; can't use both at once. Keeping "
+            "--experimental-screen-capture." << std::endl;
+        rawCapture = false;
+    }
+    if (screenCaptureRcserverMethod && rawCapture) {
+        std::cout << "[i] --screen-capture-rcserver-method and --raw-capture are alternative "
+            "capture engines; can't use both at once. Keeping "
+            "--screen-capture-rcserver-method." << std::endl;
+        rawCapture = false;
     }
 
     // Read by the main capture loop (section 7) -- window-aware capture,
@@ -2252,8 +2279,8 @@ int main(int argc, char* argv[]) {
     g_experimentalScreenCapture = experimentalScreenCapture;
     if (g_experimentalScreenCapture) {
         std::cout << "[i] --experimental-screen-capture: reusing a cached background between "
-            "frames and only freshly capturing window (and cursor) regions -- default "
-            "full-frame capture is unaffected without this flag (see readme.md)." << std::endl;
+            "frames and only freshly capturing window (and cursor) regions -- an alternative "
+            "to the default tiled capture, unaffected without this flag (see readme.md)." << std::endl;
     }
 
     // Read by the main capture loop (section 7) -- blind uniform-tile
@@ -2263,8 +2290,8 @@ int main(int argc, char* argv[]) {
     if (g_screenCaptureRcserverMethod) {
         std::cout << "[i] --screen-capture-rcserver-method: round-robin tile capture with "
             "byte-level change detection (RemoteControl RCServer's own technique) -- an "
-            "unconfirmed experiment, default full-frame capture is unaffected without this "
-            "flag (see readme.md)." << std::endl;
+            "alternative to the default tiled capture, unaffected without this flag (see "
+            "readme.md)." << std::endl;
     }
 
     // Read by the main capture loop (section 7) -- window-aware capture
@@ -2274,20 +2301,19 @@ int main(int argc, char* argv[]) {
     if (g_hybridCapture) {
         std::cout << "[i] --hybrid-capture: window-aware capture (like "
             "--experimental-screen-capture) but reading each window through small, "
-            "fixed-size tiles (like --screen-capture-rcserver-method) instead of one call "
-            "per window -- an unconfirmed experiment, default full-frame capture is "
-            "unaffected without this flag (see readme.md)." << std::endl;
+            "fixed-size tiles (like the default tiled capture) instead of one call per "
+            "window -- an unconfirmed experiment, the default is unaffected without this "
+            "flag (see readme.md)." << std::endl;
     }
 
-    // Read by the main capture loop (section 7) -- default-path
-    // correctness with rcserver-sized reads and no window tracking at
-    // all, see g_tiledCapture's own comment above for the full design.
-    g_tiledCapture = tiledCapture;
-    if (g_tiledCapture) {
-        std::cout << "[i] --tiled-capture: the whole screen refreshed through small, "
-            "fixed-size tiles every frame -- no window tracking, no caching, no "
-            "persistent state between frames -- an unconfirmed experiment, default "
-            "full-frame capture is unaffected without this flag (see readme.md)." << std::endl;
+    // Read by the main capture loop (section 7) -- the original
+    // one-read-per-frame default, see g_rawCapture's own comment above
+    // for the full design and why it's still here.
+    g_rawCapture = rawCapture;
+    if (g_rawCapture) {
+        std::cout << "[i] --raw-capture: one plain full-screen read per frame, no tiling -- "
+            "the original default, kept available now that tiled reads are the default "
+            "instead (see readme.md)." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -2654,7 +2680,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.10.3";
+	    const char* localVersion = "v1.11.0";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2903,24 +2929,21 @@ int main(int argc, char* argv[]) {
                         av_packet_unref(pkt);
                     }
                 }
-            } else if (g_tiledCapture) {
-                // The whole screen, every frame, through the same small,
-                // fixed-size tile grid --hybrid-capture uses for window
-                // regions -- see g_tiledCapture's own comment for why no
-                // other state (background cache, window list, round-robin
-                // cursor) is needed here at all.
-                RefreshScreenRegionTiled(BRect(0, 0, width - 1, height - 1), screen,
-                    screenBitmap, width, height);
-
+            } else if (g_rawCapture && screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK) {
+                // The original default: one plain full-screen read, every
+                // frame, no tiling -- see g_rawCapture's own comment for
+                // why this is still here as an explicit opt-in.
                 void* pixelBuffer = screenBitmap->Bits();
+
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                    outWidth, outHeight, videoCodecCtx->pix_fmt,
-                    profile.swsFlags, nullptr, nullptr, nullptr);
+                                              outWidth, outHeight, videoCodecCtx->pix_fmt,
+                                              profile.swsFlags, nullptr, nullptr, nullptr);
+
                 uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                 int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                sws_scale(swsCtx, srcData, srcLinesize, 0, height,
-                    encodingFrame->data, encodingFrame->linesize);
+                sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
 
+                // PTS is determined by actual elapsed real-world microseconds
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
                 encodingFrame->pts = currentPresentationTime;
 
@@ -2933,18 +2956,28 @@ int main(int argc, char* argv[]) {
                         av_packet_unref(pkt);
                     }
                 }
-            } else if (screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK) {
+            } else if (!g_rawCapture) {
+                // Default: the whole screen, every frame, through the same
+                // small, fixed-size tile grid --hybrid-capture uses for
+                // window regions -- see the design comment above
+                // g_rawCapture for why no other state (background cache,
+                // window list, round-robin cursor) is needed here at all.
+                // The `!g_rawCapture` guard just keeps this from also
+                // firing on a real ReadBitmap() failure above when
+                // --raw-capture is active -- every other mode's own branch
+                // already returned before reaching this point.
+                RefreshScreenRegionTiled(BRect(0, 0, width - 1, height - 1), screen,
+                    screenBitmap, width, height);
+
                 void* pixelBuffer = screenBitmap->Bits();
-
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                                              outWidth, outHeight, videoCodecCtx->pix_fmt,
-                                              profile.swsFlags, nullptr, nullptr, nullptr);
-
+                    outWidth, outHeight, videoCodecCtx->pix_fmt,
+                    profile.swsFlags, nullptr, nullptr, nullptr);
                 uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                 int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
+                sws_scale(swsCtx, srcData, srcLinesize, 0, height,
+                    encodingFrame->data, encodingFrame->linesize);
 
-                // PTS is determined by actual elapsed real-world microseconds
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
                 encodingFrame->pts = currentPresentationTime;
 

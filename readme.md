@@ -10,13 +10,21 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--raw-capture] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
   container) to `/boot/home/hrecord_capture_YYYYMMDD_HHMMSS.mkv`, with a
   Vorbis desktop-audio track alongside it whenever the audio tap (below) can
-  be set up.
+  be set up. **Screen capture defaults to tiled reads now** -- the whole
+  screen refreshed every frame through small, fixed-size tiles instead of
+  one big read -- real-world confirmed for noticeably better mouse
+  responsiveness while recording, with none of the round-robin
+  staleness/drag-fragmentation trade-offs the other small-read modes
+  below carry. No flag needed; see "`--tiled-capture`: default
+  correctness, rcserver-sized reads" below for the full story and
+  `--raw-capture` if you want the original one-read-per-frame behavior
+  back.
 - `hrecord start --audioonly` — records desktop audio only (no screen
   capture) to `/boot/home/hrecord_capture_YYYYMMDD_HHMMSS.ogg`, an
   Ogg/Vorbis file. Both Ogg and Vorbis are open, royalty-free formats, so
@@ -48,19 +56,20 @@ whatever an earlier run left behind in `/boot/home`.
   get tighter buffers at all. It forces the same tighter buffering on
   with a generic 128-frame guess instead of a confirmed number. See
   "Real-time audio: auto-detected from your driver settings" below.
-- `hrecord start --experimental-screen-capture` — reuses a cached capture
-  buffer between frames instead of re-reading the whole screen every time,
-  only freshly reading the screen regions actually covered by a window (or
-  the mouse cursor) each frame, then converting the whole composited
+- `hrecord start --experimental-screen-capture` — an *alternative* to the
+  default tiled capture: reuses a cached capture buffer between frames,
+  only freshly reading the screen regions actually covered by a window
+  (or the mouse cursor) each frame, then converting the whole composited
   buffer once per frame. No effect under `--audioonly` (there's no video
   to capture). Real-world tested: noticeably better mouse responsiveness
-  while recording, and no window-border artifacts (an earlier version had
-  a confirmed one; fixed by compositing regions via plain `memcpy` and
+  than the *original* one-read-per-frame default (see `--raw-capture`
+  below), and no window-border artifacts (an earlier version had a
+  confirmed one; fixed by compositing regions via plain `memcpy` and
   converting the whole frame in a single pass instead of scaling each
-  region independently). The default full-frame capture path is
-  completely unaffected unless this flag is passed. See
-  "--experimental-screen-capture: window-aware capture" below.
-- `hrecord start --screen-capture-rcserver-method` — an alternative,
+  region independently). Not compared against the current tiled-read
+  default. See "--experimental-screen-capture: window-aware capture"
+  below.
+- `hrecord start --screen-capture-rcserver-method` — another alternative,
   independent capture engine: no window tracking at all, just a fixed grid
   of small tiles round-robined across frames, each freshly read and only
   pasted into the capture buffer when a byte-level `memcmp` against its
@@ -70,36 +79,38 @@ whatever an earlier run left behind in `/boot/home`.
   with `--experimental-screen-capture` (alternative engines, not
   stackable) — `--experimental-screen-capture` wins if both are passed.
   Real-world tested: mouse responsiveness "almost identical to native
-  mouse motion" and remarkably low `app_server` CPU cost, the best of the
-  capture modes tested so far on both fronts -- but dragging a window
-  around visibly fragmented it in the recording, a mitigation for which
-  (untested as of this writing) is also in place. See
+  mouse motion" and remarkably low `app_server` CPU cost -- this is what
+  inspired the tiled-read technique the default now uses -- but dragging
+  a window around visibly fragmented it in the recording, a mitigation
+  for which (untested as of this writing) is also in place. See
   "--screen-capture-rcserver-method: blind uniform-tile capture" below.
-- `hrecord start --hybrid-capture` — a fourth capture engine testing a
+- `hrecord start --hybrid-capture` — a third alternative engine testing a
   specific hypothesis: `--experimental-screen-capture`'s window-aware
   design with `--screen-capture-rcserver-method`'s small, fixed-size
   reads. Reads each tracked window through a grid of small tiles instead
   of one call per window, keeping full per-frame correctness (no
   round-robin, no drag fragmentation, no visualizer slowdown case) while
   testing whether the smaller call size alone closes the mouse-
-  responsiveness gap. Can't be combined with `--experimental-screen-capture`,
-  `--screen-capture-rcserver-method`, or `--tiled-capture` (alternative
-  engines, not stackable) — `--tiled-capture` wins over this one if both
-  are passed, otherwise `--hybrid-capture` wins.
+  responsiveness gap. Can't be combined with `--experimental-screen-capture`
+  or `--screen-capture-rcserver-method` (alternative engines, not
+  stackable) — `--hybrid-capture` wins if more than one is passed.
   Unconfirmed, not yet real-world tested. See "--hybrid-capture:
   window-aware capture, rcserver-sized reads" below.
-- `hrecord start --tiled-capture` — a fifth capture engine, a more
-  isolated test of the same hypothesis `--hybrid-capture` tests, with
-  window tracking removed from the equation entirely rather than kept:
-  the whole screen refreshed through the same small, fixed-size tile
-  grid every single frame, no window API, no background caching, no
-  persistent state between frames at all -- every tile read fresh and
-  pasted every frame, matching the default path's own "every pixel
-  current, every frame" guarantee, so no round-robin staleness risk and
-  no drag-fragmentation trade-off either. Can't be combined with any of
-  the other three capture engines (alternative engines, not stackable)
-  — `--tiled-capture` wins if more than one is passed. Unconfirmed, not
-  yet real-world tested. See "--tiled-capture: default correctness,
+- `hrecord start --tiled-capture` — **this is the default now**; passing
+  it explicitly is accepted (for clarity, or old habit) but doesn't
+  change anything on its own. See the top of this list and
+  "--tiled-capture: default correctness, rcserver-sized reads" below for
+  the full story.
+- `hrecord start --raw-capture` — the *original* default, before tiled
+  reads were confirmed and promoted: one plain full-screen read per
+  frame, no tiling, no window tracking, the simplest possible code path
+  this project has shipped. Kept available as a fallback in case tiled
+  reads' own extra per-frame IPC-call overhead (many small calls instead
+  of one big one) ever turns out to matter more than the responsiveness
+  win it was confirmed to bring. Can't be combined with
+  `--experimental-screen-capture`, `--screen-capture-rcserver-method`, or
+  `--hybrid-capture` (alternative engines, not stackable) — whichever of
+  those was also passed wins. See "--tiled-capture: default correctness,
   rcserver-sized reads" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
@@ -156,12 +167,13 @@ how often and how expensively that contention happens.
 
 ## `--experimental-screen-capture`: window-aware capture
 
-The default path reads the whole screen and reruns `sws_scale`'s
-colorspace conversion over every pixel, every single frame, regardless of
-how much of the screen actually changed since the last one. That's simple
-and always correct, but wasteful on a desktop where windows only cover
-part of the screen -- the bare wallpaper/Deskbar area gets reconverted for
-no reason, every frame.
+A plain whole-screen read (what `--raw-capture` still does today, and
+what was the only option when this mode was first built) reads the whole
+screen and reruns `sws_scale`'s colorspace conversion over every pixel,
+every single frame, regardless of how much of the screen actually
+changed since the last one. That's simple and always correct, but
+wasteful on a desktop where windows only cover part of the screen -- the
+bare wallpaper/Deskbar area gets reconverted for no reason, every frame.
 
 **First version only fixed half the problem.** It skipped the `sws_scale`
 conversion cost for the static background (a cached, already-converted
@@ -173,9 +185,10 @@ that `BScreen` had no partial-capture primitive. Real-world testing
 showed that assumption was the actual problem: `htop` showed `app_server`
 itself pinned near 100% of one core, identically with or without this
 mode, and a brief improvement in mouse responsiveness faded after about a
-second back to the same sluggishness the default path has. The `sws_scale`
-cost this mode targeted was real, but small next to the cost of the
-*read* itself -- reading is where nearly all the CPU time actually goes.
+second back to the same sluggishness a plain full-screen read has. The
+`sws_scale` cost this mode targeted was real, but small next to the cost
+of the *read* itself -- reading is where nearly all the CPU time actually
+goes.
 
 **BScreen does support a genuine partial capture, via `ReadBitmap()`'s own
 `bounds` parameter** -- confirmed by looking at how
@@ -223,8 +236,9 @@ expect "the apps" to mean.
 
 **Real-world confirmation: the bounded-read fix above is a genuine win.**
 One real user's testing described mouse responsiveness while recording as
-roughly 50% better than the default path, "feels like what using
-[RemoteControl's] RClient would behave as" -- consistent with the
+roughly 50% better than a plain full-screen read (what `--raw-capture`
+still does today), "feels like what using [RemoteControl's] RClient
+would behave as" -- consistent with the
 `app_server`-contention theory above, since small, frequent capture
 requests interleave with `app_server`'s other work far better than one
 big request per frame does. Worth noting honestly: `htop` still shows
@@ -410,15 +424,16 @@ The fix: when a tile-scan pass finds more than 60% of its sampled tiles
 changed in one go -- a much higher bar than the burst-ramp threshold above,
 meant to catch only genuinely pathological churn -- the next ~1 second of
 frames (tied to the profile's own fps) falls back to a plain full-screen
-`ReadBitmap()`, identical in cost to the default path, instead of
-continuing to ramp the tile machinery harder. After the cooldown, it tries
-granular tiling again; if the screen is still that busy, it re-triggers
-immediately, if not, it resumes normal round-robin operation with an
-already-current buffer (the fallback reads kept it fresh throughout). This
-makes the mode self-adapt across the whole spectrum: cheap and granular on
-a mostly-static desktop (the confirmed win), and never meaningfully worse
-than the default path's own cost on something as demanding as a full-screen
-visualizer, instead of getting stuck paying for the worst of both.
+`ReadBitmap()`, identical in cost to `--raw-capture`'s own approach,
+instead of continuing to ramp the tile machinery harder. After the
+cooldown, it tries granular tiling again; if the screen is still that
+busy, it re-triggers immediately, if not, it resumes normal round-robin
+operation with an already-current buffer (the fallback reads kept it
+fresh throughout). This makes the mode self-adapt across the whole
+spectrum: cheap and granular on a mostly-static desktop (the confirmed
+win), and never meaningfully worse than a single plain full-screen read's
+own cost on something as demanding as a full-screen visualizer, instead
+of getting stuck paying for the worst of both.
 
 Real-world re-test against projectM: "a little better," not a full fix --
 `app_server` stayed comfortably in the 60-80% range and the mouse remained
@@ -504,23 +519,27 @@ chunking it further.
 
 ## `--tiled-capture`: default correctness, rcserver-sized reads
 
-A second, more isolated test of the same hypothesis `--hybrid-capture`
-tests -- with a real question raised after seeing `--hybrid-capture`'s
-own design: does it actually need window tracking layered in at all, or
-was that just carrying `--experimental-screen-capture`'s own complexity
-along for the ride? This mode drops window tracking from the equation
-entirely rather than keeping it.
+**This is the default capture mode now.** It started as a more isolated
+test of the same hypothesis `--hybrid-capture` tests -- with a real
+question raised after seeing `--hybrid-capture`'s own design: does it
+actually need window tracking layered in at all, or was that just
+carrying `--experimental-screen-capture`'s own complexity along for the
+ride? This mode dropped window tracking from the equation entirely
+rather than keeping it, and real-world testing confirmed it: the user's
+own verdict was "very happy with it," enough to promote it from an
+opt-in experiment to the default every recording now uses, with no flag
+needed.
 
-**The design: the *default* path's own architecture, with tile-sized
-reads swapped in.** Every single frame, the whole screen is refreshed
-through the same small, fixed-size tile grid `--hybrid-capture` uses for
-window regions (`RefreshScreenRegionTiled`, applied to the full screen
-rectangle instead of per-window rectangles) -- no private Window Kit API,
-no background caching, no layout-change detection, and critically, no
-persistent state carried between frames at all. Every tile is read fresh
-and pasted every frame, exactly matching the default path's own "every
-pixel current, every frame" guarantee. Two consequences fall out of that
-for free:
+**The design: the *original* default path's own architecture, with
+tile-sized reads swapped in.** Every single frame, the whole screen is
+refreshed through the same small, fixed-size tile grid `--hybrid-capture`
+uses for window regions (`RefreshScreenRegionTiled`, applied to the full
+screen rectangle instead of per-window rectangles) -- no private Window
+Kit API, no background caching, no layout-change detection, and
+critically, no persistent state carried between frames at all. Every tile
+is read fresh and pasted every frame, exactly matching the *original*
+default path's own "every pixel current, every frame" guarantee. Two
+consequences fall out of that for free:
 
 - **No round-robin staleness risk and no drag-fragmentation trade-off**,
   unlike `--screen-capture-rcserver-method` -- there's no rotation to be
@@ -537,27 +556,42 @@ via small tiles every single frame, rather than only tracked-window
 regions being read fresh while empty wallpaper/Deskbar area sits cached
 until the window layout changes. On a desktop with a lot of that empty
 area, `--hybrid-capture` should have measurably less total read work per
-frame than this mode does. This mode's own bet is that the smaller,
-uniform call size matters more to `app_server` contention (and therefore
-mouse responsiveness) than the raw amount of screen area actually read --
-if that bet is right, the extra read work might not matter much; if it's
-wrong, `--hybrid-capture` should come out ahead.
+frame than this mode does -- still unconfirmed which of the two actually
+feels better in practice, since only this one has been real-world tested
+so far.
 
-Can't be combined with any of the other three capture engines --
-`--tiled-capture` wins the tie-break if more than one is passed (see the
-top-level flag list above for the full precedence chain).
+### `--raw-capture`: the original default, now opt-in
 
-**Unconfirmed, not yet real-world tested.** Open questions:
+Before this mode was confirmed and promoted, the default was one plain
+`BScreen::ReadBitmap()` call covering the whole screen, every frame, no
+tiling at all -- the simplest possible code path this project has ever
+shipped, and the one every other capture mode in this readme was
+originally compared against. Rather than deleting that path outright, it
+moved behind its own explicit flag, `--raw-capture`, as a fallback: in
+case tiled reads' own extra per-frame IPC overhead (many small
+`BScreen::GetBitmap()` calls instead of one big `ReadBitmap()`) ever
+turns out to matter more than the responsiveness win it was confirmed to
+bring -- on different hardware, a heavily loaded system, or anything else
+this project hasn't tested against yet -- there's still a way back to the
+simplest, most predictable option with the fewest moving parts.
 
-- Whether the hypothesis is actually correct at all -- same open
-  question as `--hybrid-capture`'s own.
-- Whether this mode's extra total read work (the whole screen, not just
-  tracked windows, every frame) costs enough to offset any
-  responsiveness gain from the smaller call size -- the direct trade-off
-  against `--hybrid-capture` described above, not measured either way.
-- Whether dropping window tracking entirely turns out to matter for
-  responsiveness at all, or whether `--hybrid-capture`'s own result
-  (once tested) already answers this by itself.
+Can't be combined with `--experimental-screen-capture`,
+`--screen-capture-rcserver-method`, or `--hybrid-capture` (alternative
+engines, not stackable) -- whichever of those was also passed wins (see
+the top-level flag list above for the full precedence chain). `--tiled-capture`
+itself is still accepted as an explicit flag if passed, but since it's
+the default now, it's a no-op -- passing both `--tiled-capture` and
+`--raw-capture` together just gets you `--raw-capture`, with a note
+explaining why.
+
+**Confirmed via real-world testing:** the promotion itself is the
+confirmation -- `--tiled-capture` (now just "the default") was tested
+and preferred over the original single-read approach `--raw-capture`
+preserves. What's *not* yet confirmed is how the default compares
+against `--hybrid-capture`, `--experimental-screen-capture`, or
+`--screen-capture-rcserver-method` head to head -- those three remain
+open experiments in their own right, each still worth trying against the
+new default rather than the old one.
 
 ## How desktop-audio capture works
 
