@@ -14,7 +14,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--list-audio-inputs]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -86,11 +86,25 @@ whatever an earlier run left behind in `/boot/home`.
   of one call per window, keeping full per-frame correctness (no
   round-robin, no drag fragmentation, no visualizer slowdown case) while
   testing whether the smaller call size alone closes the mouse-
-  responsiveness gap. Can't be combined with `--experimental-screen-capture`
-  or `--screen-capture-rcserver-method` (alternative engines, not
-  stackable) — `--hybrid-capture` wins if more than one is passed.
+  responsiveness gap. Can't be combined with `--experimental-screen-capture`,
+  `--screen-capture-rcserver-method`, or `--tiled-capture` (alternative
+  engines, not stackable) — `--tiled-capture` wins over this one if both
+  are passed, otherwise `--hybrid-capture` wins.
   Unconfirmed, not yet real-world tested. See "--hybrid-capture:
   window-aware capture, rcserver-sized reads" below.
+- `hrecord start --tiled-capture` — a fifth capture engine, a more
+  isolated test of the same hypothesis `--hybrid-capture` tests, with
+  window tracking removed from the equation entirely rather than kept:
+  the whole screen refreshed through the same small, fixed-size tile
+  grid every single frame, no window API, no background caching, no
+  persistent state between frames at all -- every tile read fresh and
+  pasted every frame, matching the default path's own "every pixel
+  current, every frame" guarantee, so no round-robin staleness risk and
+  no drag-fragmentation trade-off either. Can't be combined with any of
+  the other three capture engines (alternative engines, not stackable)
+  — `--tiled-capture` wins if more than one is passed. Unconfirmed, not
+  yet real-world tested. See "--tiled-capture: default correctness,
+  rcserver-sized reads" below.
 - `hrecord stop` — signals a running recording instance to stop and finalize
   its output file.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
@@ -491,6 +505,63 @@ chunking it further.
 - Whether the `app_server` CPU-load characteristics carry over the same
   way call-size reduction did for `--screen-capture-rcserver-method`, or
   behave differently once window tracking is layered back in.
+
+## `--tiled-capture`: default correctness, rcserver-sized reads
+
+A second, more isolated test of the same hypothesis `--hybrid-capture`
+tests -- with a real question raised after seeing `--hybrid-capture`'s
+own design: does it actually need window tracking layered in at all, or
+was that just carrying `--experimental-screen-capture`'s own complexity
+along for the ride? This mode drops window tracking from the equation
+entirely rather than keeping it.
+
+**The design: the *default* path's own architecture, with tile-sized
+reads swapped in.** Every single frame, the whole screen is refreshed
+through the same small, fixed-size tile grid `--hybrid-capture` uses for
+window regions (`RefreshScreenRegionTiled`, applied to the full screen
+rectangle instead of per-window rectangles) -- no private Window Kit API,
+no background caching, no layout-change detection, and critically, no
+persistent state carried between frames at all. Every tile is read fresh
+and pasted every frame, exactly matching the default path's own "every
+pixel current, every frame" guarantee. Two consequences fall out of that
+for free:
+
+- **No round-robin staleness risk and no drag-fragmentation trade-off**,
+  unlike `--screen-capture-rcserver-method` -- there's no rotation to be
+  behind on; everything is always current.
+- **No dedicated cursor handling needed**, unlike every other capture
+  mode in this project. The cursor is wherever it is, and every tile
+  refreshes every frame regardless, so there's nothing that could ever
+  leave it looking stale -- the special-case code every other mode needs
+  for this simply isn't necessary here.
+
+**The trade-off against `--hybrid-capture`:** this mode can't skip
+anything the way a cached background can. The entire screen is re-read
+via small tiles every single frame, rather than only tracked-window
+regions being read fresh while empty wallpaper/Deskbar area sits cached
+until the window layout changes. On a desktop with a lot of that empty
+area, `--hybrid-capture` should have measurably less total read work per
+frame than this mode does. This mode's own bet is that the smaller,
+uniform call size matters more to `app_server` contention (and therefore
+mouse responsiveness) than the raw amount of screen area actually read --
+if that bet is right, the extra read work might not matter much; if it's
+wrong, `--hybrid-capture` should come out ahead.
+
+Can't be combined with any of the other three capture engines --
+`--tiled-capture` wins the tie-break if more than one is passed (see the
+top-level flag list above for the full precedence chain).
+
+**Unconfirmed, not yet real-world tested.** Open questions:
+
+- Whether the hypothesis is actually correct at all -- same open
+  question as `--hybrid-capture`'s own.
+- Whether this mode's extra total read work (the whole screen, not just
+  tracked windows, every frame) costs enough to offset any
+  responsiveness gain from the smaller call size -- the direct trade-off
+  against `--hybrid-capture` described above, not measured either way.
+- Whether dropping window tracking entirely turns out to matter for
+  responsiveness at all, or whether `--hybrid-capture`'s own result
+  (once tested) already answers this by itself.
 
 ## How desktop-audio capture works
 

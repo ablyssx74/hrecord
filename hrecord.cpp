@@ -423,6 +423,45 @@ const double kRcserverFallbackChurnThreshold = 0.6;
 // correctness. Unconfirmed pending real-world testing.
 bool g_hybridCapture = false;
 
+// ============================================================================
+// --tiled-capture: default correctness, rcserver-sized reads, no window
+// tracking at all
+//
+// A second, more isolated test of the same hypothesis --hybrid-capture is
+// testing (does read call *size* alone explain
+// --screen-capture-rcserver-method's mouse-responsiveness edge?), with
+// window tracking removed from the equation entirely rather than kept.
+// Where --hybrid-capture is --experimental-screen-capture's own
+// architecture with tile-sized reads swapped in, this mode is the
+// *default* path's own architecture with tile-sized reads swapped in
+// instead: every single frame, the whole screen gets refreshed through a
+// grid of small, fixed-size tiles (reusing RefreshScreenRegionTiled, the
+// same helper --hybrid-capture uses, just applied to the full screen
+// rect instead of per-window rects) -- no window API, no background
+// caching, no layout-change detection, no persistent state carried
+// between frames at all. Every tile is read fresh and pasted every
+// frame, exactly matching the default path's own "every pixel current,
+// every frame" guarantee -- so, unlike --screen-capture-rcserver-method,
+// there's no round-robin staleness risk and no drag-fragmentation
+// trade-off, and unlike --hybrid-capture/--experimental-screen-capture,
+// no dependency on Haiku's private Window Kit API at all. The cursor
+// needs no special handling here either, for the same reason: it's
+// wherever it is, and every tile refreshes every frame regardless, so
+// there's nothing that could ever leave it stale.
+//
+// The trade-off against --hybrid-capture: this mode can't skip anything
+// the way a cached background can -- the entire screen is re-read via
+// small tiles every single frame, rather than only tracked-window
+// regions being read fresh while the background is cached until the
+// window layout changes. On a desktop with a lot of empty
+// wallpaper/Deskbar area, --hybrid-capture should have less total read
+// work per frame than this mode does; this mode's own bet is that the
+// smaller, uniform call size matters more to app_server contention (and
+// therefore mouse responsiveness) than the raw amount of screen area
+// read. Unconfirmed pending real-world testing.
+// ============================================================================
+bool g_tiledCapture = false;
+
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
 // tracking uses, via get_window_info()/BPrivate::get_window_order()).
@@ -2103,6 +2142,7 @@ int main(int argc, char* argv[]) {
     bool experimentalScreenCapture = false;
     bool screenCaptureRcserverMethod = false;
     bool hybridCapture = false;
+    bool tiledCapture = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
     int profileIndex = 1; // default: medium
@@ -2124,6 +2164,8 @@ int main(int argc, char* argv[]) {
             screenCaptureRcserverMethod = true;
         } else if (strcmp(argv[i], "--hybrid-capture") == 0) {
             hybridCapture = true;
+        } else if (strcmp(argv[i], "--tiled-capture") == 0) {
+            tiledCapture = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -2135,7 +2177,7 @@ int main(int argc, char* argv[]) {
         } else {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
                 "[--allaudio] [--realtime] [--experimental-screen-capture] "
-                "[--screen-capture-rcserver-method] [--hybrid-capture] "
+                "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
                 "[--list-audio-inputs]" << std::endl;
             return 0;
         }
@@ -2156,16 +2198,36 @@ int main(int argc, char* argv[]) {
             "--audioonly." << std::endl;
         hybridCapture = false;
     }
+    if (tiledCapture && audioOnly) {
+        std::cout << "[i] --tiled-capture only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        tiledCapture = false;
+    }
 
-    // Three alternative video-capture engines -- doesn't make sense to run
-    // more than one at once. --hybrid-capture wins over both if explicitly
-    // requested (it's the newest, built specifically to test a hypothesis
-    // about --experimental-screen-capture's own weak point -- see its own
-    // comment); otherwise --experimental-screen-capture wins over
-    // --screen-capture-rcserver-method since it has real-world confirmation
-    // --hybrid-capture doesn't have yet. Just a sane tie-break for an
-    // unlikely combination, not a statement that one is strictly better
-    // than the others in general.
+    // Four alternative video-capture engines -- doesn't make sense to run
+    // more than one at once. Newest wins when explicitly combined --
+    // --tiled-capture over --hybrid-capture over --experimental-screen-capture
+    // over --screen-capture-rcserver-method -- on the theory that whichever
+    // was added most recently is also whichever the user most likely meant
+    // to actually test. Just a sane tie-break for an unlikely combination,
+    // not a statement that one is strictly better than the others in
+    // general.
+    if (tiledCapture && hybridCapture) {
+        std::cout << "[i] --tiled-capture and --hybrid-capture are alternative capture "
+            "engines; can't use both at once. Keeping --tiled-capture." << std::endl;
+        hybridCapture = false;
+    }
+    if (tiledCapture && experimentalScreenCapture) {
+        std::cout << "[i] --tiled-capture and --experimental-screen-capture are alternative "
+            "capture engines; can't use both at once. Keeping --tiled-capture." << std::endl;
+        experimentalScreenCapture = false;
+    }
+    if (tiledCapture && screenCaptureRcserverMethod) {
+        std::cout << "[i] --tiled-capture and --screen-capture-rcserver-method are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--tiled-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
     if (hybridCapture && experimentalScreenCapture) {
         std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
             "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
@@ -2215,6 +2277,17 @@ int main(int argc, char* argv[]) {
             "fixed-size tiles (like --screen-capture-rcserver-method) instead of one call "
             "per window -- an unconfirmed experiment, default full-frame capture is "
             "unaffected without this flag (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- default-path
+    // correctness with rcserver-sized reads and no window tracking at
+    // all, see g_tiledCapture's own comment above for the full design.
+    g_tiledCapture = tiledCapture;
+    if (g_tiledCapture) {
+        std::cout << "[i] --tiled-capture: the whole screen refreshed through small, "
+            "fixed-size tiles every frame -- no window tracking, no caching, no "
+            "persistent state between frames -- an unconfirmed experiment, default "
+            "full-frame capture is unaffected without this flag (see readme.md)." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -2581,7 +2654,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.10.2";
+	    const char* localVersion = "v1.10.3";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2817,6 +2890,36 @@ int main(int argc, char* argv[]) {
                     sws_scale(swsCtx, srcData, srcLinesize, 0, height,
                         encodingFrame->data, encodingFrame->linesize);
                 }
+
+                bigtime_t currentPresentationTime = system_time() - recordingStartTime;
+                encodingFrame->pts = currentPresentationTime;
+
+                std::lock_guard<std::mutex> lock(g_muxMutex);
+                if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                    while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
+                        av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
+                        pkt->stream_index = videoStream->index;
+                        av_interleaved_write_frame(fmtCtx, pkt);
+                        av_packet_unref(pkt);
+                    }
+                }
+            } else if (g_tiledCapture) {
+                // The whole screen, every frame, through the same small,
+                // fixed-size tile grid --hybrid-capture uses for window
+                // regions -- see g_tiledCapture's own comment for why no
+                // other state (background cache, window list, round-robin
+                // cursor) is needed here at all.
+                RefreshScreenRegionTiled(BRect(0, 0, width - 1, height - 1), screen,
+                    screenBitmap, width, height);
+
+                void* pixelBuffer = screenBitmap->Bits();
+                swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
+                    outWidth, outHeight, videoCodecCtx->pix_fmt,
+                    profile.swsFlags, nullptr, nullptr, nullptr);
+                uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
+                int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+                sws_scale(swsCtx, srcData, srcLinesize, 0, height,
+                    encodingFrame->data, encodingFrame->linesize);
 
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
                 encodingFrame->pts = currentPresentationTime;
