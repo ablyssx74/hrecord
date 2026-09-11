@@ -36,15 +36,21 @@ whatever an earlier run left behind in `/boot/home`.
   `--audioonly` -- combine it with plain `hrecord start` to get screen
   recording with every currently-playing app mixed into its audio track,
   not just one. See "Recording every audio source at once" below.
-- **Real-time audio buffers are now auto-detected, no flag needed.** If
-  the currently active audio driver has its own settings file with a
-  genuinely active (uncommented) play buffer frame count set -- the same
-  file [RealTimeGUI](https://github.com/ablyssx74/RealTimeGUI), this
-  project's own companion app, reads and writes -- hrecord trims its audio-
-  tap ring buffers and the buffer size requested from BSoundPlayer to
-  match, automatically, at startup. `hrecord start --realtime` remains as
-  a manual fallback: forces the same tighter buffering on with a generic
-  128-frame guess, for a driver this app doesn't have cataloged yet. See
+- **Real-time audio buffers are now auto-detected, no flag needed --
+  for most users.** If the currently active audio driver has its own
+  settings file with a genuinely active (uncommented) play buffer frame
+  count set -- the same file
+  [RealTimeGUI](https://github.com/ablyssx74/RealTimeGUI), this project's
+  own companion app, reads and writes -- hrecord trims its audio-tap ring
+  buffers and the buffer size requested from BSoundPlayer to match,
+  automatically, at startup. **You may still need `hrecord start
+  --realtime` yourself** if your audio driver isn't one of the six this
+  app currently knows how to read a settings file from (`hda`, `auich`,
+  `es1370`, `echo`, `emuxki`, `ice1712` -- see the driver catalog below):
+  on an uncataloged driver, auto-detection can't find anything to read no
+  matter how you've tuned it, so `--realtime` is still the only way to
+  get tighter buffers at all. It forces the same tighter buffering on
+  with a generic 128-frame guess instead of a confirmed number. See
   "Real-time audio: auto-detected from your driver settings" below.
 - `hrecord start --experimental-screen-capture` — reuses a cached capture
   buffer between frames instead of re-reading the whole screen every time,
@@ -634,7 +640,12 @@ use case that motivated them -- requiring the user to remember and pass
 two flags on a system that's *already* tuned for real-time audio stopped
 making sense: the driver's own settings file already says whether
 real-time buffers are in play. hrecord now reads that file itself, at
-startup, before any audio tap is set up:
+startup, before any audio tap is set up. **Confirmed working:** a
+`--realtime`-free `hrecord --audioonly` run against a driver already
+hand-tuned to `play_buffer_frames 128` printed
+`[i] Real-time audio settings detected (128-frame play buffers) -- using
+tighter audio buffers automatically.` and started recording -- exactly
+the intended no-flag-needed case.
 
 1. Scans `/dev/audio/hmulti/` for the active audio driver -- the same
    place every Haiku audio driver publishes itself, confirmed the same
@@ -652,6 +663,18 @@ startup, before any audio tap is set up:
 3. `--realtime` remains as a manual fallback: forces the same behavior on
    with a generic 128-frame guess, for a driver this app doesn't have
    cataloged yet.
+
+**Auto-detection only covers six drivers so far** (`hda`, `auich`,
+`es1370`, `echo`, `emuxki`, `ice1712` -- see the driver catalog in
+RealTimeGUI's own readme for exactly what was confirmed about each). If
+your driver isn't one of those -- most USB audio interfaces, for
+instance, publish as `usb`, which is confirmed to have no tunable
+settings file at all -- step 2 above can never find anything to read, no
+matter how carefully you've tuned your hardware some other way. On a
+driver like that, `--realtime` isn't a redundant relic of the old flag
+system; it's still the only way to get hrecord's own tighter buffering,
+just without the confirmed exact frame count auto-detection would
+otherwise supply.
 
 Real-time mode (auto-detected or forced) trims two things, in both
 single-tap and `--allaudio` mode. With pacing already preventing a
