@@ -613,6 +613,58 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     delete regionBitmap;
 }
 
+// Remembers where the cursor was last frame, for RefreshCursorRegion below
+// -- shared by every capture mode with dedicated cursor handling
+// (--experimental-screen-capture, --hybrid-capture,
+// --screen-capture-rcserver-method). Only one such mode is ever active in
+// a single run, so one global is enough. (-1, -1) is the "no previous
+// frame yet" sentinel -- a real cursor position is never negative.
+BPoint g_lastCursorPos(-1, -1);
+
+// Refreshes the screen region around the mouse cursor's current position
+// -- and, separately, wherever it was last frame, if that's a different
+// spot.
+//
+// A real, confirmed artifact: with only the *current* position's box
+// refreshed each frame (this function's own predecessor), a mouse-trail
+// ghosting artifact showed up in --experimental-screen-capture,
+// --hybrid-capture, and --screen-capture-rcserver-method -- every mode
+// with dedicated cursor handling -- but never in --tiled-capture, which
+// refreshes the entire screen every frame regardless, leaving nothing for
+// a stale cursor image to persist in. The mechanism: when the cursor
+// moves far enough between two consecutive frames that the old and new
+// boxes don't overlap, the *previous* frame's rendered cursor pixels --
+// baked into screenBitmap by BScreen itself, the same way everything else
+// this project captures is -- are never revisited by anything else (the
+// background there is cached, unlike a tracked window's own region), so
+// they persist indefinitely as a visible ghost until the cursor happens
+// to pass back through that exact spot.
+//
+// Fixed by also refreshing the *previous* frame's box, as its own
+// separate small, bounded read -- not by unioning the two rectangles
+// into one, which could balloon into a large, mostly-empty read if the
+// cursor jumped a long distance in one frame (e.g. a multi-monitor
+// warp). Two small reads stay small regardless of how far apart the two
+// positions are.
+static void RefreshCursorRegion(BScreen& screen, BBitmap* screenBitmap,
+        int nativeWidth, int nativeHeight) {
+    BPoint cursorPos;
+    uint32 cursorButtons;
+    get_mouse(&cursorPos, &cursorButtons);
+
+    BRect cursorRect(cursorPos.x - 8, cursorPos.y - 8,
+        cursorPos.x + 32, cursorPos.y + 32);
+    RefreshScreenRegion(cursorRect, screen, screenBitmap, nativeWidth, nativeHeight);
+
+    if (g_lastCursorPos.x >= 0 && g_lastCursorPos != cursorPos) {
+        BRect lastRect(g_lastCursorPos.x - 8, g_lastCursorPos.y - 8,
+            g_lastCursorPos.x + 32, g_lastCursorPos.y + 32);
+        RefreshScreenRegion(lastRect, screen, screenBitmap, nativeWidth, nativeHeight);
+    }
+
+    g_lastCursorPos = cursorPos;
+}
+
 // The --hybrid-capture counterpart to RefreshScreenRegion above: covers
 // the exact same rectangle, with the exact same per-frame correctness
 // guarantee (called unconditionally, every frame, for every tracked
@@ -2680,7 +2732,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.11.0";
+	    const char* localVersion = "v1.11.1";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
@@ -2742,15 +2794,10 @@ int main(int argc, char* argv[]) {
 
                 // Same reasoning for the mouse cursor: BScreen bakes it
                 // into the captured pixels, but it isn't a window, so
-                // nothing above ever refreshes it otherwise. A generous
-                // fixed-size box around its current position covers any
-                // cursor glyph regardless of exact shape.
-                BPoint cursorPos;
-                uint32 cursorButtons;
-                get_mouse(&cursorPos, &cursorButtons);
-                BRect cursorRect(cursorPos.x - 8, cursorPos.y - 8,
-                    cursorPos.x + 32, cursorPos.y + 32);
-                RefreshScreenRegion(cursorRect, screen, screenBitmap, width, height);
+                // nothing above ever refreshes it otherwise. See
+                // RefreshCursorRegion's own comment for why both its
+                // current *and* previous position get refreshed.
+                RefreshCursorRegion(screen, screenBitmap, width, height);
 
                 // Exactly one full-frame convert per frame, identical to
                 // the default path below -- screenBitmap by this point
@@ -2896,13 +2943,10 @@ int main(int argc, char* argv[]) {
                 // cursor moves every frame and isn't reported by anything
                 // the tile grid can key off, so it needs its own
                 // unconditional refresh every frame rather than waiting
-                // for its tile to come up in rotation.
-                BPoint cursorPos;
-                uint32 cursorButtons;
-                get_mouse(&cursorPos, &cursorButtons);
-                BRect cursorRect(cursorPos.x - 8, cursorPos.y - 8,
-                    cursorPos.x + 32, cursorPos.y + 32);
-                RefreshScreenRegion(cursorRect, screen, screenBitmap, width, height);
+                // for its tile to come up in rotation. See
+                // RefreshCursorRegion's own comment for why both its
+                // current *and* previous position get refreshed.
+                RefreshCursorRegion(screen, screenBitmap, width, height);
 
                 // Exactly one full-frame convert per frame, identical in
                 // shape to both other capture paths.

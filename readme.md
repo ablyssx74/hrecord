@@ -98,7 +98,10 @@ whatever an earlier run left behind in `/boot/home`.
   responsiveness gap. Can't be combined with `--experimental-screen-capture`
   or `--screen-capture-rcserver-method` (alternative engines, not
   stackable) — `--hybrid-capture` wins if more than one is passed.
-  Unconfirmed, not yet real-world tested. See "--hybrid-capture:
+  Real-world tested: felt like a mix of the two modes it combines
+  (accurately -- it is one), which is what led to `--tiled-capture`
+  instead; also shared the mouse-trail ghosting artifact confirmed in
+  `--experimental-screen-capture`, now fixed. See "--hybrid-capture:
   window-aware capture, rcserver-sized reads" below.
 - `hrecord start --tiled-capture` — **this is the default now**; passing
   it explicitly is accepted (for clarity, or old habit) but doesn't
@@ -279,6 +282,34 @@ background gets rebuilt every frame during that -- no visual artifacts,
 just no speedup for that specific moment. That's the correct choice (never
 risk a stale background sliver under a moving window), not a bug.
 
+**Mouse-trail ghosting, confirmed, with a fix pending re-test.** Real-world testing (inside
+a QEMU session, where the artifact stood out clearly against an otherwise
+glitch-free recording) found a visible cursor trail/ghosting artifact in
+this mode -- and, it turned out, in `--hybrid-capture` and
+`--screen-capture-rcserver-method` too, every mode with its own dedicated
+cursor handling. `--tiled-capture` never showed it, which is what
+pointed at the actual cause: those three modes all refreshed a small,
+fixed-size box around the cursor's *current* position only, every frame.
+When the cursor moved far enough between two consecutive frames that the
+old and new boxes stopped overlapping, the *previous* frame's rendered
+cursor pixels -- baked into the shared capture buffer by `BScreen`
+itself, the same way everything else here is captured -- were never
+revisited by anything else (the background there is cached, unlike a
+tracked window's own region), so they persisted indefinitely as a
+visible ghost until the cursor happened to pass back through that exact
+spot. `--tiled-capture` never had this problem because it refreshes the
+*entire* screen every frame regardless, leaving nothing for a stale
+cursor image to survive in.
+
+Fixed by also refreshing wherever the cursor *was* last frame, as its
+own separate small, bounded read -- not by merging the two rectangles
+into one larger one, which could balloon into a large, mostly-empty read
+if the cursor jumped a long distance in a single frame (e.g. a
+multi-monitor warp). Two small reads stay small regardless of how far
+apart the two positions are. All three affected modes now share one
+`RefreshCursorRegion()` helper instead of each carrying its own copy of
+the (buggy) fixed-box logic.
+
 **Unconfirmed pending real-world testing**, including assumptions worth
 flagging if something looks visibly wrong:
 
@@ -359,7 +390,9 @@ whichever tile it happens to be sitting in to come up in the round-robin
 rotation would make it look laggy/stale. Instead the cursor's own region
 gets an unconditional refresh (reusing the same helper the window-aware
 mode uses for its own cursor handling) every single frame, on top of the
-tile rotation.
+tile rotation -- see `--experimental-screen-capture`'s own section above
+for a real mouse-trail ghosting artifact confirmed in this mode too, and
+its fix (shared by all three modes with dedicated cursor handling).
 
 Exactly one full-frame `sws_scale` still runs per frame, over the whole
 composited capture buffer at once -- identical in shape to both other
@@ -501,12 +534,25 @@ correctness, without either mode's own known weakness: no round-robin
 staleness, no drag fragmentation, no full-screen-visualizer pathological
 case (this never touches the screen-wide blind tiling
 `--screen-capture-rcserver-method` does -- only tracked windows and the
-cursor get tiled). The cursor itself is still refreshed with a single
-plain `RefreshScreenRegion` call, unchanged -- its own capture rectangle
-is already smaller than one tile, so there's nothing to gain from
-chunking it further.
+cursor get tiled). The cursor itself is still refreshed via
+`RefreshCursorRegion` (see `--experimental-screen-capture`'s own
+section), unchanged from the other two modes with dedicated cursor
+handling -- its own capture rectangle is already smaller than one tile,
+so there's nothing to gain from chunking it further.
 
-**Unconfirmed, not yet real-world tested.** Open questions:
+**Real-world tested.** This was actually the *first* of the "hybrid"
+designs tried, before `--tiled-capture` existed. The verdict: it felt
+like a mix of `--experimental-screen-capture` and
+`--screen-capture-rcserver-method` -- accurately, since that's exactly
+what it is -- which is what led to trying a hybrid of `--raw-capture`
+and `--screen-capture-rcserver-method` instead (dropping window tracking
+entirely rather than keeping it), which became `--tiled-capture` and was
+eventually promoted to the default. This mode also shared the mouse-trail
+ghosting artifact confirmed in `--experimental-screen-capture`'s own
+section, with the same fix now applied. Not directly compared against
+`--tiled-capture` head to head on real hardware.
+
+**Open questions:**
 
 - Whether the hypothesis is actually correct -- that call *size*, not
   just call *count* or the presence of window tracking, is what drove
@@ -552,7 +598,11 @@ consequences fall out of that for free:
   mode in this project. The cursor is wherever it is, and every tile
   refreshes every frame regardless, so there's nothing that could ever
   leave it looking stale -- the special-case code every other mode needs
-  for this simply isn't necessary here.
+  for this simply isn't necessary here. This turned out to matter for
+  real: a mouse-trail ghosting artifact was confirmed in every *other*
+  mode's own dedicated cursor handling (see
+  `--experimental-screen-capture`'s own section), and `--tiled-capture`
+  never showed it, which is what pointed at the actual cause.
 
 **The trade-off against `--hybrid-capture`:** this mode can't skip
 anything the way a cached background can. The entire screen is re-read
