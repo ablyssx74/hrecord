@@ -880,7 +880,21 @@ bool SetupAudioEncoder(AVFormatContext* fmtCtx, const media_raw_audio_format& ra
 
     AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
     int channels = raw.channel_count > 0 ? (int)raw.channel_count : 2;
-    int sampleRate = raw.frame_rate > 0 ? (int)(raw.frame_rate + 0.5f) : 44100;
+    int sourceRate = raw.frame_rate > 0 ? (int)(raw.frame_rate + 0.5f) : 44100;
+
+    // libvorbis's own encoder setup only reliably covers a handful of
+    // "standard" rates -- avcodec_open2() for "libvorbis" fails outright
+    // ("Invalid Argument") at unusual/high rates like 96000 or 192000,
+    // confirmed once real-time audio was actually running the system mixer
+    // at those rates. Vorbis output doesn't need to match the source rate
+    // 1:1 anyway -- desktop/app audio has no meaningful content above
+    // ~24kHz -- so the encoder always targets a fixed, known-good rate, and
+    // the resampler set up below converts from whatever the live source
+    // rate actually is. Since this only ever downsamples (or leaves the
+    // rate unchanged), EncodeAudioSamples' resample buffer -- sized to the
+    // *input* sample count -- stays safely sized; swr_convert() can't
+    // produce more output samples than input samples when downsampling.
+    int sampleRate = sourceRate > 48000 ? 48000 : sourceRate;
 
     av_channel_layout_default(&codecCtx->ch_layout, channels);
     codecCtx->sample_rate = sampleRate;
@@ -923,7 +937,7 @@ bool SetupAudioEncoder(AVFormatContext* fmtCtx, const media_raw_audio_format& ra
 
     SwrContext* swr = nullptr;
     int swrErr = swr_alloc_set_opts2(&swr, &codecCtx->ch_layout, AV_SAMPLE_FMT_FLTP,
-        sampleRate, &inLayout, HaikuAudioFormatToAV(raw.format), sampleRate, 0, nullptr);
+        sampleRate, &inLayout, HaikuAudioFormatToAV(raw.format), sourceRate, 0, nullptr);
     if (swrErr >= 0 && swr)
         swrErr = swr_init(swr);
     av_channel_layout_uninit(&inLayout);
@@ -1757,6 +1771,33 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
             media_input restoredInput;
             err = roster->Connect(originalAppOutput.source, freeInput.destination,
                 &restoreFormat, &restoredOutput, &restoredInput);
+
+            // Connect() only takes restoreFormat as a request -- the Mixer's
+            // actual reply isn't guaranteed to match it exactly, and the app
+            // on the other end of originalAppOutput.source has no way to
+            // find out its connection was ever touched (this whole
+            // hijack/restore cycle happens entirely from hrecord's process,
+            // via the roster, without that app's own knowledge). A drifted
+            // frame rate or buffer size here means that app keeps running
+            // with internal buffers/timing sized for the OLD connection
+            // while actually fed by the NEW one -- exactly the kind of
+            // mismatch that produced static/garbage audio in practice
+            // (confirmed against Rakarrack). Surfacing the mismatch here is
+            // the most hrecord can do about it: there's no notification
+            // path to tell the other app to resync, so restarting it is
+            // the only real fix once this fires.
+            if (err == B_OK) {
+                const media_raw_audio_format& before = originalAppOutput.format.u.raw_audio;
+                const media_raw_audio_format& after = restoredOutput.format.u.raw_audio;
+                if (before.frame_rate != after.frame_rate || before.buffer_size != after.buffer_size) {
+                    std::cerr << "[!] Warning: reconnected app's audio format drifted from what it "
+                        "was before hrecord touched it (" << before.frame_rate << " Hz / "
+                        << before.buffer_size << "-byte buffers -> " << after.frame_rate
+                        << " Hz / " << after.buffer_size << "-byte buffers). The app has no way to "
+                        "know its connection changed and may now produce static or garbled audio "
+                        "until it's restarted." << std::endl;
+                }
+            }
         }
         roster->ReleaseNode(mixerNode);
     }
@@ -2732,7 +2773,7 @@ int main(int argc, char* argv[]) {
 
     {
 	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.11.1";
+	    const char* localVersion = "v1.11.2";
 
 	    char updateCmd[1024];
 	    snprintf(updateCmd, sizeof(updateCmd),
