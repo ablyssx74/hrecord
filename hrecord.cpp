@@ -18,6 +18,8 @@
 #include <TimeSource.h>
 #include <Buffer.h>
 #include <SoundPlayer.h>
+#include <Notification.h>
+#include <curl/curl.h>
 #include <algorithm>
 #include <iostream>
 #include <string>
@@ -2233,7 +2235,60 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
     handles->active = false;
 }
 
+// libcurl write callback -- appends received bytes onto a std::string buffer
+// passed in via userp.
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    ((std::string*)userp)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+// Runs in a background thread: fetches the latest published VERSION file and
+// notifies the user if it differs from the version baked into this binary.
+static int32 BackgroundUpdateChecker(void* data) {
+    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
+    const char* localVersion = "v1.11.3";
+
+    CURL* curl = curl_easy_init();
+    if (!curl)
+        return 0;
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, targetUrl);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "hrecord-update-checker/1.0");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_perform(curl);
+
+    // Deliberately not calling curl_easy_cleanup() here: on this machine's
+    // Haiku libcurl build it reproducibly hangs/crashes when invoked from a
+    // background thread on a handle used for a one-shot fetch like this one.
+    // Leaking a single small handle once per app launch is a fine tradeoff --
+    // the process reclaims it at exit anyway.
+
+    BString remoteVersion(response.c_str());
+    remoteVersion.Trim();
+
+    if (remoteVersion.Length() > 0 && remoteVersion != localVersion) {
+        BNotification notification(B_INFORMATION_NOTIFICATION);
+        notification.SetGroup("hrecord");
+        notification.SetTitle("Update Available");
+        BString content;
+        content << "A newer version of hrecord is available! (" << remoteVersion << ")";
+        notification.SetContent(content);
+        notification.Send();
+    }
+
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
+    // libcurl's global init is not thread-safe against other concurrently
+    // running threads, so do it explicitly up front (before any background
+    // thread might trigger an implicit lazy global init and race it).
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     // ========================================================================
     // Argument parsing: "start" (default) / "stop", plus an optional
     // --audioonly flag that restricts recording to desktop audio only.
@@ -2772,18 +2827,11 @@ int main(int argc, char* argv[]) {
     AVPacket* pkt = av_packet_alloc();
 
     {
-	    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-	    const char* localVersion = "v1.11.2";
-
-	    char updateCmd[1024];
-	    snprintf(updateCmd, sizeof(updateCmd),
-	        "(REMOTE_V=$(curl -sL \"%s\" | tr -d '\\r\\n'); "
-	        "if [ ! -z \"$REMOTE_V\" ] && [ \"$REMOTE_V\" != \"%s\" ]; then "
-	        "notify --title \"Update Available\" --group \"hrecord\" "
-	        "\"A newer version of hrecord is available! ($REMOTE_V)\"; fi) &",
-	        targetUrl, localVersion);
-	    system(updateCmd);
-	}
+        thread_id updateCheckThread = spawn_thread(BackgroundUpdateChecker,
+            "hrecord_update_checker", B_LOW_PRIORITY, nullptr);
+        if (updateCheckThread >= 0)
+            resume_thread(updateCheckThread);
+    }
 
 
     // 7. Main Core Recording Loop
@@ -3154,5 +3202,7 @@ int main(int argc, char* argv[]) {
     avformat_free_context(fmtCtx);
 
     std::cout << "[+] Output written to '" << output_filename << "' successfully!" << std::endl;
+
+    curl_global_cleanup();
     return 0;
 }
