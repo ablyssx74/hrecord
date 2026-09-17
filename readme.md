@@ -14,7 +14,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--raw-capture] [--list-audio-inputs]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--raw-capture] [--list-audio-inputs] [--logfps]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -124,6 +124,17 @@ whatever an earlier run left behind in `/boot/home`.
 - `hrecord --list-audio-inputs` — lists the apps currently feeding the
   System Mixer (i.e. currently playing sound). `--audioonly` needs at least
   one.
+- `hrecord start --logfps` — prints the *actual* capture rate once per
+  second while recording (frames written vs. the chosen profile's own
+  target fps, and how many of those frames took longer than the target
+  frame interval to produce — i.e. genuinely fell behind pace rather than
+  being intentionally paced down by the profile's own snooze), plus a
+  final summary at shutdown. CPU usage alone doesn't tell you this: a slow
+  disk write blocks the capture loop without costing a CPU cycle, so a
+  recording can be falling well short of its target fps while `top`/the
+  usual monitors show the process sitting mostly idle. Ignored (with a
+  note) under `--audioonly`, since there's no frame pacing to report on
+  there.
 
 ## Screen recording quality profiles
 
