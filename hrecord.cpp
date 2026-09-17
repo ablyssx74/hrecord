@@ -2246,7 +2246,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.11.5";
+    const char* localVersion = "v1.11.6";
 
     CURL* curl = curl_easy_init();
     if (!curl)
@@ -2470,9 +2470,9 @@ int main(int argc, char* argv[]) {
     if (logFps) {
         std::cout << "[i] --logfps: printing actual capture rate once per second (frames "
             "written vs. this profile's target fps, plus how many of those frames took "
-            "longer than the target frame interval), and a final summary at shutdown -- "
-            "useful for telling a genuinely slow capture/encode/disk-write pace apart from "
-            "normal playback smoothness." << std::endl;
+            "longer than the target frame interval), a per-frame capture-vs-encode+write "
+            "time split, and a final summary at shutdown -- useful for telling a genuinely "
+            "slow capture/encode/disk-write pace apart from normal playback smoothness." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -2872,11 +2872,26 @@ int main(int argc, char* argv[]) {
         long long logFpsTotalLateFrames = 0;
         bigtime_t logFpsRecordingStart = system_time();
 
+        // Phase split, so a slow iteration can be pinned on capture
+        // (BScreen/app_server IPC) vs. everything after it (sws_scale,
+        // avcodec_send_frame/receive_packet, av_interleaved_write_frame --
+        // the latter is where a slow disk shows up). captureElapsed is set
+        // by whichever capture-mode branch runs, right before its own
+        // sws_getCachedContext() call; encodeElapsed is just what's left of
+        // the iteration after that.
+        bigtime_t logFpsWindowCaptureUs = 0;
+        bigtime_t logFpsWindowEncodeUs = 0;
+        int logFpsWindowIterations = 0;
+        long long logFpsTotalCaptureUs = 0;
+        long long logFpsTotalEncodeUs = 0;
+        long long logFpsTotalIterations = 0;
+
         while (g_running) {
             bigtime_t loopIterationStart = system_time();
             bool frameWritten = false; // --logfps: set true below in whichever
                                         // capture-mode branch actually sends a
                                         // frame to the encoder this iteration
+            bigtime_t captureElapsed = 0; // --logfps: see its declaration above the loop
 
             if (g_experimentalScreenCapture || g_hybridCapture) {
                 std::vector<TrackedWindowRect> currentWindows;
@@ -2926,6 +2941,7 @@ int main(int argc, char* argv[]) {
                 // window/cursor region, so there's only ever one scale
                 // operation with full context everywhere, which is what
                 // eliminates the per-region seam artifact by construction.
+                captureElapsed = system_time() - loopIterationStart; // --logfps
                 {
                     void* pixelBuffer = screenBitmap->Bits();
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
@@ -3072,6 +3088,7 @@ int main(int argc, char* argv[]) {
 
                 // Exactly one full-frame convert per frame, identical in
                 // shape to both other capture paths.
+                captureElapsed = system_time() - loopIterationStart; // --logfps
                 {
                     void* pixelBuffer = screenBitmap->Bits();
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
@@ -3101,6 +3118,7 @@ int main(int argc, char* argv[]) {
                 // frame, no tiling -- see g_rawCapture's own comment for
                 // why this is still here as an explicit opt-in.
                 void* pixelBuffer = screenBitmap->Bits();
+                captureElapsed = system_time() - loopIterationStart; // --logfps
 
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
                                               outWidth, outHeight, videoCodecCtx->pix_fmt,
@@ -3136,6 +3154,7 @@ int main(int argc, char* argv[]) {
                 // already returned before reaching this point.
                 RefreshScreenRegionTiled(BRect(0, 0, width - 1, height - 1), screen,
                     screenBitmap, width, height);
+                captureElapsed = system_time() - loopIterationStart; // --logfps
 
                 void* pixelBuffer = screenBitmap->Bits();
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
@@ -3176,6 +3195,14 @@ int main(int argc, char* argv[]) {
                     logFpsTotalLateFrames++;
                 }
 
+                bigtime_t encodeElapsed = loopIterationElapsed - captureElapsed;
+                logFpsWindowCaptureUs += captureElapsed;
+                logFpsWindowEncodeUs += encodeElapsed;
+                logFpsWindowIterations++;
+                logFpsTotalCaptureUs += captureElapsed;
+                logFpsTotalEncodeUs += encodeElapsed;
+                logFpsTotalIterations++;
+
                 bigtime_t logFpsWindowElapsed = system_time() - logFpsWindowStart;
                 if (logFpsWindowElapsed >= 1000000) {
                     double actualFps =
@@ -3189,11 +3216,21 @@ int main(int argc, char* argv[]) {
                             << " frame(s) over budget (>= "
                             << (frameDelay / 1000.0) << "ms)";
                     }
+                    if (logFpsWindowIterations > 0) {
+                        std::cout << " -- avg "
+                            << (logFpsWindowCaptureUs / 1000.0 / logFpsWindowIterations)
+                            << "ms capture / "
+                            << (logFpsWindowEncodeUs / 1000.0 / logFpsWindowIterations)
+                            << "ms encode+write per frame";
+                    }
                     std::cout << std::endl;
 
                     logFpsWindowStart = system_time();
                     logFpsWindowFrames = 0;
                     logFpsWindowLateFrames = 0;
+                    logFpsWindowCaptureUs = 0;
+                    logFpsWindowEncodeUs = 0;
+                    logFpsWindowIterations = 0;
                 }
             }
 
@@ -3214,7 +3251,15 @@ int main(int argc, char* argv[]) {
                 << "), " << logFpsTotalLateFrames << " frame(s) over budget ("
                 << (logFpsTotalFrames > 0
                     ? (100.0 * logFpsTotalLateFrames / logFpsTotalFrames) : 0.0)
-                << "%)." << std::endl;
+                << "%)";
+            if (logFpsTotalIterations > 0) {
+                std::cout << " -- avg "
+                    << (logFpsTotalCaptureUs / 1000.0 / logFpsTotalIterations)
+                    << "ms capture / "
+                    << (logFpsTotalEncodeUs / 1000.0 / logFpsTotalIterations)
+                    << "ms encode+write per frame";
+            }
+            std::cout << "." << std::endl;
         }
     }
 

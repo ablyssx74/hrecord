@@ -128,13 +128,16 @@ whatever an earlier run left behind in `/boot/home`.
   second while recording (frames written vs. the chosen profile's own
   target fps, and how many of those frames took longer than the target
   frame interval to produce — i.e. genuinely fell behind pace rather than
-  being intentionally paced down by the profile's own snooze), plus a
-  final summary at shutdown. CPU usage alone doesn't tell you this: a slow
-  disk write blocks the capture loop without costing a CPU cycle, so a
-  recording can be falling well short of its target fps while `top`/the
-  usual monitors show the process sitting mostly idle. Ignored (with a
-  note) under `--audioonly`, since there's no frame pacing to report on
-  there.
+  being intentionally paced down by the profile's own snooze), plus each
+  line's average time split between capture (the screen-read step) and
+  encode+write (scale, encode, mux to disk), and a final summary with the
+  same split at shutdown. CPU usage alone doesn't tell you this: a slow
+  disk write or a slow screen-capture IPC call both block the capture loop
+  without costing a CPU cycle, so a recording can be falling well short of
+  its target fps while `top`/the usual monitors show the process sitting
+  mostly idle — the capture/encode+write split is what tells those two
+  apart. Ignored (with a note) under `--audioonly`, since there's no frame
+  pacing to report on there.
 
 ## Screen recording quality profiles
 

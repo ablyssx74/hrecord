@@ -1,7 +1,7 @@
 # hrecord Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
-VERSION = 1.11.5
+VERSION = 1.11.6
 PACKAGE_DIR := build/package
 DUMMY_PC_PATH := $(shell pwd)/build/pkgconfig
 
