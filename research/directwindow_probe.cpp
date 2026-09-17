@@ -419,6 +419,15 @@ static int32 ProbeThreadEntry(void* arg) {
 }
 
 int main(int argc, char** argv) {
+    // Force line buffering regardless of whether stdout is a real TTY --
+    // ProbeThreadEntry's prints happen on a spawned thread, and if this
+    // process exits abnormally (crash, or app_server force-killing it for
+    // being slow to answer DirectConnected()) with stdout fully buffered
+    // instead of line buffered, everything since the last flush is lost
+    // silently: the shell just gets its prompt back with no error and no
+    // indication anything after the last flushed line ever ran.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--desktop-read-test") == 0) {
             g_desktopReadTest = true;
