@@ -53,9 +53,9 @@
 //     buffer" hypothesis this whole investigation hinges on
 //
 // Build (from this directory): make
-// (If linking fails with undefined references to BDirectWindow's symbols,
-// BDirectWindow may still live in Haiku's separate Game Kit lib on your
-// system -- add -lgame to LIBS in Makefile and retry.)
+// (BDirectWindow's own symbols live in Haiku's separate Game Kit lib, not
+// libbe itself -- confirmed by a real link failure; the Makefile already
+// links -lgame.)
 //
 // Run: ./directwindow_probe
 //      ./directwindow_probe --desktop-read-test   (see warning below)
