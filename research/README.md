@@ -19,9 +19,9 @@ cd research
 make
 ```
 
-If linking fails on undefined references to `BDirectWindow`'s own symbols,
-uncomment `LIBS_EXTRA = -lgame` in this directory's `Makefile` and rebuild
--- some Haiku versions keep it in a separate Game Kit library.
+Already links `-lgame` -- `BDirectWindow`'s own symbols live in Haiku's
+separate Game Kit library, not `libbe` itself (confirmed by a real link
+failure on real hardware).
 
 ## Run
 
