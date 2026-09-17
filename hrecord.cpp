@@ -2246,7 +2246,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.11.3";
+    const char* localVersion = "v1.11.4";
 
     CURL* curl = curl_easy_init();
     if (!curl)
@@ -2260,12 +2260,7 @@ static int32 BackgroundUpdateChecker(void* data) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_perform(curl);
-
-    // Deliberately not calling curl_easy_cleanup() here: on this machine's
-    // Haiku libcurl build it reproducibly hangs/crashes when invoked from a
-    // background thread on a handle used for a one-shot fetch like this one.
-    // Leaking a single small handle once per app launch is a fine tradeoff --
-    // the process reclaims it at exit anyway.
+    curl_easy_cleanup(curl);
 
     BString remoteVersion(response.c_str());
     remoteVersion.Trim();
