@@ -277,7 +277,7 @@ static int32 ProbeThreadEntry(void* arg) {
     int clipHeight = info.clip_bounds.bottom - info.clip_bounds.top + 1;
     if (clipWidth > 0 && clipHeight > 0) {
         size_t ownRegionBytes = (size_t)clipHeight * info.bytes_per_row;
-        const uint8_t* ownRegionStart = info.bits
+        const uint8_t* ownRegionStart = (const uint8_t*)info.bits
             + (size_t)info.clip_bounds.top * info.bytes_per_row;
 
         printf("\n[*] Timing 30 reads of the window's own clip region "
@@ -333,7 +333,7 @@ static int32 ProbeThreadEntry(void* arg) {
         int windowScreenY = (int)windowFrame.top;
         long offsetBytes = (long)(probeScreenY - windowScreenY) * info.bytes_per_row
             + (long)(probeScreenX - windowScreenX) * bytesPerPixel;
-        const uint8_t* probePtr = info.bits + offsetBytes;
+        const uint8_t* probePtr = (const uint8_t*)info.bits + offsetBytes;
 
         printf("    Screen frame: %dx%d. Probing screen point (%d,%d) -- "
             "window origin is (%d,%d), so that's buffer offset %ld from "
@@ -385,7 +385,7 @@ static int32 ProbeThreadEntry(void* arg) {
             // hrecord: how fast would a whole-screen capture be through
             // this pointer, if the mismatch check above says it's real.
             size_t fullBytes = (size_t)(screenFrame.Height() + 1) * info.bytes_per_row;
-            const uint8_t* fullStart = info.bits
+            const uint8_t* fullStart = (const uint8_t*)info.bits
                 - (size_t)windowScreenY * info.bytes_per_row
                 - (size_t)windowScreenX * bytesPerPixel;
             g_inRiskyRead = 1;
