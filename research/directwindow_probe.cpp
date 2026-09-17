@@ -232,7 +232,9 @@ static int32 ProbeThreadEntry(void* arg) {
            "    exclusive mode might still work, but that takes over the\n"
            "    whole display and isn't viable for a background recorder.)\n\n");
 
+    printf("[*] Calling Show()...\n");
     window->Show();
+    printf("[*] Show() returned.\n");
 
     printf("[*] Waiting for DirectConnected() (up to 5s)...\n");
     if (!window->WaitForConnect(5000000)) {
