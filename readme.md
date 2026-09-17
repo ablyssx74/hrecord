@@ -186,6 +186,43 @@ architectural property of `app_server` itself, not something fixable from
 outside it. The profiles get you the rest of the way there by controlling
 how often and how expensively that contention happens.
 
+### Real hardware vs. virtual machines
+
+`--logfps`'s capture-vs-encode+write split (see above) makes a real
+difference visible: how much of that "practical ceiling" is `app_server`
+itself struggling on real graphics hardware, versus something a VM guest
+doesn't run into at all.
+
+**On real hardware**, capture is the overwhelming majority of every
+frame's cost, at every quality profile. Real-world `--logfps` runs on real
+hardware showed ~730-760ms/frame under the default tiled capture (nearly
+all of it capture, not encode+write) and ~400-425ms/frame even with
+`--raw-capture`'s single whole-screen read — consistent across Low/Medium/
+High, since only the encode side (a consistently small 15-60ms) responds
+to profile choice at all; capture itself pays the same cost regardless of
+target resolution/fps. On this hardware, the default tiled capture is
+still the better trade-off: `--raw-capture`, despite being faster in raw
+frame time, pushes the overall frame rate low enough (well under 3fps)
+that the mouse cursor in the resulting recording becomes practically
+unusable.
+
+**Inside a VM**, that bottleneck largely disappears. A Haiku VM guest's
+software-rendered graphics stack services capture requests in single-digit
+milliseconds instead of hundreds — one real-world `--logfps` run inside a
+VM (itself hosted on Haiku) landed at ~20.6fps average against Medium's
+24fps target, capture averaging ~2.7ms/frame, only ~5% of frames over
+budget. In a VM, `--raw-capture` is the clear winner: one capture call per
+frame instead of tiled capture's ~200+ small reads, with none of the real-
+hardware mouse-responsiveness trade-off, since the frame rate stays high
+enough for cursor motion to look smooth either way.
+
+**Bottom line:** this is a characteristic of Haiku's `app_server` on real
+graphics hardware, not something hrecord's own code controls (see
+"Practical ceiling" above). Running Haiku as a VM guest — `--raw-capture`
+is worth trying; it's likely to significantly outperform the default
+tiled capture there. On real hardware, the default tiled capture remains
+the better trade-off despite its lower absolute frame rate.
+
 ## `--experimental-screen-capture`: window-aware capture
 
 A plain whole-screen read (what `--raw-capture` still does today, and
