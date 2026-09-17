@@ -440,6 +440,17 @@ int main(int argc, char** argv) {
 
     BRect frame(200, 150, 200 + 319, 150 + 239);
     ProbeWindow* window = new ProbeWindow(frame);
+    // A freshly constructed BWindow starts out locked by the thread that
+    // created it (this one). ProbeThreadEntry -- running on a different,
+    // spawned thread -- calls window->Show(), which needs that same lock;
+    // without unlocking it here first, that Lock() call blocks forever
+    // waiting on a lock only this (the main) thread could ever release,
+    // and this thread has already moved on into app.Run() by then. A real
+    // debugger backtrace on real hardware confirmed exactly this: the
+    // probe thread stuck in BWindow::Show() -> BLooper::Lock() ->
+    // _kern_acquire_sem_etc, not anywhere related to DirectWindow/
+    // app_server/the accelerant at all.
+    window->Unlock();
 
     thread_id probeThread = spawn_thread(ProbeThreadEntry, "probe_thread",
         B_NORMAL_PRIORITY, window);
