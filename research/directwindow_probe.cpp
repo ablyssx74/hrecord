@@ -232,6 +232,16 @@ static int32 ProbeThreadEntry(void* arg) {
            "    exclusive mode might still work, but that takes over the\n"
            "    whole display and isn't viable for a background recorder.)\n\n");
 
+    // The thread making a BWindow's *first* Show() call (which internally
+    // triggers BLooper::Run(), spawning the window's own message-handling
+    // thread for the first time) must hold the window's lock at that exact
+    // moment -- Run()'s own AssertLocked() enforces this, and Haiku's
+    // debugger caught it firing for real: main() unlocked the window after
+    // construction (fixing the earlier cross-thread deadlock), but nothing
+    // ever re-locked it on this thread before Show(). Run() itself hands
+    // the lock off to the new message thread as part of starting it, so
+    // this lock is deliberately not paired with a later Unlock() here.
+    window->Lock();
     printf("[*] Calling Show()...\n");
     window->Show();
     printf("[*] Show() returned.\n");
