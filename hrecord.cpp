@@ -2246,7 +2246,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.11.4";
+    const char* localVersion = "v1.11.5";
 
     CURL* curl = curl_easy_init();
     if (!curl)
@@ -2298,6 +2298,7 @@ int main(int argc, char* argv[]) {
     bool rawCapture = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
+    bool logFps = false;
     int profileIndex = 1; // default: medium
 
     for (int i = 1; i < argc; i++) {
@@ -2323,6 +2324,8 @@ int main(int argc, char* argv[]) {
             rawCapture = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
             listAudioInputs = true;
+        } else if (strcmp(argv[i], "--logfps") == 0) {
+            logFps = true;
         } else if (strcmp(argv[i], "--low") == 0) {
             profileIndex = 0;
         } else if (strcmp(argv[i], "--medium") == 0) {
@@ -2333,7 +2336,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
                 "[--allaudio] [--realtime] [--experimental-screen-capture] "
                 "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
-                "[--raw-capture] [--list-audio-inputs]" << std::endl;
+                "[--raw-capture] [--list-audio-inputs] [--logfps]" << std::endl;
             return 0;
         }
     }
@@ -2357,6 +2360,11 @@ int main(int argc, char* argv[]) {
         std::cout << "[i] --raw-capture only affects video capture; ignored under "
             "--audioonly." << std::endl;
         rawCapture = false;
+    }
+    if (logFps && audioOnly) {
+        std::cout << "[i] --logfps only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        logFps = false;
     }
     if (tiledCapture) {
         // --tiled-capture is the default now -- accepted so it doesn't
@@ -2457,6 +2465,14 @@ int main(int argc, char* argv[]) {
         std::cout << "[i] --raw-capture: one plain full-screen read per frame, no tiling -- "
             "the original default, kept available now that tiled reads are the default "
             "instead (see readme.md)." << std::endl;
+    }
+
+    if (logFps) {
+        std::cout << "[i] --logfps: printing actual capture rate once per second (frames "
+            "written vs. this profile's target fps, plus how many of those frames took "
+            "longer than the target frame interval), and a final summary at shutdown -- "
+            "useful for telling a genuinely slow capture/encode/disk-write pace apart from "
+            "normal playback smoothness." << std::endl;
     }
 
     // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
@@ -2838,8 +2854,29 @@ int main(int argc, char* argv[]) {
         }
     } else {
         int frameDelay = 1000000 / profile.fps; // microseconds per frame at this profile's fps
+
+        // --logfps diagnostics: how many frames actually got written each
+        // wall-clock second, versus this profile's own target, plus how many
+        // of those took longer than frameDelay to produce (i.e. genuinely
+        // fell behind pace rather than just being intentionally throttled by
+        // the snooze() below). See the section comment above kVideoProfiles
+        // for the report this was added to help diagnose: a mismatch here
+        // can look like "smooth" or "choppy" without any CPU usage to show
+        // for it, e.g. a slow disk write blocks this loop without costing a
+        // CPU cycle. logFpsTotalFrames/logFpsRecordingStart also feed the
+        // final summary printed at shutdown (section 8).
+        bigtime_t logFpsWindowStart = system_time();
+        int logFpsWindowFrames = 0;
+        int logFpsWindowLateFrames = 0;
+        long long logFpsTotalFrames = 0;
+        long long logFpsTotalLateFrames = 0;
+        bigtime_t logFpsRecordingStart = system_time();
+
         while (g_running) {
             bigtime_t loopIterationStart = system_time();
+            bool frameWritten = false; // --logfps: set true below in whichever
+                                        // capture-mode branch actually sends a
+                                        // frame to the encoder this iteration
 
             if (g_experimentalScreenCapture || g_hybridCapture) {
                 std::vector<TrackedWindowRect> currentWindows;
@@ -2905,6 +2942,7 @@ int main(int argc, char* argv[]) {
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
                 if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                    frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
                         pkt->stream_index = videoStream->index;
@@ -3050,6 +3088,7 @@ int main(int argc, char* argv[]) {
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
                 if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                    frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
                         pkt->stream_index = videoStream->index;
@@ -3077,6 +3116,7 @@ int main(int argc, char* argv[]) {
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
                 if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                    frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
                         pkt->stream_index = videoStream->index;
@@ -3111,6 +3151,7 @@ int main(int argc, char* argv[]) {
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
                 if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                    frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
                         pkt->stream_index = videoStream->index;
@@ -3121,11 +3162,59 @@ int main(int argc, char* argv[]) {
             }
 
             bigtime_t loopIterationElapsed = system_time() - loopIterationStart;
+
+            if (logFps) {
+                if (frameWritten) {
+                    logFpsWindowFrames++;
+                    logFpsTotalFrames++;
+                }
+                // ">=" rather than ">": exactly using the whole budget still
+                // means there was nothing left to snooze away below, i.e.
+                // this iteration was not throttled by choice.
+                if (loopIterationElapsed >= frameDelay) {
+                    logFpsWindowLateFrames++;
+                    logFpsTotalLateFrames++;
+                }
+
+                bigtime_t logFpsWindowElapsed = system_time() - logFpsWindowStart;
+                if (logFpsWindowElapsed >= 1000000) {
+                    double actualFps =
+                        logFpsWindowFrames * 1000000.0 / logFpsWindowElapsed;
+                    std::cout << "[fps] " << logFpsWindowFrames << " frame(s) in "
+                        << (logFpsWindowElapsed / 1000000.0) << "s -- " << actualFps
+                        << " fps actual vs " << profile.fps << " fps target ("
+                        << profile.name << ")";
+                    if (logFpsWindowLateFrames > 0) {
+                        std::cout << ", " << logFpsWindowLateFrames
+                            << " frame(s) over budget (>= "
+                            << (frameDelay / 1000.0) << "ms)";
+                    }
+                    std::cout << std::endl;
+
+                    logFpsWindowStart = system_time();
+                    logFpsWindowFrames = 0;
+                    logFpsWindowLateFrames = 0;
+                }
+            }
+
             if (loopIterationElapsed < frameDelay) {
                 snooze(frameDelay - loopIterationElapsed);
             } else {
                 snooze(1000);
             }
+        }
+
+        if (logFps) {
+            bigtime_t totalElapsed = system_time() - logFpsRecordingStart;
+            double overallFps = totalElapsed > 0
+                ? logFpsTotalFrames * 1000000.0 / totalElapsed : 0.0;
+            std::cout << "[fps] Summary: " << logFpsTotalFrames << " frame(s) written over "
+                << (totalElapsed / 1000000.0) << "s -- " << overallFps
+                << " fps average vs " << profile.fps << " fps target (" << profile.name
+                << "), " << logFpsTotalLateFrames << " frame(s) over budget ("
+                << (logFpsTotalFrames > 0
+                    ? (100.0 * logFpsTotalLateFrames / logFpsTotalFrames) : 0.0)
+                << "%)." << std::endl;
         }
     }
 
