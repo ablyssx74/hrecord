@@ -1,5 +1,23 @@
 # Research: BDirectWindow as a faster capture path
 
+## Result: ruled out, on real hardware
+
+`./directwindow_probe` on real Haiku hardware (the same machine whose
+`--logfps` numbers are documented in the main readme's "Real hardware vs.
+virtual machines" section) reported `SupportsWindowMode(): false` --
+windowed `BDirectWindow` isn't available on this driver at all. The only
+alternative, `SetFullScreen(true)`, takes over the entire display, which
+defeats the point of a background recorder (it needs the user's other
+windows to stay usable while it captures them). So this path is a dead
+end here, bounded by Haiku's own driver/`app_server` architecture on this
+hardware -- not something reachable from hrecord's own code, through this
+API or any other. hrecord's actual capture code was never touched based
+on this; the default tiled capture (real hardware) / `--raw-capture` (VM
+guest) split documented in the main readme stands as the practical
+answer. Kept here, unbuilt by hrecord's own Makefile, as a record of what
+was tried and why, so this doesn't get re-investigated from scratch later
+on the same hardware class.
+
 Exploratory only -- not part of hrecord itself, not built by hrecord's own
 `make`/`make release`. See `directwindow_probe.cpp`'s own top comment for
 the full rationale; short version: hrecord's `--logfps` diagnostics showed

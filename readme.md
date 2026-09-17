@@ -223,6 +223,14 @@ is worth trying; it's likely to significantly outperform the default
 tiled capture there. On real hardware, the default tiled capture remains
 the better trade-off despite its lower absolute frame rate.
 
+**Investigated and ruled out:** bypassing `BScreen`'s IPC path entirely
+via `BDirectWindow` (a real Haiku API for direct, shared-memory frame
+buffer access). Real-hardware testing showed `SupportsWindowMode()`
+returning `false` — windowed direct connection isn't available on that
+driver at all, and the only alternative, full-screen exclusive mode,
+would take over the whole display, which isn't compatible with a
+background recorder. See `research/README.md` for the full writeup.
+
 ## `--experimental-screen-capture`: window-aware capture
 
 A plain whole-screen read (what `--raw-capture` still does today, and
