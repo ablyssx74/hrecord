@@ -139,10 +139,21 @@ public:
         fInfo = *info; // shallow copy is fine for the fixed-size fields we
                         // read below; we never touch info->clip_list past
                         // this call, only the fields already copied here.
-        if (info->buffer_state & B_DIRECT_START) {
+        // B_DIRECT_START/STOP/MODIFY are NOT independent bit flags -- they're
+        // mutually-exclusive *values* (0/1/2) packed into the low 4 bits of
+        // buffer_state (B_DIRECT_MODE_MASK = 15), meant to be extracted and
+        // compared, never tested with a bare "&" -- B_DIRECT_START is 0, so
+        // `buffer_state & B_DIRECT_START` is always 0 regardless of what
+        // buffer_state actually is. This was the entire bug behind every
+        // "never connected" result this probe ever reported: app_server's
+        // own real-hardware debug_printf logging (added chasing this same
+        // symptom) proved DirectConnected() was firing correctly every
+        // time -- this check just could never notice.
+        int mode = info->buffer_state & B_DIRECT_MODE_MASK;
+        if (mode == B_DIRECT_START) {
             fConnected = true;
             release_sem(fConnectSem);
-        } else if (info->buffer_state & B_DIRECT_STOP) {
+        } else if (mode == B_DIRECT_STOP) {
             fConnected = false;
         }
         fLock.Unlock();
@@ -179,14 +190,21 @@ private:
 };
 
 static void PrintBufferState(uint32 state) {
-    printf("    buffer_state flags:");
-    if (state & B_DIRECT_START)          printf(" B_DIRECT_START");
-    if (state & B_DIRECT_STOP)           printf(" B_DIRECT_STOP");
-    if (state & B_DIRECT_MODIFY)         printf(" B_DIRECT_MODIFY");
-    if (state & B_BUFFER_MOVED)          printf(" B_BUFFER_MOVED");
-    if (state & B_CLIPPING_MODIFIED)     printf(" B_CLIPPING_MODIFIED");
-    if (state & B_BUFFER_RESIZED)        printf(" B_BUFFER_RESIZED");
-    if (state & B_BUFFER_RESET)          printf(" B_BUFFER_RESET");
+    // See DirectConnected()'s own comment: START/STOP/MODIFY are a
+    // mutually-exclusive mode value (mask B_DIRECT_MODE_MASK), not bit
+    // flags -- everything else here (CLIPPING_MODIFIED, BUFFER_MOVED, etc.)
+    // genuinely are independent bits and are fine to test with "&".
+    const char* modeName = "?";
+    switch (state & B_DIRECT_MODE_MASK) {
+        case B_DIRECT_START:  modeName = "B_DIRECT_START"; break;
+        case B_DIRECT_STOP:   modeName = "B_DIRECT_STOP"; break;
+        case B_DIRECT_MODIFY: modeName = "B_DIRECT_MODIFY"; break;
+    }
+    printf("    buffer_state: %s", modeName);
+    if (state & B_BUFFER_MOVED)          printf(" | B_BUFFER_MOVED");
+    if (state & B_CLIPPING_MODIFIED)     printf(" | B_CLIPPING_MODIFIED");
+    if (state & B_BUFFER_RESIZED)        printf(" | B_BUFFER_RESIZED");
+    if (state & B_BUFFER_RESET)          printf(" | B_BUFFER_RESET");
     printf(" (0x%08x)\n", (unsigned)state);
 }
 
