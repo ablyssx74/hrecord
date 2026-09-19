@@ -1,6 +1,31 @@
 # Research: BDirectWindow as a faster capture path
 
-## Result: BDirectWindow connects successfully -- the accelerant patch alone was sufficient
+## Final result: works, but scoped to a window's own content -- not usable for hrecord
+
+`BDirectWindow` connects successfully (the accelerant's `B_PARALLEL_ACCESS`
+patch was sufficient, no `app_server` changes needed -- see the full history
+below) and is genuinely fast: **0.000ms** via the direct pointer vs
+**19.4ms** via `BScreen::ReadBitmap()` for the same 320x240 region. But
+`--desktop-read-test` settles the actual question this research exists to
+answer, and the answer is no: reading outside the connected window's own
+bounds segfaults. Did the math on the specific crash -- if `info.bits`
+pointed into one true whole-screen buffer, that read (1,122,064 bytes
+before a window positioned at (200,150)) would have landed ~30KB into an
+8.3MB buffer, comfortably in range. It crashed anyway, meaning the memory
+this driver hands a windowed `BDirectWindow` client is scoped to that
+window's own rows (native screen stride, `bytes_per_row: 7680` matches the
+full 1920px-wide screen -- but only as many rows as the window itself
+needs), not a mapping of the whole physical framebuffer.
+
+That's not a bug to fix -- it's what the API is for: fast access to a
+window's *own* rendered content (games, video players), not a way to peek
+at other windows' content across the desktop. hrecord needs the latter.
+**Conclusion stands: `BDirectWindow` is not usable as hrecord's capture
+path.** The default tiled capture (real hardware) / `--raw-capture` (VM
+guest) split documented in the main readme remains the actual answer;
+nothing here changes hrecord's own capture code.
+
+## History (the two dead ends this ruled out first)
 
 Long story, worth recording in full since it took several wrong turns to get
 here:
@@ -46,13 +71,6 @@ fix that matters is entirely contained in the accelerant's
 `B_PARALLEL_ACCESS` patch plus this probe's own bitmask bug. A stock,
 unmodified `app_server` works fine.
 
-**Still open**: the probe's `--desktop-read-test` -- the actual question
-this whole investigation exists to answer (does the direct buffer pointer
-really cover the *whole* desktop, safely, not just this window's own
-region) -- hasn't been re-run since the bitmask fix. That's the next,
-genuinely final step before concluding whether this is usable as a real
-hrecord capture path.
-
 Exploratory only -- not part of hrecord itself, not built by hrecord's own
 `make`/`make release`. See `directwindow_probe.cpp`'s own top comment for
 the full original rationale.
@@ -78,6 +96,7 @@ failure on real hardware).
                                           # save other work first
 ```
 
-Please run both again now that the bitmask bug is fixed, on real hardware
-and in a VM guest -- that's what actually decides whether integrating this
-into hrecord is possible, and if so, what it would need to handle.
+Both already ran to completion (real hardware, patched accelerant) with the
+results in "Final result" above -- included here only so the probe stays
+buildable/runnable for anyone who wants to reproduce or poke further; there's
+no open question left that another run would answer.
