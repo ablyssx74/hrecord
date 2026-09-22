@@ -2666,7 +2666,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.11.7";
+    const char* localVersion = "v1.11.8";
 
     CURL* curl = curl_easy_init();
     if (!curl)
