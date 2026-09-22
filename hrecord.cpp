@@ -640,6 +640,23 @@ static void SetupDirectCapture() {
     }
 
     direct_buffer_info info = g_directCaptureWindow->Snapshot();
+
+    // Verbose dump, always printed once connected -- mirrors
+    // research/directwindow_probe.cpp's own diagnostic output, so a report
+    // back doesn't need a second run with extra flags to be useful.
+    std::cout << "[i] --direct-tiled-capture: DirectConnected() info:" << std::endl;
+    std::cout << "    bits: " << (void*)info.bits << std::endl;
+    std::cout << "    bytes_per_row: " << info.bytes_per_row << std::endl;
+    std::cout << "    bits_per_pixel: " << info.bits_per_pixel << std::endl;
+    std::cout << "    pixel_format: " << (int)info.pixel_format << std::endl;
+    std::cout << "    window_bounds: (" << info.window_bounds.left << ","
+        << info.window_bounds.top << ")-(" << info.window_bounds.right << ","
+        << info.window_bounds.bottom << ")" << std::endl;
+    std::cout << "    clip_bounds: (" << info.clip_bounds.left << ","
+        << info.clip_bounds.top << ")-(" << info.clip_bounds.right << ","
+        << info.clip_bounds.bottom << ")" << std::endl;
+    std::cout << "    clip_list_count: " << info.clip_list_count << std::endl;
+
     if (info.bits == nullptr || info.bytes_per_row == 0) {
         std::cout << "[!] --direct-tiled-capture: connected, but got no usable buffer "
             "pointer; using the default (BScreen) tiled capture instead." << std::endl;
@@ -728,6 +745,14 @@ static void SetupDirectCapture() {
     }
 
     uint8_t* refBytes = (uint8_t*)refBitmap.Bits();
+    char probeHex[16], refHex[16];
+    snprintf(probeHex, sizeof(probeHex), "%02x %02x %02x %02x",
+        probeBytes[0], probeBytes[1], probeBytes[2], probeBytes[3]);
+    snprintf(refHex, sizeof(refHex), "%02x %02x %02x %02x",
+        refBytes[0], refBytes[1], refBytes[2], refBytes[3]);
+    std::cout << "[i] --direct-tiled-capture: probe pixel at screen (" << probeX << ","
+        << probeY << ") -- direct-pointer bytes: " << probeHex
+        << ", BScreen::ReadBitmap() bytes: " << refHex << std::endl;
     if (memcmp(probeBytes, refBytes, 4) != 0) {
         std::cout << "[!] --direct-tiled-capture: the direct-pointer read didn't match "
             "a real screen read at the same point -- using the default (BScreen) "
