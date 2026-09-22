@@ -45,7 +45,10 @@ LIB_PATH = -L/boot/system/lib$(LIB_ARCH_DIR) -L/boot/system/develop/lib$(LIB_ARC
 EXTRA_LIBS = $(shell $(PKG_CONFIG_CMD) --libs libavformat libavcodec libavutil libswscale libswresample) \
              -lcurl -lnetwork
 
-HAIKU_LIBS = -lbe -lmedia -ltranslation -ltracker -lshared -lroot -lpthread
+# -lgame: BDirectWindow's own symbols live in Haiku's separate Game Kit lib,
+# not libbe itself -- confirmed by research/directwindow_probe.cpp's own
+# Makefile, needed here too for --direct-tiled-capture.
+HAIKU_LIBS = -lbe -lgame -lmedia -ltranslation -ltracker -lshared -lroot -lpthread
 
 CXXFLAGS += $(shell $(PKG_CONFIG_CMD) --cflags libavformat libavcodec libavutil libswscale libswresample)
 

@@ -4,6 +4,7 @@
  */
 
 #include <InterfaceKit.h> // Pulls in BApplication, BScreen, BBitmap
+#include <DirectWindow.h> // BDirectWindow -- see --direct-tiled-capture/SetupDirectCapture()
 #include <WindowInfo.h> // Private Window Kit API -- see EnumerateVisibleWindows()
 #include <StorageKit.h>
 #include <Path.h> // BPath -- DetectRealtimeAudioSettings' own settings-dir resolution
@@ -28,6 +29,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <csetjmp> // sigsetjmp/siglongjmp -- SetupDirectCapture()'s SIGSEGV/SIGBUS safety net
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
@@ -473,6 +475,270 @@ bool g_hybridCapture = false;
 // tested against.
 bool g_rawCapture = false;
 
+// ============================================================================
+// --direct-tiled-capture: the same default tile grid (RefreshScreenRegion/
+// RefreshScreenRegionTiled), but each tile read through a BDirectWindow's
+// raw framebuffer pointer (a local memcpy) instead of BScreen::GetBitmap()
+// (an app_server IPC round trip) -- prior art: jackburton79/bescreencapture
+// does something similar for its own capture path.
+//
+// This looks, at first glance, like exactly what research/README.md already
+// ruled out: reading past a window's own bounds. It isn't the same claim.
+// That research was about whether BDirectWindow could see an *occluded*
+// window's own content while some other window was drawn on top of it (it
+// can't -- Haiku keeps no off-screen buffer for content that isn't the
+// frontmost thing on screen at those pixels, so there's nothing there to
+// read no matter the access method). This is different: reading arbitrary
+// *on-screen, unoccluded* pixels through a window that has nothing to do
+// with them, which is possible because DirectWindowInfo::SetState() itself
+// (app_server, confirmed by reading its actual source) clones the *whole*
+// area backing whatever HWInterface::FrontBuffer() the accelerant reports,
+// not something scoped to the connecting window -- confirmed independently
+// by jackburton79/bescreencapture's own shipped ReadBitmap() doing exactly
+// this against an arbitrary capture-area rect from a small, unrelated UI
+// window.
+//
+// Whether that pointer is actually *safe* to read beyond the connecting
+// window's own rows varies by accelerant, though: this project's own prior
+// research (research/directwindow_probe.cpp's --desktop-read-test) found a
+// real, real-hardware crash doing exactly this on one experimental
+// accelerant, despite SupportsWindowMode() reporting true -- so that check
+// alone is not trusted here. SetupDirectCapture() below only ever leaves
+// g_directCaptureVerified true after SupportsWindowMode(), a successful
+// connection, a matching pixel format, AND a real out-of-window-bounds
+// probe read -- signal-guarded the same way that research already proved
+// necessary, and additionally checked byte-for-byte against a real
+// BScreen::ReadBitmap() at the same point, which catches a wrong-but-non-
+// crashing read too (a bug along these lines -- an offset computed in
+// pixels where the buffer layout expects bytes -- is what a read of
+// jackburton79/bescreencapture's own ReadBitmap() turned up; RefreshScreen-
+// Region's direct-read branch below is careful to multiply by bytesPerPixel
+// for exactly that reason). Any failure at any step leaves
+// g_directCaptureVerified false and every tile read keeps going through
+// BScreen exactly as it does today -- the fallback this flag promises.
+bool g_directTiledCapture = false;
+bool g_directCaptureVerified = false;
+const uint8_t* g_directDesktopOrigin = nullptr;
+uint32 g_directBytesPerRow = 0;
+int g_directBytesPerPixel = 0;
+BDirectWindow* g_directCaptureWindow = nullptr;
+
+// Adapted from research/directwindow_probe.cpp's own ProbeWindow, already
+// validated on real hardware: B_DIRECT_START/STOP/MODIFY are mutually-
+// exclusive *values* packed into buffer_state's low 4 bits
+// (B_DIRECT_MODE_MASK), not independent flags, so they must be extracted
+// and compared, never tested with a bare "&".
+class DirectCaptureWindow : public BDirectWindow {
+public:
+    DirectCaptureWindow(BRect frame)
+        : BDirectWindow(frame, "hrecord direct capture",
+              B_NO_BORDER_WINDOW_LOOK, B_FLOATING_ALL_WINDOW_FEEL,
+              B_NOT_ZOOMABLE | B_NOT_RESIZABLE | B_NOT_MOVABLE
+                  | B_NOT_CLOSABLE | B_NOT_MINIMIZABLE | B_AVOID_FOCUS),
+          fConnected(false),
+          fConnectSem(create_sem(0, "hrecord_direct_connect")) {
+        memset(&fInfo, 0, sizeof(fInfo));
+    }
+
+    ~DirectCaptureWindow() {
+        delete_sem(fConnectSem);
+    }
+
+    // Called by app_server on its own dedicated thread, not this window's
+    // usual message-handling thread.
+    virtual void DirectConnected(direct_buffer_info* info) {
+        fLock.Lock();
+        fInfo = *info;
+        int mode = info->buffer_state & B_DIRECT_MODE_MASK;
+        if (mode == B_DIRECT_START) {
+            fConnected = true;
+            release_sem(fConnectSem);
+        } else if (mode == B_DIRECT_STOP) {
+            fConnected = false;
+        }
+        fLock.Unlock();
+    }
+
+    bool WaitForConnect(bigtime_t timeoutUs) {
+        status_t err = acquire_sem_etc(fConnectSem, 1, B_RELATIVE_TIMEOUT, timeoutUs);
+        return err == B_OK;
+    }
+
+    direct_buffer_info Snapshot() {
+        fLock.Lock();
+        direct_buffer_info copy = fInfo;
+        fLock.Unlock();
+        return copy;
+    }
+
+private:
+    BLocker fLock;
+    bool fConnected;
+    sem_id fConnectSem;
+    direct_buffer_info fInfo;
+};
+
+// The out-of-window-bounds probe read below is wrapped in this the same
+// way research/directwindow_probe.cpp's --desktop-read-test already
+// validated on real hardware: reading outside a connected window's own
+// clip region is outside what the DirectWindow API contract promises is
+// safe, so on some driver/hardware combination it can raise SIGSEGV/SIGBUS
+// instead of just returning wrong bytes. sigsetjmp/siglongjmp turns that
+// into a clean "not safe here" instead of taking hrecord itself down.
+static sigjmp_buf g_directCaptureSegvJmpBuf;
+static volatile sig_atomic_t g_inDirectCaptureRiskyRead = 0;
+
+static void DirectCaptureSegvHandler(int sig) {
+    if (g_inDirectCaptureRiskyRead) {
+        siglongjmp(g_directCaptureSegvJmpBuf, sig);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// Sets up a small, otherwise-unused BDirectWindow purely to get a raw
+// framebuffer pointer, and only trusts it for real capture after every
+// check in g_directTiledCapture's own comment above passes. Called once,
+// from main(), after haikuApp (the BApplication main() already
+// constructs) exists -- BDirectWindow needs a registered app to connect
+// through, same as everything else here, but a *second* BApplication in
+// the same team isn't legal, so this reuses that one rather than making
+// its own. Constructed and Show()n on this same (main()'s) thread, which
+// sidesteps a real deadlock research/directwindow_probe.cpp's own
+// ProbeWindow hit: a freshly constructed BWindow starts out locked by
+// whichever thread constructed it, and Show()'s internal BLooper::Run()
+// needs that same thread to be the one holding that lock -- true here by
+// construction, since nothing hands this window off to another thread
+// first. Leaves every global above untouched (so g_directCaptureVerified
+// stays false) on any failure.
+static void SetupDirectCapture() {
+    // Borderless, tiny (4x4), pinned to the top-left corner -- it has to be
+    // a real, visible, on-screen window for DirectConnected() to hand back
+    // a usable buffer at all, so it can't be zero-sized or hidden, but kept
+    // this small it's a barely-visible 4x4 speck rather than a titled
+    // window sitting in the middle of whatever's being recorded.
+    BRect frame(0, 0, 3, 3);
+    g_directCaptureWindow = new DirectCaptureWindow(frame);
+
+    if (!g_directCaptureWindow->SupportsWindowMode()) {
+        std::cout << "[!] --direct-tiled-capture: this video driver doesn't support "
+            "BDirectWindow's windowed mode; using the default (BScreen) tiled capture "
+            "instead." << std::endl;
+        return;
+    }
+
+    g_directCaptureWindow->Show();
+
+    if (!g_directCaptureWindow->WaitForConnect(5000000)) {
+        std::cout << "[!] --direct-tiled-capture: never got a DirectWindow connection "
+            "within 5s; using the default (BScreen) tiled capture instead." << std::endl;
+        return;
+    }
+
+    direct_buffer_info info = g_directCaptureWindow->Snapshot();
+    if (info.bits == nullptr || info.bytes_per_row == 0) {
+        std::cout << "[!] --direct-tiled-capture: connected, but got no usable buffer "
+            "pointer; using the default (BScreen) tiled capture instead." << std::endl;
+        return;
+    }
+
+    // Only B_RGB32/B_RGBA32 line up byte-for-byte with the BGRA buffers
+    // this project already captures into -- anything else would need a
+    // real pixel-format conversion per tile read, defeating the point of
+    // a raw memcpy.
+    if (info.pixel_format != B_RGB32 && info.pixel_format != B_RGBA32) {
+        std::cout << "[!] --direct-tiled-capture: screen isn't in a 32-bit-per-pixel "
+            "color mode (this project only captures BGRA); using the default "
+            "(BScreen) tiled capture instead." << std::endl;
+        return;
+    }
+
+    int bytesPerPixel = info.bits_per_pixel / 8;
+    if (bytesPerPixel != 4) {
+        std::cout << "[!] --direct-tiled-capture: unexpected bits_per_pixel ("
+            << info.bits_per_pixel << "); using the default (BScreen) tiled capture "
+            "instead." << std::endl;
+        return;
+    }
+
+    // BWindow state must only be read while holding the window's own
+    // BLooper lock -- true even from the thread that constructed it, once
+    // Show() has handed that lock off to the window's own spawned message
+    // thread (see research/directwindow_probe.cpp's own ProbeWindow
+    // comment for the cross-thread deadlock that taught this project that
+    // rule the hard way).
+    g_directCaptureWindow->Lock();
+    BRect windowFrame = g_directCaptureWindow->Frame();
+    g_directCaptureWindow->Unlock();
+    const uint8_t* desktopOrigin = (const uint8_t*)info.bits
+        - (size_t)windowFrame.top * info.bytes_per_row
+        - (size_t)windowFrame.left * bytesPerPixel;
+
+    // The actual safety test: read one pixel well outside this window's own
+    // tiny (4x4, top-left corner) bounds -- the screen's own center, so
+    // this stays a meaningful test regardless of screen resolution -- and
+    // compare it against a BScreen::ReadBitmap() of that same screen point.
+    BScreen screen;
+    BRect screenFrame = screen.Frame();
+    int probeX = (int)(screenFrame.Width() / 2.0f);
+    int probeY = (int)(screenFrame.Height() / 2.0f);
+    BRect probeRect(probeX, probeY, probeX, probeY);
+    BBitmap refBitmap(probeRect, B_RGB32);
+    if (screen.ReadBitmap(&refBitmap, false, &probeRect) != B_OK) {
+        std::cout << "[!] --direct-tiled-capture: couldn't get a reference read for "
+            "the safety check; using the default (BScreen) tiled capture instead." << std::endl;
+        return;
+    }
+
+    const uint8_t* probePtr = desktopOrigin
+        + (size_t)probeY * info.bytes_per_row + (size_t)probeX * bytesPerPixel;
+
+    struct sigaction sa, oldSegv, oldBus;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = DirectCaptureSegvHandler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &oldSegv);
+    sigaction(SIGBUS, &sa, &oldBus);
+
+    bool safe = false;
+    uint8_t probeBytes[4] = {0, 0, 0, 0};
+    int caughtSignal = sigsetjmp(g_directCaptureSegvJmpBuf, 1);
+    if (caughtSignal == 0) {
+        g_inDirectCaptureRiskyRead = 1;
+        memcpy(probeBytes, probePtr, 4);
+        g_inDirectCaptureRiskyRead = 0;
+        safe = true;
+    } else {
+        g_inDirectCaptureRiskyRead = 0;
+    }
+
+    sigaction(SIGSEGV, &oldSegv, nullptr);
+    sigaction(SIGBUS, &oldBus, nullptr);
+
+    if (!safe) {
+        std::cout << "[!] --direct-tiled-capture: reading outside this window's own "
+            "region crashed (caught safely) on this video driver -- it doesn't share "
+            "one whole-screen buffer with windowed DirectWindow clients here. Using "
+            "the default (BScreen) tiled capture instead." << std::endl;
+        return;
+    }
+
+    uint8_t* refBytes = (uint8_t*)refBitmap.Bits();
+    if (memcmp(probeBytes, refBytes, 4) != 0) {
+        std::cout << "[!] --direct-tiled-capture: the direct-pointer read didn't match "
+            "a real screen read at the same point -- using the default (BScreen) "
+            "tiled capture instead." << std::endl;
+        return;
+    }
+
+    g_directDesktopOrigin = desktopOrigin;
+    g_directBytesPerRow = info.bytes_per_row;
+    g_directBytesPerPixel = bytesPerPixel;
+    g_directCaptureVerified = true;
+    std::cout << "[i] --direct-tiled-capture: verified safe on this video driver -- "
+        "using the direct framebuffer pointer instead of BScreen for tile reads." << std::endl;
+}
+
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
 // tracking uses, via get_window_info()/BPrivate::get_window_order()).
@@ -594,17 +860,34 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     if (srcRight <= srcX || srcBottom <= srcY)
         return; // degenerate (fully off-screen) -- nothing to do
 
+    int rowBytes = (srcRight - srcX) * 4; // BGRA/RGB32 -- 4 bytes per pixel
+    uint8_t* dstRow = (uint8_t*)screenBitmap->Bits()
+        + (size_t)srcY * screenBitmap->BytesPerRow() + (size_t)srcX * 4;
+    int dstStride = (int)screenBitmap->BytesPerRow();
+
+    if (g_directCaptureVerified) {
+        // --direct-tiled-capture, verified safe by SetupDirectCapture(): a
+        // raw memcpy straight from the framebuffer pointer, no app_server
+        // IPC call at all. srcX/srcY are multiplied by g_directBytesPerPixel
+        // here, not left as a bare pixel count -- see g_directTiledCapture's
+        // own comment for the real bug this avoids.
+        const uint8_t* srcRow = g_directDesktopOrigin
+            + (size_t)srcY * g_directBytesPerRow + (size_t)srcX * g_directBytesPerPixel;
+        for (int row = srcY; row < srcBottom; row++) {
+            memcpy(dstRow, srcRow, rowBytes);
+            srcRow += g_directBytesPerRow;
+            dstRow += dstStride;
+        }
+        return;
+    }
+
     BRect captureRect(srcX, srcY, srcRight - 1, srcBottom - 1);
     BBitmap* regionBitmap = nullptr;
     if (screen.GetBitmap(&regionBitmap, false, &captureRect) != B_OK || regionBitmap == nullptr)
         return;
 
-    int rowBytes = (srcRight - srcX) * 4; // BGRA/RGB32 -- 4 bytes per pixel
     uint8_t* srcRow = (uint8_t*)regionBitmap->Bits();
-    uint8_t* dstRow = (uint8_t*)screenBitmap->Bits()
-        + (size_t)srcY * screenBitmap->BytesPerRow() + (size_t)srcX * 4;
     int srcStride = (int)regionBitmap->BytesPerRow();
-    int dstStride = (int)screenBitmap->BytesPerRow();
 
     for (int row = srcY; row < srcBottom; row++) {
         memcpy(dstRow, srcRow, rowBytes);
@@ -2295,6 +2578,7 @@ int main(int argc, char* argv[]) {
     bool screenCaptureRcserverMethod = false;
     bool hybridCapture = false;
     bool tiledCapture = false; // now the default; accepted as an inert, explicit confirmation
+    bool directTiledCapture = false;
     bool rawCapture = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
@@ -2320,6 +2604,8 @@ int main(int argc, char* argv[]) {
             hybridCapture = true;
         } else if (strcmp(argv[i], "--tiled-capture") == 0) {
             tiledCapture = true;
+        } else if (strcmp(argv[i], "--direct-tiled-capture") == 0) {
+            directTiledCapture = true;
         } else if (strcmp(argv[i], "--raw-capture") == 0) {
             rawCapture = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
@@ -2336,7 +2622,8 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
                 "[--allaudio] [--realtime] [--experimental-screen-capture] "
                 "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
-                "[--raw-capture] [--list-audio-inputs] [--logfps]" << std::endl;
+                "[--direct-tiled-capture] [--raw-capture] [--list-audio-inputs] "
+                "[--logfps]" << std::endl;
             return 0;
         }
     }
@@ -2361,6 +2648,11 @@ int main(int argc, char* argv[]) {
             "--audioonly." << std::endl;
         rawCapture = false;
     }
+    if (directTiledCapture && audioOnly) {
+        std::cout << "[i] --direct-tiled-capture only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        directTiledCapture = false;
+    }
     if (logFps && audioOnly) {
         std::cout << "[i] --logfps only affects video capture; ignored under "
             "--audioonly." << std::endl;
@@ -2378,17 +2670,21 @@ int main(int argc, char* argv[]) {
         tiledCapture = false;
     }
 
-    // Three alternative video-capture engines, plus --raw-capture as a
-    // fourth fallback to the *original* default -- doesn't make sense to
+    // Four alternative video-capture engines, plus --raw-capture as a
+    // fifth fallback to the *original* default -- doesn't make sense to
     // run more than one at once. Newest wins when explicitly combined:
-    // --hybrid-capture over --experimental-screen-capture over
-    // --screen-capture-rcserver-method over --raw-capture, on the theory
-    // that whichever was added most recently is also whichever the user
-    // most likely meant to actually test. Just a sane tie-break for an
-    // unlikely combination, not a statement that one is strictly better
-    // than the others in general. (Tiled reads are the default now,
-    // handled by falling through when none of these four are set --
-    // see the main loop below.)
+    // --direct-tiled-capture over --hybrid-capture over
+    // --experimental-screen-capture over --screen-capture-rcserver-method
+    // over --raw-capture, on the theory that whichever was added most
+    // recently is also whichever the user most likely meant to actually
+    // test. Just a sane tie-break for an unlikely combination, not a
+    // statement that one is strictly better than the others in general.
+    // (Tiled reads are the default now, handled by falling through when
+    // none of these five are set -- see the main loop below. Note
+    // --direct-tiled-capture itself still falls through to that same
+    // default code path -- it's the same tile grid, just with
+    // RefreshScreenRegion's own direct-pointer branch active underneath
+    // it when SetupDirectCapture() verified that's safe.)
     if (hybridCapture && experimentalScreenCapture) {
         std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
             "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
@@ -2421,6 +2717,30 @@ int main(int argc, char* argv[]) {
         std::cout << "[i] --screen-capture-rcserver-method and --raw-capture are alternative "
             "capture engines; can't use both at once. Keeping "
             "--screen-capture-rcserver-method." << std::endl;
+        rawCapture = false;
+    }
+    // --direct-tiled-capture is the newest of the five, same tie-break
+    // convention as the others above: wins over any of them if combined.
+    if (directTiledCapture && hybridCapture) {
+        std::cout << "[i] --direct-tiled-capture and --hybrid-capture are alternative capture "
+            "engines; can't use both at once. Keeping --direct-tiled-capture." << std::endl;
+        hybridCapture = false;
+    }
+    if (directTiledCapture && experimentalScreenCapture) {
+        std::cout << "[i] --direct-tiled-capture and --experimental-screen-capture are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--direct-tiled-capture." << std::endl;
+        experimentalScreenCapture = false;
+    }
+    if (directTiledCapture && screenCaptureRcserverMethod) {
+        std::cout << "[i] --direct-tiled-capture and --screen-capture-rcserver-method are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--direct-tiled-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
+    if (directTiledCapture && rawCapture) {
+        std::cout << "[i] --direct-tiled-capture and --raw-capture are alternative capture "
+            "engines; can't use both at once. Keeping --direct-tiled-capture." << std::endl;
         rawCapture = false;
     }
 
@@ -2465,6 +2785,19 @@ int main(int argc, char* argv[]) {
         std::cout << "[i] --raw-capture: one plain full-screen read per frame, no tiling -- "
             "the original default, kept available now that tiled reads are the default "
             "instead (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- same default tile grid,
+    // but through a verified-safe BDirectWindow pointer instead of BScreen
+    // when SetupDirectCapture() (called below, once haikuApp exists) finds
+    // one. See g_directTiledCapture's own comment above for the full
+    // design and safety checks.
+    g_directTiledCapture = directTiledCapture;
+    if (g_directTiledCapture) {
+        std::cout << "[i] --direct-tiled-capture: the default tile grid, read through a "
+            "BDirectWindow's raw framebuffer pointer when verified safe on this video "
+            "driver, falling back to the default (BScreen) tiled capture otherwise "
+            "(see readme.md)." << std::endl;
     }
 
     if (logFps) {
@@ -2600,6 +2933,10 @@ int main(int argc, char* argv[]) {
         outHeight -= outHeight % 2;
         if (outWidth < 2) outWidth = 2;
         if (outHeight < 2) outHeight = 2;
+
+        if (g_directTiledCapture) {
+            SetupDirectCapture();
+        }
     }
 
     // 5. Build FFmpeg Container and Muxing Pipeline
