@@ -810,7 +810,11 @@ static void FastFramebufferCopySSE41(void* dst, const void* src, size_t bytes) {
     const uint8_t* s = (const uint8_t*)src;
     size_t chunks = bytes / 16;
     for (size_t i = 0; i < chunks; i++) {
-        __m128i v = _mm_stream_load_si128((const __m128i*)s);
+        // Haiku's gcc13 declares _mm_stream_load_si128() as taking a
+        // non-const __m128i* (some libc/gcc versions differ on this) --
+        // the framebuffer memory itself is never actually written through
+        // this pointer, only read, so casting away const here is safe.
+        __m128i v = _mm_stream_load_si128((__m128i*)(const_cast<uint8_t*>(s)));
         _mm_storeu_si128((__m128i*)d, v);
         s += 16;
         d += 16;
