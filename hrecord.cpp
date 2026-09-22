@@ -521,7 +521,6 @@ bool g_directCaptureVerified = false;
 const uint8_t* g_directDesktopOrigin = nullptr;
 uint32 g_directBytesPerRow = 0;
 int g_directBytesPerPixel = 0;
-BDirectWindow* g_directCaptureWindow = nullptr;
 
 // Adapted from research/directwindow_probe.cpp's own ProbeWindow, already
 // validated on real hardware: B_DIRECT_START/STOP/MODIFY are mutually-
@@ -577,6 +576,11 @@ private:
     sem_id fConnectSem;
     direct_buffer_info fInfo;
 };
+
+// Typed as the derived class, not BDirectWindow* -- SetupDirectCapture()
+// below calls WaitForConnect()/Snapshot(), which only exist on
+// DirectCaptureWindow itself.
+DirectCaptureWindow* g_directCaptureWindow = nullptr;
 
 // The out-of-window-bounds probe read below is wrapped in this the same
 // way research/directwindow_probe.cpp's --desktop-read-test already
