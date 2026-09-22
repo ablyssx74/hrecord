@@ -14,7 +14,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--raw-capture] [--list-audio-inputs] [--logfps]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--direct-tiled-capture] [--raw-capture] [--list-audio-inputs] [--logfps]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -108,6 +108,17 @@ whatever an earlier run left behind in `/boot/home`.
   change anything on its own. See the top of this list and
   "--tiled-capture: default correctness, rcserver-sized reads" below for
   the full story.
+- `hrecord start --direct-tiled-capture` — the same default tile grid, read
+  through a `BDirectWindow`'s raw framebuffer pointer instead of
+  `BScreen::GetBitmap()` when verified safe on the machine running it,
+  falling back to the exact default behavior otherwise. Can't be combined
+  with `--experimental-screen-capture`, `--screen-capture-rcserver-method`,
+  `--hybrid-capture`, or `--raw-capture` (alternative engines, not
+  stackable) — `--direct-tiled-capture` wins if more than one is passed,
+  being the newest. **Unconfirmed pending real-world testing.** See
+  "--direct-tiled-capture: the default tile grid, through a raw framebuffer
+  pointer" below for the full design and the safety checks it runs before
+  ever trusting the direct pointer.
 - `hrecord start --raw-capture` — the *original* default, before tiled
   reads were confirmed and promoted: one plain full-screen read per
   frame, no tiling, no window tracking, the simplest possible code path
@@ -672,6 +683,79 @@ area, `--hybrid-capture` should have measurably less total read work per
 frame than this mode does -- still unconfirmed which of the two actually
 feels better in practice, since only this one has been real-world tested
 so far.
+
+### `--direct-tiled-capture`: the default tile grid, through a raw framebuffer pointer
+
+Same tile grid as the default (`--tiled-capture`'s own whole-screen,
+every-frame refresh), but each tile read through a `BDirectWindow`'s raw
+framebuffer pointer (a local `memcpy`) instead of `BScreen::GetBitmap()`
+(an `app_server` IPC round trip), when that's been verified safe -- see
+below -- on the machine actually running it.
+
+This started from `research/README.md`'s own BDirectWindow investigation,
+which concluded `BDirectWindow` couldn't help this project: reading an
+*occluded* window's own content through it doesn't work, because Haiku
+keeps no off-screen buffer for content that isn't the frontmost thing on
+screen at those pixels -- there's nothing there to read no matter the
+access method. That conclusion still stands, but it turned out not to be
+the whole story. `app_server`'s own `DirectWindowInfo::SetState()` clones
+the *whole* area backing the accelerant's front buffer for a connecting
+window, not something scoped to that window's own bounds -- confirmed by
+reading its actual source, and independently by
+[jackburton79/bescreencapture](https://github.com/jackburton79/bescreencapture),
+a real, shipped Haiku screen recorder whose own `BSCApp::ReadBitmap()`
+reads an arbitrary on-screen capture area through a small, otherwise
+unrelated `BDirectWindow`. Testing that app directly (with its own
+"Use less CPU (BDirectWindow)" option on) showed real artifacts while
+windows were being moved around -- most likely because it does one large,
+unsynchronized `memcpy` of the whole capture region per frame, catching
+Haiku's non-compositing `app_server` mid-redraw. This mode targets that
+specific problem: many small tile reads instead of one large one, the
+same principle that makes the default tile grid feel more responsive than
+`--raw-capture`'s single big read, just with the direct pointer backing
+each small read instead of an IPC call.
+
+**Not trusted on a capability check alone.** `BDirectWindow::SupportsWindowMode()`
+reporting `true` was already found, in this project's own prior research
+(`research/directwindow_probe.cpp`'s `--desktop-read-test`), to not
+guarantee a safe out-of-window-bounds read -- one real, experimental
+accelerant crashed doing exactly that despite the capability check passing.
+So this mode never trusts that check by itself. At startup it:
+
+1. Connects a small, otherwise-unused `BDirectWindow` and checks
+   `SupportsWindowMode()`.
+2. Confirms the reported pixel format is 32-bit (`B_RGB32`/`B_RGBA32`) --
+   this project's own buffers are always BGRA, and a mismatched format
+   would need a real per-tile conversion, defeating the point of a raw
+   `memcpy`.
+3. Performs one real out-of-window-bounds probe read, wrapped in the same
+   `SIGSEGV`/`SIGBUS` recovery `research/directwindow_probe.cpp` already
+   validated on real hardware -- a crash here is caught cleanly rather than
+   taking hrecord down.
+4. Compares that probe read, byte for byte, against a real
+   `BScreen::ReadBitmap()` of the same screen point -- catching a
+   wrong-but-non-crashing read too, not just an outright crash. (A bug
+   along exactly these lines -- an offset computed in pixels where the
+   buffer layout expects bytes -- is what reading
+   jackburton79/bescreencapture's own `ReadBitmap()` turned up; this
+   project's own version is careful to multiply by the actual
+   bytes-per-pixel for that reason.)
+
+Only after all four pass does this mode actually use the direct pointer
+for real capture. Any failure at any step prints why and silently falls
+back to the exact same `BScreen`-based tile reads `--tiled-capture` already
+does -- this mode never behaves worse than the default, only potentially
+faster.
+
+Can't be combined with `--experimental-screen-capture`,
+`--screen-capture-rcserver-method`, `--hybrid-capture`, or `--raw-capture`
+(alternative engines, not stackable) -- `--direct-tiled-capture` wins if
+more than one is passed, being the newest.
+
+**Unconfirmed pending real-world testing** -- on real hardware, whether the
+safety checks above pass at all, and if they do, whether it actually closes
+the gap `research/README.md` and `--logfps` measured between real hardware
+and a VM guest.
 
 ### `--raw-capture`: the original default, now opt-in
 
