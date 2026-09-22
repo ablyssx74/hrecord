@@ -14,7 +14,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--direct-tiled-capture] [--raw-capture] [--list-audio-inputs] [--logfps]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] [--list-audio-inputs] [--logfps]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -115,10 +115,33 @@ whatever an earlier run left behind in `/boot/home`.
   with `--experimental-screen-capture`, `--screen-capture-rcserver-method`,
   `--hybrid-capture`, or `--raw-capture` (alternative engines, not
   stackable) — `--direct-tiled-capture` wins if more than one is passed,
-  being the newest. **Unconfirmed pending real-world testing.** See
-  "--direct-tiled-capture: the default tile grid, through a raw framebuffer
-  pointer" below for the full design and the safety checks it runs before
-  ever trusting the direct pointer.
+  being the newest. **Confirmed via real-world testing:** verifies safe and
+  connects cleanly on real hardware, but only a modest ~10-15% faster than
+  the plain default (~642ms/frame vs. ~730-760ms/frame) -- not the large
+  win eliminating `app_server`'s IPC round trip was expected to bring, and
+  not enough to meaningfully shrink the full-screen sweep time that causes
+  window-drag smearing (see below). See "--direct-tiled-capture: the
+  default tile grid, through a raw framebuffer pointer" below for the full
+  design, the safety checks it runs before ever trusting the direct
+  pointer, and what the real numbers imply about where the time actually
+  goes.
+- `hrecord start --direct-raw-capture` — `--raw-capture`'s own single
+  whole-screen read per frame (no tiling), through the same verified-safe
+  `BDirectWindow` pointer `--direct-tiled-capture` uses, falling back to
+  plain `--raw-capture` behavior otherwise. Targets the window-drag
+  smearing `--direct-tiled-capture` didn't fix from a different angle: one
+  tight, uninterrupted read instead of many small tile calls, on the
+  theory that total sweep *time* (not just avoiding IPC calls) is what
+  actually matters for that artifact -- `--raw-capture`'s own plain
+  `BScreen` version already measured meaningfully faster than the tiled
+  default (~400-425ms/frame vs. ~730-760ms/frame) from fewer, larger calls
+  alone, independent of the direct-pointer question. Can't be combined
+  with `--experimental-screen-capture`, `--screen-capture-rcserver-method`,
+  `--hybrid-capture`, `--raw-capture`, or `--direct-tiled-capture`
+  (alternative engines, not stackable) — `--direct-raw-capture` wins if
+  more than one is passed, being the newest. **Unconfirmed pending
+  real-world testing.** See "--direct-raw-capture: --raw-capture through a
+  raw framebuffer pointer" below for the full design.
 - `hrecord start --raw-capture` — the *original* default, before tiled
   reads were confirmed and promoted: one plain full-screen read per
   frame, no tiling, no window tracking, the simplest possible code path
@@ -752,10 +775,86 @@ Can't be combined with `--experimental-screen-capture`,
 (alternative engines, not stackable) -- `--direct-tiled-capture` wins if
 more than one is passed, being the newest.
 
-**Unconfirmed pending real-world testing** -- on real hardware, whether the
-safety checks above pass at all, and if they do, whether it actually closes
-the gap `research/README.md` and `--logfps` measured between real hardware
-and a VM guest.
+**Confirmed via real-world testing**, and the numbers turned out to say
+something more specific than "faster" or "not faster":
+
+- The safety checks all pass cleanly on this hardware -- `SupportsWindowMode()`
+  true, connects, 32-bit pixel format, the out-of-bounds probe read
+  survives, and matches a real `BScreen::ReadBitmap()` of the same point
+  byte for byte.
+- `--logfps` with this mode active measured **~642ms average capture time
+  per frame** (22 frames over 14.7s, ~1.5fps), against the plain default's
+  own previously-measured **~730-760ms/frame** on the same real hardware
+  (see "Real hardware vs. virtual machines" above). That's a real but
+  modest ~10-15% improvement -- not the large win eliminating
+  `app_server`'s IPC round trip altogether was expected to bring.
+- That gap between "avoided every IPC call" and "only ~10-15% faster"
+  points at where the real cost actually lives: not the round trip to
+  `app_server` itself, but reading the framebuffer memory *at all* --
+  real GPU-mapped framebuffer memory is typically write-combined, a memory
+  type notoriously slow for CPU *reads* specifically (it's optimized for
+  writes), regardless of which code path gets you there. A raw `memcpy`
+  and `BScreen::GetBitmap()`'s own internal copy both end up paying most
+  of that same cost, which is consistent with neither being dramatically
+  faster than the other here.
+- **This does not fix the window-drag smearing artifact.** A recording
+  taken with this mode active, while a window was being dragged, showed
+  exactly that: one output frame with the dragged window's content visible
+  at two overlapping positions, gone again by the very next frame. Since
+  the full-screen sweep still takes ~640ms either way, a window moved
+  fast enough during that ~640ms still gets smeared across the positions
+  it passed through -- each tile read is individually correct, but the
+  tiles as a whole don't represent one single instant when something is
+  moving faster than the sweep completes. This mode targeted the wrong
+  bottleneck for that specific problem: it went after IPC overhead, but
+  the artifact comes from total sweep *time*, most of which turned out to
+  be memory-read cost rather than IPC cost.
+
+### `--direct-raw-capture`: `--raw-capture` through a raw framebuffer pointer
+
+`--direct-tiled-capture`'s own real-world numbers (previous section) said
+something specific: the direct pointer only modestly beat plain `BScreen`
+reads (~642ms/frame vs. ~730-760ms/frame), which pointed at framebuffer
+memory-read cost, not `app_server`'s IPC overhead, as the real bottleneck
+-- and since the sweep still took about as long either way, the
+window-drag smearing that mode was built to fix wasn't fixed.
+
+That's not the whole picture, though. `--raw-capture` (this project's own
+original default) already showed, through plain `BScreen`, that call
+*count* matters independently of memory-read cost: one big
+`BScreen::ReadBitmap()` measured ~400-425ms/frame, meaningfully faster
+than the tiled default's ~730-760ms for the *same total bytes*, purely
+from being one call instead of many small ones (see "Real hardware vs.
+virtual machines" above). So there are two separate costs stacked on top
+of each other in the tiled paths: the per-tile IPC/call overhead
+`--raw-capture` already avoids, and the memory-read cost
+`--direct-tiled-capture` targets. This mode combines both: one direct-
+pointer read, covering the whole screen in a single tight copy loop, no
+tiling and no per-call overhead at all.
+
+Mechanically this reuses `RefreshScreenRegion`'s own direct-pointer branch
+-- the exact same code `--direct-tiled-capture` already exercises once per
+tile, called here once for the whole screen instead. No new capture
+primitive, no new safety logic: `SetupDirectCapture()` and its four-step
+verification (see the previous section) are identical between the two
+modes -- this one just uses the result differently. When the direct
+pointer wasn't verified safe, this mode falls back to exactly
+`--raw-capture`'s own `screen.ReadBitmap()` call, not to any tiled path.
+
+Whether one large, tight, uninterrupted copy actually completes closer to
+atomically (in wall-clock terms) than hundreds of small tile calls spread
+across the same wall-clock window -- and whether that's enough to shrink
+or eliminate the window-drag smearing -- is exactly what real-world
+testing needs to answer.
+
+Can't be combined with `--experimental-screen-capture`,
+`--screen-capture-rcserver-method`, `--hybrid-capture`, `--raw-capture`, or
+`--direct-tiled-capture` (alternative engines, not stackable) --
+`--direct-raw-capture` wins if more than one is passed, being the newest.
+
+**Unconfirmed pending real-world testing** -- whether it measurably beats
+`--direct-tiled-capture`'s own ~642ms/frame, and whether that's enough to
+actually fix the smearing a dragged window showed under that mode.
 
 ### `--raw-capture`: the original default, now opt-in
 
