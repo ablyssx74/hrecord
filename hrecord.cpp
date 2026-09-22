@@ -791,6 +791,68 @@ static void SetupDirectCapture() {
         "using the direct framebuffer pointer instead of BScreen for tile reads." << std::endl;
 }
 
+#ifdef __x86_64__
+#include <smmintrin.h> // _mm_stream_load_si128 (MOVNTDQA) -- SSE4.1
+
+// The bulk-copy half of FastFramebufferCopy() below, split into its own
+// function so only *this* function is compiled for SSE4.1 -- the rest of
+// the file stays on whatever baseline -march the Makefile targets, and
+// __builtin_cpu_supports() at the one call site below gates whether this
+// ever actually runs, so a CPU that predates SSE4.1 (2008+, never assumed)
+// simply never reaches it. Guarded to __x86_64__ only, not __i386__ too:
+// this project's 32-bit (BePC) build uses a separate, much older gcc2-era
+// compiler for BeOS ABI compatibility that doesn't support this attribute
+// or __builtin_cpu_supports() at all, and never defines __x86_64__, so
+// this whole block naturally compiles out for that toolchain.
+__attribute__((target("sse4.1")))
+static void FastFramebufferCopySSE41(void* dst, const void* src, size_t bytes) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    size_t chunks = bytes / 16;
+    for (size_t i = 0; i < chunks; i++) {
+        __m128i v = _mm_stream_load_si128((const __m128i*)s);
+        _mm_storeu_si128((__m128i*)d, v);
+        s += 16;
+        d += 16;
+    }
+    size_t remainder = bytes - chunks * 16;
+    if (remainder > 0) {
+        memcpy(d, s, remainder);
+    }
+}
+#endif
+
+// Copies `bytes` bytes from src (framebuffer memory) to dst. Real
+// GPU-mapped framebuffer memory is typically write-combined -- a memory
+// type ordinary MOV-based reads (what a plain memcpy uses) are known to
+// handle poorly, since write-combining is optimized for writes, not
+// reads. SSE4.1's MOVNTDQA streaming-load instruction exists specifically
+// for fast reads from that memory type, so this uses it for the bulk of
+// the copy whenever the CPU actually supports it (checked once, via
+// __builtin_cpu_supports(), never assumed) and src happens to be 16-byte
+// aligned -- true by construction for --direct-raw-capture's own
+// whole-screen reads (row 0 of a page-aligned buffer, and every
+// bytes_per_row afterwards, since bytes_per_row itself is always a
+// multiple of 16 for a 32-bit-per-pixel native screen width), but not
+// guaranteed for --direct-tiled-capture's own tile-boundary reads (tile
+// size, kRcserverTileSize, isn't a multiple of 16) -- so this only takes
+// the fast path when alignment actually holds, and falls back to plain
+// memcpy otherwise. Always safe to call regardless of caller, hardware,
+// or alignment.
+static inline void FastFramebufferCopy(void* dst, const void* src, size_t bytes) {
+#ifdef __x86_64__
+    static int sHasSse41 = -1;
+    if (sHasSse41 < 0) {
+        sHasSse41 = __builtin_cpu_supports("sse4.1") ? 1 : 0;
+    }
+    if (sHasSse41 && ((uintptr_t)src & 15) == 0 && bytes >= 16) {
+        FastFramebufferCopySSE41(dst, src, bytes);
+        return;
+    }
+#endif
+    memcpy(dst, src, bytes);
+}
+
 // One tracked window's on-screen rectangle, from Haiku's private Window
 // Kit API (client_window_info -- the same struct hDesktop's own window
 // tracking uses, via get_window_info()/BPrivate::get_window_order()).
@@ -918,15 +980,21 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     int dstStride = (int)screenBitmap->BytesPerRow();
 
     if (g_directCaptureVerified) {
-        // --direct-tiled-capture, verified safe by SetupDirectCapture(): a
-        // raw memcpy straight from the framebuffer pointer, no app_server
-        // IPC call at all. srcX/srcY are multiplied by g_directBytesPerPixel
-        // here, not left as a bare pixel count -- see g_directTiledCapture's
-        // own comment for the real bug this avoids.
+        // --direct-tiled-capture/--direct-raw-capture, verified safe by
+        // SetupDirectCapture(): a raw read straight from the framebuffer
+        // pointer, no app_server IPC call at all. srcX/srcY are multiplied
+        // by g_directBytesPerPixel here, not left as a bare pixel count --
+        // see g_directTiledCapture's own comment for the real bug this
+        // avoids. FastFramebufferCopy() (see its own comment) uses a
+        // streaming-load fast path when alignment allows -- guaranteed for
+        // --direct-raw-capture's own whole-screen reads, opportunistic for
+        // --direct-tiled-capture's tile-boundary ones -- and falls back to
+        // plain memcpy otherwise either way, so this is always correct
+        // regardless of which mode is active.
         const uint8_t* srcRow = g_directDesktopOrigin
             + (size_t)srcY * g_directBytesPerRow + (size_t)srcX * g_directBytesPerPixel;
         for (int row = srcY; row < srcBottom; row++) {
-            memcpy(dstRow, srcRow, rowBytes);
+            FastFramebufferCopy(dstRow, srcRow, rowBytes);
             srcRow += g_directBytesPerRow;
             dstRow += dstStride;
         }
