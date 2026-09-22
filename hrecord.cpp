@@ -516,6 +516,19 @@ bool g_rawCapture = false;
 // for exactly that reason). Any failure at any step leaves
 // g_directCaptureVerified false and every tile read keeps going through
 // BScreen exactly as it does today -- the fallback this flag promises.
+//
+// Promoted to the default (see main()'s own g_directTiledCapture
+// assignment) once real-world testing backed all of the above up: verifies
+// safe and connects cleanly on real hardware, and -- once
+// FastFramebufferCopy()'s SSE4.1 streaming-load fast path landed (see its
+// own comment further down; real GPU-mapped framebuffer memory is
+// typically write-combined, which ordinary memcpy handles poorly for
+// reads) -- measured roughly 10x faster than plain BScreen tiled reads
+// (~43-63ms/frame vs. the ~640-760ms/frame BScreen alone measured earlier)
+// with no window-drag smearing left at all, the artifact this whole
+// avenue was originally chasing. --direct-tiled-capture itself is still
+// accepted as an explicit flag (an inert confirmation, same as
+// --tiled-capture before it) for anyone who types it out of habit.
 bool g_directTiledCapture = false;
 bool g_directCaptureVerified = false;
 const uint8_t* g_directDesktopOrigin = nullptr;
@@ -2775,11 +2788,6 @@ int main(int argc, char* argv[]) {
             "--audioonly." << std::endl;
         rawCapture = false;
     }
-    if (directTiledCapture && audioOnly) {
-        std::cout << "[i] --direct-tiled-capture only affects video capture; ignored under "
-            "--audioonly." << std::endl;
-        directTiledCapture = false;
-    }
     if (directRawCapture && audioOnly) {
         std::cout << "[i] --direct-raw-capture only affects video capture; ignored under "
             "--audioonly." << std::endl;
@@ -2801,25 +2809,42 @@ int main(int argc, char* argv[]) {
             "one-read-per-frame behavior back." << std::endl;
         tiledCapture = false;
     }
+    if (directTiledCapture) {
+        // --direct-tiled-capture *was* its own opt-in flag; real-world
+        // testing (readme.md's own "--direct-tiled-capture" section) found
+        // it verifies safe and connects cleanly, and -- once the SSE4.1
+        // streaming-load fast path landed -- measured roughly 10x faster
+        // than plain BScreen tiled reads with no window-drag tearing left
+        // at all, on top of already gracefully falling back to the exact
+        // same plain BScreen tiled reads whenever any of that isn't true
+        // on the machine running it. That combination (safe by
+        // construction, faster when it can be, identical to the old
+        // default when it can't) is exactly what a default should be, so
+        // this is it now -- accepted as an explicit, inert confirmation,
+        // same as --tiled-capture above, not a separate opt-in anymore.
+        std::cout << "[i] --direct-tiled-capture: this is the default now (see readme.md), "
+            "so this flag doesn't change anything on its own; pass it if you like for "
+            "clarity. --direct-raw-capture is still its own explicit opt-in, for testing." << std::endl;
+        directTiledCapture = false;
+    }
 
-    // Five alternative video-capture engines, plus --raw-capture as a
-    // sixth fallback to the *original* default -- doesn't make sense to
-    // run more than one at once. Newest wins when explicitly combined:
-    // --direct-raw-capture over --direct-tiled-capture over
-    // --hybrid-capture over --experimental-screen-capture over
-    // --screen-capture-rcserver-method over --raw-capture, on the theory
-    // that whichever was added most recently is also whichever the user
-    // most likely meant to actually test. Just a sane tie-break for an
-    // unlikely combination, not a statement that one is strictly better
-    // than the others in general. (Tiled reads are the default now,
-    // handled by falling through when none of these six are set -- see
-    // the main loop below. Note --direct-tiled-capture itself still falls
-    // through to that same default code path -- it's the same tile grid,
-    // just with RefreshScreenRegion's own direct-pointer branch active
-    // underneath it when SetupDirectCapture() verified that's safe.
-    // --direct-raw-capture has its own dedicated branch instead, mirroring
-    // --raw-capture's own single-read shape -- see its own comment above
-    // for why.)
+    // Four *explicit* alternative video-capture engines, plus --raw-capture
+    // as a fifth fallback to the *original* default -- doesn't make sense
+    // to run more than one at once. --direct-tiled-capture isn't part of
+    // this chain at all anymore: it's the default now (falling through
+    // when none of these five are set, exactly like plain tiled reads
+    // always have -- see g_directTiledCapture's own comment below and the
+    // main loop), not a competing opt-in, so there's nothing left to
+    // resolve a conflict against. Newest wins when explicitly combined:
+    // --direct-raw-capture over --hybrid-capture over
+    // --experimental-screen-capture over --screen-capture-rcserver-method
+    // over --raw-capture, on the theory that whichever was added most
+    // recently is also whichever the user most likely meant to actually
+    // test. Just a sane tie-break for an unlikely combination, not a
+    // statement that one is strictly better than the others in general.
+    // (--direct-raw-capture has its own dedicated branch in the main loop,
+    // mirroring --raw-capture's own single-read shape -- see its own
+    // comment above for why.)
     if (hybridCapture && experimentalScreenCapture) {
         std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
             "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
@@ -2854,33 +2879,12 @@ int main(int argc, char* argv[]) {
             "--screen-capture-rcserver-method." << std::endl;
         rawCapture = false;
     }
-    // --direct-tiled-capture is the newest of the five, same tie-break
-    // convention as the others above: wins over any of them if combined.
-    if (directTiledCapture && hybridCapture) {
-        std::cout << "[i] --direct-tiled-capture and --hybrid-capture are alternative capture "
-            "engines; can't use both at once. Keeping --direct-tiled-capture." << std::endl;
-        hybridCapture = false;
-    }
-    if (directTiledCapture && experimentalScreenCapture) {
-        std::cout << "[i] --direct-tiled-capture and --experimental-screen-capture are "
-            "alternative capture engines; can't use both at once. Keeping "
-            "--direct-tiled-capture." << std::endl;
-        experimentalScreenCapture = false;
-    }
-    if (directTiledCapture && screenCaptureRcserverMethod) {
-        std::cout << "[i] --direct-tiled-capture and --screen-capture-rcserver-method are "
-            "alternative capture engines; can't use both at once. Keeping "
-            "--direct-tiled-capture." << std::endl;
-        screenCaptureRcserverMethod = false;
-    }
-    if (directTiledCapture && rawCapture) {
-        std::cout << "[i] --direct-tiled-capture and --raw-capture are alternative capture "
-            "engines; can't use both at once. Keeping --direct-tiled-capture." << std::endl;
-        rawCapture = false;
-    }
-    // --direct-raw-capture is the newest of the six, same tie-break
-    // convention as the others above: wins over any of them if combined,
-    // including --direct-tiled-capture.
+    // --direct-tiled-capture no longer competes here at all -- it's the
+    // default now (see its own no-op block above), not a separate opt-in,
+    // so there's nothing left to resolve a conflict against.
+    // --direct-raw-capture is still a real, explicit opt-in for testing,
+    // same tie-break convention as the others above: wins over any of them
+    // if combined.
     if (directRawCapture && hybridCapture) {
         std::cout << "[i] --direct-raw-capture and --hybrid-capture are alternative capture "
             "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
@@ -2902,11 +2906,6 @@ int main(int argc, char* argv[]) {
         std::cout << "[i] --direct-raw-capture and --raw-capture are alternative capture "
             "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
         rawCapture = false;
-    }
-    if (directRawCapture && directTiledCapture) {
-        std::cout << "[i] --direct-raw-capture and --direct-tiled-capture are alternative "
-            "capture engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
-        directTiledCapture = false;
     }
 
     // Read by the main capture loop (section 7) -- window-aware capture,
@@ -2952,19 +2951,6 @@ int main(int argc, char* argv[]) {
             "instead (see readme.md)." << std::endl;
     }
 
-    // Read by the main capture loop (section 7) -- same default tile grid,
-    // but through a verified-safe BDirectWindow pointer instead of BScreen
-    // when SetupDirectCapture() (called below, once haikuApp exists) finds
-    // one. See g_directTiledCapture's own comment above for the full
-    // design and safety checks.
-    g_directTiledCapture = directTiledCapture;
-    if (g_directTiledCapture) {
-        std::cout << "[i] --direct-tiled-capture: the default tile grid, read through a "
-            "BDirectWindow's raw framebuffer pointer when verified safe on this video "
-            "driver, falling back to the default (BScreen) tiled capture otherwise "
-            "(see readme.md)." << std::endl;
-    }
-
     // Read by the main capture loop (section 7) -- --raw-capture's own
     // single whole-screen read per frame, through the same verified-safe
     // BDirectWindow pointer when SetupDirectCapture() (called below) finds
@@ -2977,6 +2963,24 @@ int main(int argc, char* argv[]) {
             "verified safe on this video driver, falling back to plain --raw-capture "
             "behavior otherwise (see readme.md)." << std::endl;
     }
+
+    // Read by the main capture loop (section 7) -- the default tile grid,
+    // through a verified-safe BDirectWindow pointer instead of BScreen
+    // when SetupDirectCapture() (called below, once haikuApp exists) finds
+    // one. This is now what "no capture flag at all" means -- true
+    // whenever none of the five explicit alternative engines above were
+    // chosen, exactly the same condition that already decides whether the
+    // main loop falls through to the tiled default path. Real-world
+    // testing (readme.md's own "--direct-tiled-capture" section) found it
+    // verifies safe, connects cleanly, and -- with the SSE4.1 streaming-
+    // load fast path -- measured roughly 10x faster than plain BScreen
+    // tiled reads with no window-drag tearing left, while gracefully
+    // falling back to the exact same plain BScreen tiled reads whenever
+    // any of that isn't true on the machine running it -- safe by
+    // construction, faster when it can be, identical to the old default
+    // when it can't.
+    g_directTiledCapture = !hybridCapture && !experimentalScreenCapture
+        && !screenCaptureRcserverMethod && !rawCapture && !directRawCapture;
 
     if (logFps) {
         std::cout << "[i] --logfps: printing actual capture rate once per second (frames "
