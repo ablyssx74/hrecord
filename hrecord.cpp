@@ -522,6 +522,29 @@ const uint8_t* g_directDesktopOrigin = nullptr;
 uint32 g_directBytesPerRow = 0;
 int g_directBytesPerPixel = 0;
 
+// --direct-raw-capture: --raw-capture's own one-read-per-frame shape (no
+// tiling), through the same verified-safe direct pointer
+// --direct-tiled-capture uses. Real --logfps numbers on real hardware
+// showed --direct-tiled-capture only modestly faster than the plain
+// default (~642ms/frame vs. ~730-760ms/frame) -- not enough to meaningfully
+// shrink the full-screen sweep time, so a real recording with a window
+// being dragged still showed it smeared across two positions in one output
+// frame. That pointed at the framebuffer memory itself (real GPU-mapped
+// memory is typically write-combined, slow for CPU reads regardless of
+// access method) as the actual bottleneck, not the many small IPC calls
+// tiling was built to avoid. This mode tests a different angle on the same
+// smearing problem: --raw-capture's own single whole-screen read already
+// measured meaningfully faster than the tiled default even through plain
+// BScreen (~400-425ms vs. ~730-760ms, see "Real hardware vs. virtual
+// machines" above) -- purely from having far fewer, larger calls instead
+// of many small ones, independent of the memory-bandwidth question. One
+// big direct-pointer read combines both: whatever memory-bandwidth
+// advantage the direct pointer has, plus one tight, uninterrupted copy
+// loop instead of hundreds of small tile calls -- worth trying since it
+// targets total sweep *time* more directly than either
+// --direct-tiled-capture or --raw-capture alone did on their own.
+bool g_directRawCapture = false;
+
 // Adapted from research/directwindow_probe.cpp's own ProbeWindow, already
 // validated on real hardware: B_DIRECT_START/STOP/MODIFY are mutually-
 // exclusive *values* packed into buffer_state's low 4 bits
@@ -2608,6 +2631,7 @@ int main(int argc, char* argv[]) {
     bool hybridCapture = false;
     bool tiledCapture = false; // now the default; accepted as an inert, explicit confirmation
     bool directTiledCapture = false;
+    bool directRawCapture = false;
     bool rawCapture = false;
     bool stopRequested = false;
     bool listAudioInputs = false;
@@ -2635,6 +2659,8 @@ int main(int argc, char* argv[]) {
             tiledCapture = true;
         } else if (strcmp(argv[i], "--direct-tiled-capture") == 0) {
             directTiledCapture = true;
+        } else if (strcmp(argv[i], "--direct-raw-capture") == 0) {
+            directRawCapture = true;
         } else if (strcmp(argv[i], "--raw-capture") == 0) {
             rawCapture = true;
         } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
@@ -2651,8 +2677,8 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
                 "[--allaudio] [--realtime] [--experimental-screen-capture] "
                 "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
-                "[--direct-tiled-capture] [--raw-capture] [--list-audio-inputs] "
-                "[--logfps]" << std::endl;
+                "[--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] "
+                "[--list-audio-inputs] [--logfps]" << std::endl;
             return 0;
         }
     }
@@ -2682,6 +2708,11 @@ int main(int argc, char* argv[]) {
             "--audioonly." << std::endl;
         directTiledCapture = false;
     }
+    if (directRawCapture && audioOnly) {
+        std::cout << "[i] --direct-raw-capture only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        directRawCapture = false;
+    }
     if (logFps && audioOnly) {
         std::cout << "[i] --logfps only affects video capture; ignored under "
             "--audioonly." << std::endl;
@@ -2699,21 +2730,24 @@ int main(int argc, char* argv[]) {
         tiledCapture = false;
     }
 
-    // Four alternative video-capture engines, plus --raw-capture as a
-    // fifth fallback to the *original* default -- doesn't make sense to
+    // Five alternative video-capture engines, plus --raw-capture as a
+    // sixth fallback to the *original* default -- doesn't make sense to
     // run more than one at once. Newest wins when explicitly combined:
-    // --direct-tiled-capture over --hybrid-capture over
-    // --experimental-screen-capture over --screen-capture-rcserver-method
-    // over --raw-capture, on the theory that whichever was added most
-    // recently is also whichever the user most likely meant to actually
-    // test. Just a sane tie-break for an unlikely combination, not a
-    // statement that one is strictly better than the others in general.
-    // (Tiled reads are the default now, handled by falling through when
-    // none of these five are set -- see the main loop below. Note
-    // --direct-tiled-capture itself still falls through to that same
-    // default code path -- it's the same tile grid, just with
-    // RefreshScreenRegion's own direct-pointer branch active underneath
-    // it when SetupDirectCapture() verified that's safe.)
+    // --direct-raw-capture over --direct-tiled-capture over
+    // --hybrid-capture over --experimental-screen-capture over
+    // --screen-capture-rcserver-method over --raw-capture, on the theory
+    // that whichever was added most recently is also whichever the user
+    // most likely meant to actually test. Just a sane tie-break for an
+    // unlikely combination, not a statement that one is strictly better
+    // than the others in general. (Tiled reads are the default now,
+    // handled by falling through when none of these six are set -- see
+    // the main loop below. Note --direct-tiled-capture itself still falls
+    // through to that same default code path -- it's the same tile grid,
+    // just with RefreshScreenRegion's own direct-pointer branch active
+    // underneath it when SetupDirectCapture() verified that's safe.
+    // --direct-raw-capture has its own dedicated branch instead, mirroring
+    // --raw-capture's own single-read shape -- see its own comment above
+    // for why.)
     if (hybridCapture && experimentalScreenCapture) {
         std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
             "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
@@ -2772,6 +2806,36 @@ int main(int argc, char* argv[]) {
             "engines; can't use both at once. Keeping --direct-tiled-capture." << std::endl;
         rawCapture = false;
     }
+    // --direct-raw-capture is the newest of the six, same tie-break
+    // convention as the others above: wins over any of them if combined,
+    // including --direct-tiled-capture.
+    if (directRawCapture && hybridCapture) {
+        std::cout << "[i] --direct-raw-capture and --hybrid-capture are alternative capture "
+            "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
+        hybridCapture = false;
+    }
+    if (directRawCapture && experimentalScreenCapture) {
+        std::cout << "[i] --direct-raw-capture and --experimental-screen-capture are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--direct-raw-capture." << std::endl;
+        experimentalScreenCapture = false;
+    }
+    if (directRawCapture && screenCaptureRcserverMethod) {
+        std::cout << "[i] --direct-raw-capture and --screen-capture-rcserver-method are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--direct-raw-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
+    if (directRawCapture && rawCapture) {
+        std::cout << "[i] --direct-raw-capture and --raw-capture are alternative capture "
+            "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
+        rawCapture = false;
+    }
+    if (directRawCapture && directTiledCapture) {
+        std::cout << "[i] --direct-raw-capture and --direct-tiled-capture are alternative "
+            "capture engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
+        directTiledCapture = false;
+    }
 
     // Read by the main capture loop (section 7) -- window-aware capture,
     // see the section comment above EnumerateVisibleWindows() for the
@@ -2827,6 +2891,19 @@ int main(int argc, char* argv[]) {
             "BDirectWindow's raw framebuffer pointer when verified safe on this video "
             "driver, falling back to the default (BScreen) tiled capture otherwise "
             "(see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- --raw-capture's own
+    // single whole-screen read per frame, through the same verified-safe
+    // BDirectWindow pointer when SetupDirectCapture() (called below) finds
+    // one. See g_directRawCapture's own comment above for why this is
+    // worth trying separately from --direct-tiled-capture.
+    g_directRawCapture = directRawCapture;
+    if (g_directRawCapture) {
+        std::cout << "[i] --direct-raw-capture: one whole-screen read per frame (like "
+            "--raw-capture), through a BDirectWindow's raw framebuffer pointer when "
+            "verified safe on this video driver, falling back to plain --raw-capture "
+            "behavior otherwise (see readme.md)." << std::endl;
     }
 
     if (logFps) {
@@ -2963,7 +3040,7 @@ int main(int argc, char* argv[]) {
         if (outWidth < 2) outWidth = 2;
         if (outHeight < 2) outHeight = 2;
 
-        if (g_directTiledCapture) {
+        if (g_directTiledCapture || g_directRawCapture) {
             SetupDirectCapture();
         }
     }
@@ -3477,6 +3554,55 @@ int main(int argc, char* argv[]) {
                         pkt->stream_index = videoStream->index;
                         av_interleaved_write_frame(fmtCtx, pkt);
                         av_packet_unref(pkt);
+                    }
+                }
+            } else if (g_directRawCapture) {
+                // --raw-capture's own one-read-per-frame shape, through
+                // the verified-safe direct pointer when available -- see
+                // g_directRawCapture's own comment for why this, not more
+                // tiling, is the next thing worth trying against the
+                // window-drag smearing --direct-tiled-capture didn't fix.
+                // RefreshScreenRegion's direct-pointer branch (the same one
+                // --direct-tiled-capture already exercises per tile) does
+                // the whole screen in one pass here, instead of many tiles.
+                // Falls back to plain screen.ReadBitmap() -- exactly
+                // --raw-capture's own behavior -- when the direct pointer
+                // was never verified safe.
+                bool captured;
+                if (g_directCaptureVerified) {
+                    RefreshScreenRegion(BRect(0, 0, width - 1, height - 1), screen,
+                        screenBitmap, width, height);
+                    captured = true;
+                } else {
+                    captured = screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK;
+                }
+
+                // A failed capture just skips encoding for this iteration --
+                // same as a failed --raw-capture read below -- rather than
+                // falling through to code that assumes a fresh frame.
+                if (captured) {
+                    void* pixelBuffer = screenBitmap->Bits();
+                    captureElapsed = system_time() - loopIterationStart; // --logfps
+
+                    swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
+                        outWidth, outHeight, videoCodecCtx->pix_fmt,
+                        profile.swsFlags, nullptr, nullptr, nullptr);
+                    uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
+                    int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
+                    sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
+
+                    bigtime_t currentPresentationTime = system_time() - recordingStartTime;
+                    encodingFrame->pts = currentPresentationTime;
+
+                    std::lock_guard<std::mutex> lock(g_muxMutex);
+                    if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                        frameWritten = true; // --logfps: see its own declaration above the loop
+                        while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
+                            av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
+                            pkt->stream_index = videoStream->index;
+                            av_interleaved_write_frame(fmtCtx, pkt);
+                            av_packet_unref(pkt);
+                        }
                     }
                 }
             } else if (g_rawCapture && screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK) {
