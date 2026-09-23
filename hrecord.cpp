@@ -29,6 +29,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <atomic> // g_directCaptureVerified and friends -- see their own comment
 #include <csetjmp> // sigsetjmp/siglongjmp -- SetupDirectCapture()'s SIGSEGV/SIGBUS safety net
 #include <signal.h>
 #include <unistd.h>
@@ -530,10 +531,45 @@ bool g_rawCapture = false;
 // accepted as an explicit flag (an inert confirmation, same as
 // --tiled-capture before it) for anyone who types it out of habit.
 bool g_directTiledCapture = false;
-bool g_directCaptureVerified = false;
-const uint8_t* g_directDesktopOrigin = nullptr;
-uint32 g_directBytesPerRow = 0;
-int g_directBytesPerPixel = 0;
+
+// g_directCaptureHardwareSafe: set exactly once, by SetupDirectCapture(),
+// after its full four-step verification passes -- a property of this
+// driver/accelerant, confirmed once at startup, never re-verified per
+// connection event.
+//
+// g_directCaptureVerified/g_directDesktopOrigin/g_directBytesPerRow/
+// g_directBytesPerPixel: live, updated on *every* DirectConnected()
+// callback thereafter (see UpdateDirectCaptureGeometry() below), not just
+// the first one. A real crash on real hardware is what taught this
+// project that distinction matters: DirectConnected() fires again on a
+// workspace switch (this window uses B_FLOATING_ALL_WINDOW_FEEL
+// specifically so it stays connected across workspaces, which is *why*
+// it keeps firing) -- app_server can tear down and recreate the
+// underlying buffer area at a new address when that happens, and the
+// original code only ever captured the very first connection's geometry,
+// in SetupDirectCapture(), then never updated it again. Reading through
+// that stale pointer after a workspace switch reached memory not even
+// listed in the crashing process's own area map -- a real, reported
+// SIGSEGV inside FastFramebufferCopySSE41.
+//
+// All four are std::atomic because DirectConnected() runs on app_server's
+// own dedicated callback thread (confirmed by Haiku's own documentation
+// and this class's other comments), not the main thread the capture loop
+// runs on -- plain globals written from one thread and read from another
+// with no synchronization at all is a real data race, not just a
+// theoretical one, once writes happen after startup instead of only
+// before the capture loop begins. g_directCaptureVerified is the
+// publish/commit flag: UpdateDirectCaptureGeometry() always stores the
+// other three first, then g_directCaptureVerified last with release
+// ordering, so a reader that observes it true (loaded with acquire
+// ordering, see RefreshScreenRegion's own direct-read branch) is
+// guaranteed to see the geometry that goes with it, never a torn mix of
+// old and new.
+std::atomic<bool> g_directCaptureHardwareSafe(false);
+std::atomic<bool> g_directCaptureVerified(false);
+std::atomic<const uint8_t*> g_directDesktopOrigin(nullptr);
+std::atomic<uint32_t> g_directBytesPerRow(0);
+std::atomic<int> g_directBytesPerPixel(0);
 
 // --direct-raw-capture: --raw-capture's own one-read-per-frame shape (no
 // tiling), through the same verified-safe direct pointer
@@ -558,6 +594,61 @@ int g_directBytesPerPixel = 0;
 // --direct-tiled-capture or --raw-capture alone did on their own.
 bool g_directRawCapture = false;
 
+// Recomputes the desktop-space origin pointer/stride/bytes-per-pixel from
+// a fresh direct_buffer_info and publishes them -- called from
+// DirectConnected() on *every* connection event once the hardware is
+// known safe (see g_directCaptureHardwareSafe's own comment above for why
+// this exists at all: a workspace switch fires DirectConnected() again
+// with a real, different buffer, and this is what keeps the pointer this
+// project actually reads through in sync with that instead of frozen at
+// whatever it was at startup).
+//
+// mode == B_DIRECT_STOP means the buffer is going away right now
+// (workspace switch, mode change, connection torn down) -- stops trusting
+// the pointer immediately rather than risk reading it again before a
+// fresh B_DIRECT_START/MODIFY arrives with new, valid geometry. The
+// capture loop's own g_directCaptureVerified check (RefreshScreenRegion's
+// direct-read branch) means this window is never longer than "one
+// BScreen-based tile read instead of one direct-pointer read" -- a
+// visible but brief slowdown during the switch, never a crash.
+static void UpdateDirectCaptureGeometry(const direct_buffer_info& info, int mode) {
+    if (mode == B_DIRECT_STOP) {
+        g_directCaptureVerified.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    if (!g_directCaptureHardwareSafe.load(std::memory_order_relaxed)) {
+        // SetupDirectCapture()'s own one-time verification hasn't passed
+        // (or hasn't run) yet -- never trust geometry before that.
+        return;
+    }
+
+    if (info.bits == nullptr || info.bytes_per_row == 0
+            || (info.pixel_format != B_RGB32 && info.pixel_format != B_RGBA32)) {
+        g_directCaptureVerified.store(false, std::memory_order_relaxed);
+        return;
+    }
+    int bytesPerPixel = info.bits_per_pixel / 8;
+    if (bytesPerPixel != 4) {
+        g_directCaptureVerified.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    // window_bounds is set by app_server on every non-STOP connection
+    // event (DirectWindowInfo::SetState(), confirmed by reading its
+    // actual source) -- no need to separately Lock()/Frame() this
+    // window to find its current on-screen position the way
+    // SetupDirectCapture()'s own initial setup does.
+    const uint8_t* desktopOrigin = (const uint8_t*)info.bits
+        - (size_t)info.window_bounds.top * info.bytes_per_row
+        - (size_t)info.window_bounds.left * bytesPerPixel;
+
+    g_directDesktopOrigin.store(desktopOrigin, std::memory_order_relaxed);
+    g_directBytesPerRow.store(info.bytes_per_row, std::memory_order_relaxed);
+    g_directBytesPerPixel.store(bytesPerPixel, std::memory_order_relaxed);
+    g_directCaptureVerified.store(true, std::memory_order_release);
+}
+
 // Adapted from research/directwindow_probe.cpp's own ProbeWindow, already
 // validated on real hardware: B_DIRECT_START/STOP/MODIFY are mutually-
 // exclusive *values* packed into buffer_state's low 4 bits
@@ -580,7 +671,12 @@ public:
     }
 
     // Called by app_server on its own dedicated thread, not this window's
-    // usual message-handling thread.
+    // usual message-handling thread -- including again later, e.g. on a
+    // workspace switch (this window is B_FLOATING_ALL_WINDOW_FEEL
+    // specifically so it stays connected across those), not just once at
+    // startup. See UpdateDirectCaptureGeometry()'s own comment for why
+    // every call here, not just the first, has to update the geometry
+    // the capture loop actually reads through.
     virtual void DirectConnected(direct_buffer_info* info) {
         fLock.Lock();
         fInfo = *info;
@@ -592,6 +688,8 @@ public:
             fConnected = false;
         }
         fLock.Unlock();
+
+        UpdateDirectCaptureGeometry(*info, mode);
     }
 
     bool WaitForConnect(bigtime_t timeoutUs) {
@@ -718,18 +816,14 @@ static void SetupDirectCapture() {
         return;
     }
 
-    // BWindow state must only be read while holding the window's own
-    // BLooper lock -- true even from the thread that constructed it, once
-    // Show() has handed that lock off to the window's own spawned message
-    // thread (see research/directwindow_probe.cpp's own ProbeWindow
-    // comment for the cross-thread deadlock that taught this project that
-    // rule the hard way).
-    g_directCaptureWindow->Lock();
-    BRect windowFrame = g_directCaptureWindow->Frame();
-    g_directCaptureWindow->Unlock();
+    // window_bounds is set by app_server on every non-STOP connection
+    // event (DirectWindowInfo::SetState(), confirmed by reading its
+    // actual source) -- already part of the snapshot above, so no need to
+    // separately Lock()/Frame() this window to find its current on-screen
+    // position.
     const uint8_t* desktopOrigin = (const uint8_t*)info.bits
-        - (size_t)windowFrame.top * info.bytes_per_row
-        - (size_t)windowFrame.left * bytesPerPixel;
+        - (size_t)info.window_bounds.top * info.bytes_per_row
+        - (size_t)info.window_bounds.left * bytesPerPixel;
 
     // The actual safety test: read one pixel well outside this window's own
     // tiny (4x4, top-left corner) bounds -- the screen's own center, so
@@ -796,10 +890,14 @@ static void SetupDirectCapture() {
         return;
     }
 
-    g_directDesktopOrigin = desktopOrigin;
-    g_directBytesPerRow = info.bytes_per_row;
-    g_directBytesPerPixel = bytesPerPixel;
-    g_directCaptureVerified = true;
+    // desktopOrigin/bytesPerPixel computed just above are only used for
+    // the probe read (a real, verified-correct-once sample); the globals
+    // the capture loop actually reads through are populated by the same
+    // helper DirectConnected() calls on every later connection event, so
+    // they stay in sync with reality instead of frozen at this moment --
+    // see g_directCaptureHardwareSafe's own comment for why that matters.
+    g_directCaptureHardwareSafe.store(true, std::memory_order_relaxed);
+    UpdateDirectCaptureGeometry(info, info.buffer_state & B_DIRECT_MODE_MASK);
     std::cout << "[i] --direct-tiled-capture: verified safe on this video driver -- "
         "using the direct framebuffer pointer instead of BScreen for tile reads." << std::endl;
 }
@@ -996,23 +1094,34 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
         + (size_t)srcY * screenBitmap->BytesPerRow() + (size_t)srcX * 4;
     int dstStride = (int)screenBitmap->BytesPerRow();
 
-    if (g_directCaptureVerified) {
+    // Acquire ordering here pairs with UpdateDirectCaptureGeometry()'s own
+    // release store of this same flag -- if this load sees true, the
+    // three loads right below it are guaranteed to see the geometry that
+    // goes with it, not a stale/torn mix from before the most recent
+    // DirectConnected() event (which can land on a different thread at
+    // any time, including mid-frame -- see g_directCaptureVerified's own
+    // comment for the real crash, after a workspace switch, that not
+    // having this cost the project).
+    if (g_directCaptureVerified.load(std::memory_order_acquire)) {
         // --direct-tiled-capture/--direct-raw-capture, verified safe by
         // SetupDirectCapture(): a raw read straight from the framebuffer
         // pointer, no app_server IPC call at all. srcX/srcY are multiplied
-        // by g_directBytesPerPixel here, not left as a bare pixel count --
-        // see g_directTiledCapture's own comment for the real bug this
+        // by bytesPerPixel here, not left as a bare pixel count -- see
+        // g_directTiledCapture's own comment for the real bug this
         // avoids. FastFramebufferCopy() (see its own comment) uses a
         // streaming-load fast path when alignment allows -- guaranteed for
         // --direct-raw-capture's own whole-screen reads, opportunistic for
         // --direct-tiled-capture's tile-boundary ones -- and falls back to
         // plain memcpy otherwise either way, so this is always correct
         // regardless of which mode is active.
-        const uint8_t* srcRow = g_directDesktopOrigin
-            + (size_t)srcY * g_directBytesPerRow + (size_t)srcX * g_directBytesPerPixel;
+        const uint8_t* origin = g_directDesktopOrigin.load(std::memory_order_relaxed);
+        uint32_t bytesPerRow = g_directBytesPerRow.load(std::memory_order_relaxed);
+        int bytesPerPixel = g_directBytesPerPixel.load(std::memory_order_relaxed);
+        const uint8_t* srcRow = origin
+            + (size_t)srcY * bytesPerRow + (size_t)srcX * bytesPerPixel;
         for (int row = srcY; row < srcBottom; row++) {
             FastFramebufferCopy(dstRow, srcRow, rowBytes);
-            srcRow += g_directBytesPerRow;
+            srcRow += bytesPerRow;
             dstRow += dstStride;
         }
         return;
@@ -3645,7 +3754,7 @@ int main(int argc, char* argv[]) {
                 // --raw-capture's own behavior -- when the direct pointer
                 // was never verified safe.
                 bool captured;
-                if (g_directCaptureVerified) {
+                if (g_directCaptureVerified.load(std::memory_order_acquire)) {
                     RefreshScreenRegion(BRect(0, 0, width - 1, height - 1), screen,
                         screenBitmap, width, height);
                     captured = true;
