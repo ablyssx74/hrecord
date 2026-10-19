@@ -46,6 +46,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -74,7 +75,8 @@ enum {
 };
 
 static const float kFaderMin = -60.0f, kFaderMax = 12.0f;		// dB, on a fader
-static const float kMeterMin = -60.0f;							// dB, the bottom of a meter
+static const float kMeterMin = -60.0f;
+static const float kSilenceDb = -70.0f;					// a source quieter than this has made no sound yet: it has no strip							// dB, the bottom of a meter
 
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -210,6 +212,59 @@ private:
 
 
 // ---------------------------------------------------------------------------------------------------------------
+// The mouse wheel moves a slider: up raises it, down lowers it, `step` units a notch. Returns whether the message was a wheel
+// turn that it handled.
+static bool
+HandleWheel(BSlider* slider, BMessage* message, int32 step)
+{
+	if (message->what != B_MOUSE_WHEEL_CHANGED)
+		return false;
+	float deltaX = 0.0f, deltaY = 0.0f;
+	message->FindFloat("be:wheel_delta_x", &deltaX);
+	message->FindFloat("be:wheel_delta_y", &deltaY);
+	const float delta = deltaY != 0.0f ? -deltaY : deltaX;		// wheel down is a positive deltaY
+	if (delta == 0.0f)
+		return true;
+	int32 notches = (int32)(fabsf(delta) + 0.5f);
+	if (notches < 1)
+		notches = 1;
+	int32 minimum, maximum;
+	slider->GetLimits(&minimum, &maximum);
+	int32 value = slider->Value() + (delta > 0.0f ? notches : -notches) * step;
+	if (value < minimum)
+		value = minimum;
+	if (value > maximum)
+		value = maximum;
+	if (value != slider->Value()) {
+		slider->SetValue(value);
+		slider->Invoke();
+	}
+	return true;
+}
+
+
+// A slider with the mouse wheel on it, for those that are not one of the classes below.
+class StepSlider : public BSlider {
+public:
+	StepSlider(const char* name, const char* label, BMessage* message, int32 minValue, int32 maxValue,
+		orientation direction, int32 wheelStep)
+		:
+		BSlider(name, label, message, minValue, maxValue, direction),
+		fWheelStep(wheelStep)
+	{
+	}
+
+	void MessageReceived(BMessage* message)
+	{
+		if (!HandleWheel(this, message, fWheelStep))
+			BSlider::MessageReceived(message);
+	}
+
+private:
+	int32	fWheelStep;
+};
+
+
 // A fader in dB (steps of half a dB), shown with its value; a right click puts it back to 0 dB.
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -229,6 +284,12 @@ public:
 	}
 
 	float Db() const { return Value() / 2.0f; }
+
+	void MessageReceived(BMessage* message)
+	{
+		if (!HandleWheel(this, message, 2))		// a dB a notch
+			BSlider::MessageReceived(message);
+	}
 
 	const char* UpdateText() const
 	{
@@ -268,6 +329,12 @@ public:
 	}
 
 	float Pan() const { return Value() / 100.0f; }
+
+	void MessageReceived(BMessage* message)
+	{
+		if (!HandleWheel(this, message, 5))		// 5 % a notch
+			BSlider::MessageReceived(message);
+	}
 
 	const char* UpdateText() const
 	{
@@ -852,7 +919,7 @@ public:
 		fLimiter = new BCheckBox("limiter", "Limiter", new BMessage(kMsgLimiter));
 		fLimiter->SetValue(B_CONTROL_ON);
 		fCeiling = new DbSlider("ceiling", new BMessage(kMsgCeiling), -12.0f, 0.0f, B_HORIZONTAL, -1.0f);
-		fRelease = new BSlider("release", "Release", new BMessage(kMsgRelease), 10, 500, B_HORIZONTAL);
+		fRelease = new StepSlider("release", "Release", new BMessage(kMsgRelease), 10, 500, B_HORIZONTAL, 10);
 		fRelease->SetValue(80);
 		fRelease->SetModificationMessage(new BMessage(kMsgRelease));
 		fRelease->SetLimitLabels("10 ms", "500 ms");
@@ -1266,12 +1333,15 @@ private:
 			const char* quote = strchr(line, '"');
 			const char* last = quote != NULL ? strrchr(line, '"') : NULL;
 			std::string name = (quote != NULL && last != NULL && last > quote) ? std::string(quote + 1, last - quote - 1) : "source";
-			AddStrip(number - 1, name.c_str());
+			// the strip appears when the source makes its first sound (see UpdateMeters): a program that is connected but
+			// silent, such as a browser tab's idle player, would only show a strip with nothing on it
+			fPendingSources[number - 1] = name;
 			Log(line);
 			return;
 		}
 		// a source that has stopped (its program has quit) leaves the mix and loses its strip
 		if (sscanf(line, "[-] Removed source #%d", &number) == 1) {
+			fPendingSources.erase(number - 1);
 			RemoveStrip(number - 1);
 			Log(line);
 			return;
@@ -1306,6 +1376,11 @@ private:
 			if (sscanf(cursor, " #%d %f %f%n", &number, &left, &right, &used) < 3)
 				break;
 			cursor += used;
+			std::map<int, std::string>::iterator waiting = fPendingSources.find(number - 1);
+			if (waiting != fPendingSources.end() && std::max(left, right) > kSilenceDb) {
+				AddStrip(number - 1, waiting->second.c_str());
+				fPendingSources.erase(waiting);
+			}
 			for (size_t i = 0; i < fStrips.size(); i++) {
 				if (fStrips[i]->Index() == number - 1)
 					fStrips[i]->SetLevels(left, right);
@@ -1366,6 +1441,7 @@ private:
 			delete fStrips[i];
 		}
 		fStrips.clear();
+		fPendingSources.clear();
 		fHint->SetText("Start playing sound in the programs to record, then press Record. Each one gets a strip; programs that start later join by themselves.");
 		if (fHint->IsHidden())
 			fHint->Show();
@@ -1409,6 +1485,7 @@ private:
 	BView*				fStripsGroup;
 	BStringView*		fHint;
 	std::vector<SourceStrip*> fStrips;
+	std::map<int, std::string> fPendingSources;		// tapped but not heard yet: number - 1, name
 	DbSlider*			fMixGain;
 	StereoMeter*		fPreMeter;
 	StereoMeter*		fPostMeter;
