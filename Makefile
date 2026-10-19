@@ -1,12 +1,12 @@
 # hrecord Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
-VERSION = 1.12.1
+VERSION = 1.13.0
 PACKAGE_DIR := build/package
 DUMMY_PC_PATH := $(shell pwd)/build/pkgconfig
 
 # Source mapping parameters
-GUI_SRCS = hrecord.cpp
+GUI_SRCS = hrecord.cpp stream/hrecord_stream.cpp
 GUI_OBJS = $(GUI_SRCS:.cpp=.o)
 
 # FIXED: Standardized target matching. Checking for hrecord.rdef instead of hTV.rdef
@@ -61,7 +61,7 @@ LIBS = $(LIB_PATH) $(EXTRA_LIBS) $(HAIKU_LIBS)
 
 # The mixer window: runs hrecord as its engine
 gui: hrecord_gui.cpp hrecord_mixer.rdef
-	$(CXX) -std=c++17 -O2 -Wall $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lroot
+	$(CXX) -std=c++17 -O2 -Wall $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lroot -lnetwork
 	rc -o hrecord_mixer.rsrc hrecord_mixer.rdef
 	xres -o hrecord_mixer hrecord_mixer.rsrc
 	mimeset -f hrecord_mixer
@@ -86,13 +86,13 @@ $(GUI_RSRCS): hrecord.rdef
 
 # Deep system cleaning target
 clean:
-	rm -f *.o *.rsrc *.hpkg $(GUI_TARGET) 
+	rm -f *.o stream/*.o *.rsrc *.hpkg $(GUI_TARGET) hrecord_mixer stream/hrecord_x264 
 	rm -rf build
 
 
 
 
-release: all gui
+release: all gui stream-release
 	@[ -n "$(PACKAGE_DIR)" ] || { echo "PACKAGE_DIR is undefined"; exit 1; }
 	rm -rf "./$(PACKAGE_DIR)"
 	mkdir -p $(PACKAGE_DIR)
@@ -106,3 +106,16 @@ release: all gui
 
 
 
+
+
+# The H.264 add-on of hrecord's live streaming, as a package of its own (it is GPL, because it is built on x264)
+STREAM_PACKAGE_DIR := build/stream_package
+stream-release:
+	$(MAKE) -C stream
+	rm -rf "./$(STREAM_PACKAGE_DIR)"
+	mkdir -p $(STREAM_PACKAGE_DIR)/add-ons/hrecord
+	sed -e 's/$$(VERSION)/$(VERSION)/g' -e 's/$$(ARCH)/$(ARCH)/' -e 's/$$(DEP_SUFFIX)/$(DEP_SUFFIX)/g' -e 's/$$(YEAR)/$(shell date +%Y)/' stream/hrecord_stream.tpl > $(STREAM_PACKAGE_DIR)/.PackageInfo
+	cp stream/hrecord_x264 $(STREAM_PACKAGE_DIR)/add-ons/hrecord/hrecord_x264
+	package create -C $(STREAM_PACKAGE_DIR) hrecord_stream-$(VERSION)-1-$(ARCH).hpkg
+
+.PHONY: stream-release

@@ -16,8 +16,10 @@
 #include <GroupLayout.h>
 #include <LayoutBuilder.h>
 #include <MenuField.h>
+#include <File.h>
 #include <MenuItem.h>
 #include <Message.h>
+#include <Url.h>
 #include <MessageRunner.h>
 #include <Messenger.h>
 #include <Path.h>
@@ -25,8 +27,10 @@
 #include <Roster.h>
 #include <String.h>
 #include <ScrollView.h>
+#include <Spinner.h>
 #include <Slider.h>
 #include <StringView.h>
+#include <TextControl.h>
 #include <TextView.h>
 #include <View.h>
 #include <Window.h>
@@ -38,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -60,7 +65,12 @@ enum {
 	kMsgMixGain		= 'mxg!',
 	kMsgCeiling		= 'cei!',
 	kMsgRelease		= 'rls!',
-	kMsgLimiter		= 'lim!'
+	kMsgLimiter		= 'lim!',
+	kMsgStreamToggle	= 'stg!',
+	kMsgStreamConfigure	= 'scf!',
+	kMsgStreamSaved		= 'ssv!',
+	kMsgStreamService	= 'ssc!',
+	kMsgStreamSave		= 'sav!'
 };
 
 static const float kFaderMin = -60.0f, kFaderMax = 12.0f;		// dB, on a fader
@@ -85,8 +95,8 @@ public:
 		fHoldTime(0)
 	{
 		SetViewColor(B_TRANSPARENT_COLOR);
-		SetExplicitMinSize(vertical ? BSize(14, 80) : BSize(80, 12));
-		SetExplicitPreferredSize(vertical ? BSize(16, 200) : BSize(160, 14));
+		SetExplicitMinSize(vertical ? BSize(7, 80) : BSize(80, 12));
+		SetExplicitPreferredSize(vertical ? BSize(8, 200) : BSize(160, 14));
 	}
 
 	void SetLevel(float db)
@@ -169,6 +179,33 @@ private:
 	bool		fReduction;
 	float		fLevel, fHold;
 	bigtime_t	fHoldTime;
+};
+
+
+// A left and a right level meter side by side.
+class StereoMeter : public BView {
+public:
+	StereoMeter(const char* name, float low, float high)
+		:
+		BView(name, 0),
+		fLeft(new LevelMeter("left", true, low, high)),
+		fRight(new LevelMeter("right", true, low, high))
+	{
+		SetViewColor(B_TRANSPARENT_COLOR);
+		BLayoutBuilder::Group<>(this, B_HORIZONTAL, 1)
+			.Add(fLeft)
+			.Add(fRight);
+	}
+
+	void SetLevels(float left, float right)
+	{
+		fLeft->SetLevel(left);
+		fRight->SetLevel(right);
+	}
+
+private:
+	LevelMeter*	fLeft;
+	LevelMeter*	fRight;
 };
 
 
@@ -284,7 +321,7 @@ public:
 		gain->AddInt32("source", index);
 		fFader = new DbSlider("fader", gain, kFaderMin, kFaderMax, B_VERTICAL);
 		fFader->SetExplicitMinSize(BSize(60, 160));
-		fMeter = new LevelMeter("meter", true, kMeterMin, 0.0f);
+		fMeter = new StereoMeter("meter", kMeterMin, 0.0f);
 
 		BMessage* pan = new BMessage(kMsgPan);
 		pan->AddInt32("source", index);
@@ -320,7 +357,7 @@ public:
 		fSolo->SetTarget(Window());
 	}
 
-	void SetLevel(float db) { fMeter->SetLevel(db); }
+	void SetLevels(float left, float right) { fMeter->SetLevels(left, right); }
 	int Index() const { return fIndex; }
 	float Pan() const { return fPan->Pan(); }
 	float Gain() const { return fFader->Db(); }
@@ -331,7 +368,7 @@ private:
 	BStringView*	fName;
 	DbSlider*		fFader;
 	PanSlider*		fPan;
-	LevelMeter*		fMeter;
+	StereoMeter*	fMeter;
 	BCheckBox*		fMute;
 	BCheckBox*		fSolo;
 };
@@ -501,6 +538,269 @@ Engine::ProgramPath()
 
 
 // ---------------------------------------------------------------------------------------------------------------
+// Live streaming: where to, and how. Kept in a settings file; the stream key in it is private to the user's account.
+// ---------------------------------------------------------------------------------------------------------------
+
+struct StreamService {
+	const char*	name;
+	const char*	base;		// the server's address up to the stream key; empty: the user enters it
+};
+
+static const StreamService kStreamServices[] = {
+	{ "YouTube (RTMPS, recommended)",	"rtmps://a.rtmps.youtube.com:443/live2" },
+	{ "YouTube (RTMP)",					"rtmp://a.rtmp.youtube.com/live2" },
+	{ "Twitch",							"rtmp://live.twitch.tv/app" },
+	{ "Facebook Live",					"rtmps://live-api-s.facebook.com:443/rtmp" },
+	{ "Other RTMP / RTMPS server",		"" },
+	{ "RTSP server",					"" }
+};
+static const int kStreamServiceCount = sizeof(kStreamServices) / sizeof(kStreamServices[0]);
+static const int kServiceCustomRtmp = 4;
+static const int kServiceRtsp = 5;
+
+// where the add-on is downloaded from (the hrecord_stream package, in the release list)
+static const char* kAddonDownloadUrl = "https://github.com/ablyssx74/hrecord/releases/latest";
+
+static const char* kStreamPresets[] = { "ultrafast", "superfast", "veryfast", "faster", "fast", "medium" };
+static const int kStreamPresetCount = sizeof(kStreamPresets) / sizeof(kStreamPresets[0]);
+
+struct StreamConfig {
+	bool		enabled = false;		// the "Stream live" box
+	int			service = 0;
+	std::string	server;					// for the services that have no fixed address
+	std::string	key;
+	int			videoKbps = 2500;
+	int			audioKbps = 128;
+	int			preset = 2;				// veryfast
+	int			keyintSeconds = 2;
+
+	std::string BaseAddress() const
+	{
+		std::string base = service < kServiceCustomRtmp ? kStreamServices[service].base : server;
+		while (!base.empty() && (base[base.size() - 1] == '/' || base[base.size() - 1] == ' '))
+			base.resize(base.size() - 1);
+		return base;
+	}
+
+	// The whole address hrecord sends to (with the key).
+	std::string Url() const
+	{
+		std::string base = BaseAddress();
+		if (service == kServiceRtsp || key.empty())
+			return base;
+		return base + "/" + key;
+	}
+
+	// What is missing, or empty when it is fine.
+	std::string Problem() const
+	{
+		const std::string base = BaseAddress();
+		if (service == kServiceRtsp) {
+			if (base.compare(0, 7, "rtsp://") != 0)
+				return "Stream settings: the RTSP address must start with rtsp://";
+			return "";
+		}
+		if (service == kServiceCustomRtmp && base.compare(0, 7, "rtmp://") != 0 && base.compare(0, 8, "rtmps://") != 0)
+			return "Stream settings: the server address must start with rtmp:// or rtmps://";
+		if (key.empty())
+			return "Stream settings: enter the stream key.";
+		return "";
+	}
+
+	static std::string FilePath()
+	{
+		BPath path;
+		if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK)
+			return "";
+		path.Append("hrecord_mixer_settings");
+		return path.Path();
+	}
+
+	void Load()
+	{
+		BFile file(FilePath().c_str(), B_READ_ONLY);
+		BMessage message;
+		if (file.InitCheck() != B_OK || message.Unflatten(&file) != B_OK)
+			return;
+		int32 number;
+		const char* text;
+		bool flag;
+		if (message.FindBool("stream", &flag) == B_OK) enabled = flag;
+		if (message.FindInt32("service", &number) == B_OK && number >= 0 && number < kStreamServiceCount) service = number;
+		if (message.FindString("server", &text) == B_OK) server = text;
+		if (message.FindString("key", &text) == B_OK) key = text;
+		if (message.FindInt32("video", &number) == B_OK) videoKbps = number;
+		if (message.FindInt32("audio", &number) == B_OK) audioKbps = number;
+		if (message.FindInt32("preset", &number) == B_OK && number >= 0 && number < kStreamPresetCount) preset = number;
+		if (message.FindInt32("keyint", &number) == B_OK) keyintSeconds = number;
+	}
+
+	void Save() const
+	{
+		BMessage message;
+		message.AddBool("stream", enabled);
+		message.AddInt32("service", service);
+		message.AddString("server", server.c_str());
+		message.AddString("key", key.c_str());
+		message.AddInt32("video", videoKbps);
+		message.AddInt32("audio", audioKbps);
+		message.AddInt32("preset", preset);
+		message.AddInt32("keyint", keyintSeconds);
+		const std::string path = FilePath();
+		if (path.empty())
+			return;
+		BFile file(path.c_str(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+		if (file.InitCheck() != B_OK)
+			return;
+		message.Flatten(&file);
+		chmod(path.c_str(), S_IRUSR | S_IWUSR);		// the stream key is for this user only
+	}
+};
+
+
+class StreamSettingsWindow : public BWindow {
+public:
+	StreamSettingsWindow(BMessenger owner, const StreamConfig& config)
+		:
+		BWindow(BRect(200, 200, 600, 520), "Stream settings", B_TITLED_WINDOW_LOOK, B_MODAL_APP_WINDOW_FEEL,
+			B_NOT_ZOOMABLE | B_NOT_RESIZABLE | B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
+		fOwner(owner)
+	{
+		fServiceMenu = new BPopUpMenu("service");
+		for (int i = 0; i < kStreamServiceCount; i++) {
+			BMenuItem* item = new BMenuItem(kStreamServices[i].name, new BMessage(kMsgStreamService));
+			fServiceMenu->AddItem(item);
+		}
+		fServiceMenu->ItemAt(config.service)->SetMarked(true);
+		fService = new BMenuField("service", "Stream to:", fServiceMenu);
+
+		fServer = new BTextControl("server", "Server address:", config.server.c_str(), NULL);
+		fKey = new BTextControl("key", "Stream key:", config.key.c_str(), NULL);
+		fKey->TextView()->HideTyping(true);
+
+		fVideo = new BSpinner("video", "Video bitrate (kbps):", NULL);
+		fVideo->SetRange(300, 20000);
+		fVideo->SetValue(config.videoKbps);
+		fAudio = new BSpinner("audio", "Audio bitrate (kbps):", NULL);
+		fAudio->SetRange(32, 320);
+		fAudio->SetValue(config.audioKbps);
+		fKeyint = new BSpinner("keyint", "Key frame every (s):", NULL);
+		fKeyint->SetRange(1, 10);
+		fKeyint->SetValue(config.keyintSeconds);
+
+		fPresetMenu = new BPopUpMenu("preset");
+		for (int i = 0; i < kStreamPresetCount; i++)
+			fPresetMenu->AddItem(new BMenuItem(kStreamPresets[i], NULL));
+		fPresetMenu->ItemAt(config.preset)->SetMarked(true);
+		fPreset = new BMenuField("preset", "Encoder speed:", fPresetMenu);
+
+		BStringView* note1 = new BStringView("note1", "The size and frame rate follow the Screen quality menu (Low: 1280 wide, 15 fps;");
+		BStringView* note2 = new BStringView("note2", "Medium: 1600, 24 fps; High: the whole screen, 30 fps). Faster encoder speeds use less CPU.");
+		BStringView* note3 = new BStringView("note3", "The stream key is kept in your settings folder, readable by your account only.");
+
+		BButton* save = new BButton("save", "Save", new BMessage(kMsgStreamSave));
+		save->MakeDefault(true);
+		BButton* cancel = new BButton("cancel", "Cancel", new BMessage(B_QUIT_REQUESTED));
+
+		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
+			.SetInsets(B_USE_WINDOW_INSETS)
+			.AddGrid(B_USE_DEFAULT_SPACING, B_USE_SMALL_SPACING)
+				.Add(fService->CreateLabelLayoutItem(), 0, 0)
+				.Add(fService->CreateMenuBarLayoutItem(), 1, 0)
+				.Add(fServer->CreateLabelLayoutItem(), 0, 1)
+				.Add(fServer->CreateTextViewLayoutItem(), 1, 1)
+				.Add(fKey->CreateLabelLayoutItem(), 0, 2)
+				.Add(fKey->CreateTextViewLayoutItem(), 1, 2)
+				.Add(fVideo->CreateLabelLayoutItem(), 0, 3)
+				.Add(fVideo->CreateTextViewLayoutItem(), 1, 3)
+				.Add(fAudio->CreateLabelLayoutItem(), 0, 4)
+				.Add(fAudio->CreateTextViewLayoutItem(), 1, 4)
+				.Add(fKeyint->CreateLabelLayoutItem(), 0, 5)
+				.Add(fKeyint->CreateTextViewLayoutItem(), 1, 5)
+				.Add(fPreset->CreateLabelLayoutItem(), 0, 6)
+				.Add(fPreset->CreateMenuBarLayoutItem(), 1, 6)
+			.End()
+			.Add(note1)
+			.Add(note2)
+			.Add(note3)
+			.AddGroup(B_HORIZONTAL)
+				.AddGlue()
+				.Add(cancel)
+				.Add(save)
+			.End();
+
+		fSavedServer = config.server;
+		UpdateServiceFields(false);
+		CenterOnScreen();
+	}
+
+	void MessageReceived(BMessage* message)
+	{
+		switch (message->what) {
+			case kMsgStreamService:
+				UpdateServiceFields(true);
+				break;
+			case kMsgStreamSave:
+			{
+				BMessage saved(kMsgStreamSaved);
+				saved.AddInt32("service", Service());
+				saved.AddString("server", Service() >= kServiceCustomRtmp ? fServer->Text() : fSavedServer.c_str());
+				saved.AddString("key", fKey->Text());
+				saved.AddInt32("video", fVideo->Value());
+				saved.AddInt32("audio", fAudio->Value());
+				BMenuItem* marked = fPresetMenu->FindMarked();
+				saved.AddInt32("preset", marked != NULL ? fPresetMenu->IndexOf(marked) : 2);
+				saved.AddInt32("keyint", fKeyint->Value());
+				fOwner.SendMessage(&saved);
+				PostMessage(B_QUIT_REQUESTED);
+				break;
+			}
+			default:
+				BWindow::MessageReceived(message);
+		}
+	}
+
+private:
+	int Service() const
+	{
+		BMenuItem* marked = fServiceMenu->FindMarked();
+		return marked != NULL ? fServiceMenu->IndexOf(marked) : 0;
+	}
+
+	// The fixed services show their address (and cannot be changed); the others have a box to fill in.
+	void UpdateServiceFields(bool changed)
+	{
+		const int service = Service();
+		if (service < kServiceCustomRtmp) {
+			if (changed && fServer->IsEnabled())
+				fSavedServer = fServer->Text();
+			fServer->SetText(kStreamServices[service].base);
+			fServer->SetEnabled(false);
+			fKey->SetEnabled(true);
+		} else {
+			if (!fServer->IsEnabled())
+				fServer->SetText(fSavedServer.c_str());
+			fServer->SetEnabled(true);
+			fKey->SetEnabled(service != kServiceRtsp);
+			fServer->SetLabel(service == kServiceRtsp ? "RTSP address:" : "Server address:");
+		}
+	}
+
+	BMessenger		fOwner;
+	BPopUpMenu*		fServiceMenu;
+	BMenuField*		fService;
+	BTextControl*	fServer;
+	BTextControl*	fKey;
+	BSpinner*		fVideo;
+	BSpinner*		fAudio;
+	BSpinner*		fKeyint;
+	BPopUpMenu*		fPresetMenu;
+	BMenuField*		fPreset;
+	std::string		fSavedServer;
+};
+
+
+// ---------------------------------------------------------------------------------------------------------------
 // The window
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -519,6 +819,9 @@ public:
 		fStop->SetEnabled(false);
 		fScreen = new BCheckBox("screen", "Record the screen too", NULL);
 		fRealtime = new BCheckBox("realtime", "Real-time (low latency)", NULL);
+		fStreamConfig.Load();
+		fStream = new BCheckBox("stream", "Stream live", new BMessage(kMsgStreamToggle));
+		fStreamSettings = new BButton("streamsettings", "Stream settings" B_UTF8_ELLIPSIS, new BMessage(kMsgStreamConfigure));
 		fQualityMenu = new BPopUpMenu("quality");
 		fQualityMenu->AddItem(new BMenuItem("Low", NULL));
 		fQualityMenu->AddItem(new BMenuItem("Medium", NULL));
@@ -542,8 +845,8 @@ public:
 		// the master section: the whole mix and the limiter
 		fMixGain = new DbSlider("mixgain", new BMessage(kMsgMixGain), -12.0f, 12.0f, B_VERTICAL);
 		fMixGain->SetExplicitMinSize(BSize(60, 120));
-		fPreMeter = new LevelMeter("pre", true, kMeterMin, 6.0f);
-		fPostMeter = new LevelMeter("post", true, kMeterMin, 6.0f);
+		fPreMeter = new StereoMeter("pre", kMeterMin, 6.0f);
+		fPostMeter = new StereoMeter("post", kMeterMin, 6.0f);
 		fLimiter = new BCheckBox("limiter", "Limiter", new BMessage(kMsgLimiter));
 		fLimiter->SetValue(B_CONTROL_ON);
 		fCeiling = new DbSlider("ceiling", new BMessage(kMsgCeiling), -12.0f, 0.0f, B_HORIZONTAL, -1.0f);
@@ -599,6 +902,10 @@ public:
 				.Add(fScreen)
 				.Add(fQuality)
 				.Add(fRealtime)
+				.AddGroup(B_VERTICAL, 2)
+					.Add(fStream)
+					.Add(fStreamSettings)
+				.End()
 				.AddGlue()
 				.Add(fTime)
 			.End()
@@ -610,6 +917,7 @@ public:
 			.Add(logScroll);
 
 		RefreshRealtime();
+		RefreshStream();
 	}
 
 	bool QuitRequested()
@@ -702,6 +1010,40 @@ public:
 			case kMsgRelease:
 				SendCommand("release %d\n", (int)fRelease->Value());
 				break;
+			case kMsgStreamToggle:
+				if (!fStreamAddon)
+					RefreshStream();		// perhaps it was installed just now
+				if (!fStreamAddon) {
+					// streaming needs the H.264 add-on: take the user to where it is downloaded
+					fStream->SetValue(B_CONTROL_OFF);
+					SetStatus("Streaming needs the H.264 add-on (the hrecord_stream package). Opening its download page...");
+					BString address(kAddonDownloadUrl);
+					BUrl url;
+					url.SetUrlString(address, true);
+					url.OpenWithPreferredApplication();
+					break;
+				}
+				fStreamConfig.enabled = fStream->Value() == B_CONTROL_ON;
+				fStreamConfig.Save();
+				ApplyStreamState();
+				break;
+			case kMsgStreamConfigure:
+				(new StreamSettingsWindow(BMessenger(this), fStreamConfig))->Show();
+				break;
+			case kMsgStreamSaved:
+			{
+				int32 number;
+				const char* text;
+				if (message->FindInt32("service", &number) == B_OK) fStreamConfig.service = number;
+				if (message->FindString("server", &text) == B_OK) fStreamConfig.server = text;
+				if (message->FindString("key", &text) == B_OK) fStreamConfig.key = text;
+				if (message->FindInt32("video", &number) == B_OK) fStreamConfig.videoKbps = number;
+				if (message->FindInt32("audio", &number) == B_OK) fStreamConfig.audioKbps = number;
+				if (message->FindInt32("preset", &number) == B_OK) fStreamConfig.preset = number;
+				if (message->FindInt32("keyint", &number) == B_OK) fStreamConfig.keyintSeconds = number;
+				fStreamConfig.Save();
+				break;
+			}
 			case kMsgLimiter:
 				SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
 				fCeiling->SetEnabled(fLimiter->Value() == B_CONTROL_ON);
@@ -754,15 +1096,61 @@ private:
 		}
 	}
 
+	// Is the H.264 add-on there? The streaming box can be used only when it is.
+	void RefreshStream()
+	{
+		std::string command = "\"" + Engine::ProgramPath() + "\" --detect-stream 2>/dev/null";
+		char answer[128] = "";
+		FILE* pipe = popen(command.c_str(), "r");
+		if (pipe != NULL) {
+			if (fgets(answer, sizeof(answer), pipe) == NULL)
+				answer[0] = '\0';
+			pclose(pipe);
+		}
+		fStreamAddon = strncmp(answer, "stream on", 9) == 0;
+		ApplyStreamState();
+	}
+
+	void ApplyStreamState()
+	{
+		const bool idle = !fRecording;
+		fStream->SetEnabled(idle);		// without the add-on a click opens its download page
+		fStreamSettings->SetEnabled(fStreamAddon && idle);
+		if (fStreamAddon) {
+			fStream->SetValue(fStreamConfig.enabled ? B_CONTROL_ON : B_CONTROL_OFF);
+			fStream->SetToolTip((const char*)NULL);
+		} else {
+			fStream->SetValue(B_CONTROL_OFF);
+			fStream->SetToolTip("Streaming needs the H.264 add-on (the hrecord_stream package), which is not installed. "
+				"Click to open its download page.");
+			fStreamSettings->SetToolTip("Available when the H.264 add-on (the hrecord_stream package) is installed.");
+		}
+		// streaming sends the screen, so the screen is always recorded with it
+		const bool streaming = fStreamAddon && fStreamConfig.enabled;
+		if (streaming)
+			fScreen->SetValue(B_CONTROL_ON);
+		fScreen->SetEnabled(idle && !streaming);
+	}
+
 	void StartRecording()
 	{
 		if (fEngine.Running())
 			return;
 		RefreshRealtime();
+		RefreshStream();
+		const bool streaming = fStream->IsEnabled() && fStream->Value() == B_CONTROL_ON;
+		if (streaming) {
+			const std::string problem = fStreamConfig.Problem();
+			if (!problem.empty()) {
+				SetStatus(problem.c_str());
+				(new StreamSettingsWindow(BMessenger(this), fStreamConfig))->Show();
+				return;
+			}
+		}
 		ClearStrips();
 		std::vector<std::string> arguments;
 		arguments.push_back("start");
-		if (fScreen->Value() != B_CONTROL_ON)
+		if (fScreen->Value() != B_CONTROL_ON && !streaming)
 			arguments.push_back("--audioonly");
 		arguments.push_back("--allaudio");
 		arguments.push_back("--meter");
@@ -771,7 +1159,19 @@ private:
 		arguments.push_back("--control");
 		if (fRealtime->IsEnabled() && fRealtime->Value() == B_CONTROL_ON)
 			arguments.push_back("--realtime");
-		if (fScreen->Value() == B_CONTROL_ON) {
+		if (streaming) {
+			// the address holds the stream key, so it goes to hrecord in its environment, not on the command line
+			arguments.push_back("--stream-env");
+			arguments.push_back("--stream-bitrate");
+			arguments.push_back(std::to_string(fStreamConfig.videoKbps));
+			arguments.push_back("--stream-audio-bitrate");
+			arguments.push_back(std::to_string(fStreamConfig.audioKbps));
+			arguments.push_back("--stream-preset");
+			arguments.push_back(kStreamPresets[fStreamConfig.preset]);
+			arguments.push_back("--stream-keyint");
+			arguments.push_back(std::to_string(fStreamConfig.keyintSeconds));
+		}
+		if (fScreen->Value() == B_CONTROL_ON || streaming) {
 			BMenuItem* marked = fQualityMenu->FindMarked();
 			int32 index = marked != NULL ? fQualityMenu->IndexOf(marked) : 1;
 			arguments.push_back(index == 0 ? "--low" : (index == 2 ? "--high" : "--medium"));
@@ -783,10 +1183,15 @@ private:
 		fPendingLimiter = fLimiter->Value() == B_CONTROL_ON;
 
 		std::string error;
-		if (!fEngine.Start(arguments, BMessenger(this), error)) {
+		if (streaming)
+			setenv("HRECORD_STREAM_URL", fStreamConfig.Url().c_str(), 1);
+		const bool started = fEngine.Start(arguments, BMessenger(this), error);
+		unsetenv("HRECORD_STREAM_URL");
+		if (!started) {
 			SetStatus(error.c_str());
 			return;
 		}
+		fStreamingNow = false;
 		fRecording = true;
 		fStopping = false;
 		fSeconds = 0;
@@ -798,6 +1203,8 @@ private:
 		fStop->SetEnabled(true);
 		fScreen->SetEnabled(false);
 		fRealtime->SetEnabled(false);
+		fStream->SetEnabled(false);
+		fStreamSettings->SetEnabled(false);
 		SetStatus("Starting hrecord...");
 		fOutputFile = "";
 		Log("-- recording started --");
@@ -826,12 +1233,12 @@ private:
 		fTick = NULL;
 		fRecord->SetEnabled(true);
 		fStop->SetEnabled(false);
-		fScreen->SetEnabled(true);
 		RefreshRealtime();
+		RefreshStream();
 		for (size_t i = 0; i < fStrips.size(); i++)
-			fStrips[i]->SetLevel(kMeterMin);
-		fPreMeter->SetLevel(kMeterMin);
-		fPostMeter->SetLevel(kMeterMin);
+			fStrips[i]->SetLevels(kMeterMin, kMeterMin);
+		fPreMeter->SetLevels(kMeterMin, kMeterMin);
+		fPostMeter->SetLevels(kMeterMin, kMeterMin);
 		fReduction->SetLevel(0.0f);
 		if (fOutputFile.length() > 0) {
 			BString text("Saved: ");
@@ -866,8 +1273,10 @@ private:
 				path.resize(end);
 			fOutputFile = path;
 		}
+		if (strstr(line, "[+] Streaming to ") != NULL)
+			fStreamingNow = true;
 		if (strstr(line, "[+] Tapped ") != NULL && strstr(line, "currently-playing") != NULL)
-			SetStatus("Recording.");
+			SetStatus(fStreamingNow ? "Live: streaming and recording." : "Recording.");
 		if (strstr(line, "[meter]") != NULL || strstr(line, "    ") == line)
 			; // the summary lines go to the log too
 		Log(line);
@@ -875,27 +1284,28 @@ private:
 			SetStatus(line);
 	}
 
-	// "[meter] #1 -0.9 #2 -3.2 | mix before 3.5 after -1.0 dBFS | limiter -4.5 dB"
+	// "[meter] #1 -0.9 -3.0 #2 -3.2 -3.2 | mix before 3.5 3.1 after -1.0 -1.0 dBFS | limiter -4.5 dB"
 	void UpdateMeters(const char* line)
 	{
 		const char* cursor = line + 7;
 		for (;;) {
 			int number = 0;
-			float db = 0;
+			float left = 0, right = 0;
 			int used = 0;
-			if (sscanf(cursor, " #%d %f%n", &number, &db, &used) < 2)
+			if (sscanf(cursor, " #%d %f %f%n", &number, &left, &right, &used) < 3)
 				break;
 			cursor += used;
 			for (size_t i = 0; i < fStrips.size(); i++) {
 				if (fStrips[i]->Index() == number - 1)
-					fStrips[i]->SetLevel(db);
+					fStrips[i]->SetLevels(left, right);
 			}
 		}
-		float before, after, limiter;
+		float beforeL, beforeR, afterL, afterR, limiter;
 		const char* mix = strstr(line, "| mix before");
-		if (mix != NULL && sscanf(mix, "| mix before %f after %f dBFS | limiter %f dB", &before, &after, &limiter) == 3) {
-			fPreMeter->SetLevel(before);
-			fPostMeter->SetLevel(after);
+		if (mix != NULL && sscanf(mix, "| mix before %f %f after %f %f dBFS | limiter %f dB", &beforeL, &beforeR,
+				&afterL, &afterR, &limiter) == 5) {
+			fPreMeter->SetLevels(beforeL, beforeR);
+			fPostMeter->SetLevels(afterL, afterR);
 			float reduction = -limiter;
 			if (reduction < 0.0f)
 				reduction = 0.0f;
@@ -959,6 +1369,11 @@ private:
 	BButton*			fStop;
 	BCheckBox*			fScreen;
 	BCheckBox*			fRealtime;
+	BCheckBox*			fStream;
+	BButton*			fStreamSettings;
+	StreamConfig		fStreamConfig;
+	bool				fStreamAddon = false;
+	bool				fStreamingNow = false;
 	BPopUpMenu*			fQualityMenu;
 	BMenuField*			fQuality;
 	BStringView*		fTime;
@@ -966,8 +1381,8 @@ private:
 	BStringView*		fHint;
 	std::vector<SourceStrip*> fStrips;
 	DbSlider*			fMixGain;
-	LevelMeter*			fPreMeter;
-	LevelMeter*			fPostMeter;
+	StereoMeter*		fPreMeter;
+	StereoMeter*		fPostMeter;
 	BCheckBox*			fLimiter;
 	DbSlider*			fCeiling;
 	BSlider*			fRelease;
@@ -984,12 +1399,37 @@ private:
 
 class MixerApp : public BApplication {
 public:
-	MixerApp() : BApplication(kAppSignature) {}
+	MixerApp() : BApplication(kAppSignature), fAutoRecord(false), fShowStream(false), fToggleStream(false) {}
+
+	// "hrecord_mixer --record" starts recording as soon as the window is open.
+	void ArgvReceived(int32 argc, char** argv)
+	{
+		for (int32 i = 1; i < argc; i++) {
+			if (strcmp(argv[i], "--record") == 0)
+				fAutoRecord = true;
+			else if (strcmp(argv[i], "--stream-settings") == 0)
+				fShowStream = true;
+			else if (strcmp(argv[i], "--stream-toggle") == 0)
+				fToggleStream = true;
+		}
+	}
 
 	void ReadyToRun()
 	{
-		(new MixerWindow())->Show();
+		MixerWindow* window = new MixerWindow();
+		window->Show();
+		if (fAutoRecord)
+			window->PostMessage(kMsgRecord);
+		if (fShowStream)
+			window->PostMessage(kMsgStreamConfigure);
+		if (fToggleStream)
+			window->PostMessage(kMsgStreamToggle);
 	}
+
+private:
+	bool	fAutoRecord;
+	bool	fShowStream;
+	bool	fToggleStream;
 };
 
 

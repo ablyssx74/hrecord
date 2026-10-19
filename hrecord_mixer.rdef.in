@@ -2,11 +2,11 @@ resource app_signature "application/x-vnd.hrecord-mixer";
 
 resource app_version {
     major  = 1,
-    minor  = 12,
-    middle = 1,
+    minor  = 13,
+    middle = 0,
     variety = B_APPV_DEVELOPMENT,
     internal = 0,
-    short_info = "hRecord Mixer v1.12.1",
+    short_info = "hRecord Mixer v1.13.0",
     long_info = "A mixer window for hrecord: levels, volume, balance, mute, solo and a limiter"
 };
 

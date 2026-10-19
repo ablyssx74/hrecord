@@ -137,6 +137,22 @@ warning) in the default mode, or fails outright under `--audioonly`.
 design history (buffer sizing, pacing/backpressure fixes, and open
 issues) is in [`research.md`](research.md).
 
+## Live streaming (`--stream`)
+
+`hrecord start --stream <address>` also sends the screen and the sound to a server while it records
+to the file (the file is unaffected if the stream breaks). The address is `rtmp://` or `rtmps://`
+(YouTube, Twitch, Facebook, ... : the server's address with your stream key at the end) or
+`rtsp://` (pushed to an RTSP server such as MediaMTX). Options: `--stream-bitrate <kbps>`
+(2500), `--stream-audio-bitrate <kbps>` (128), `--stream-preset <x264 preset>` (veryfast; a
+faster one costs less CPU) and `--stream-keyint <seconds>` (2).
+
+Streaming needs H.264 video, which Haiku's ffmpeg does not have (x264 is GPL). It is done by a
+small add-on, `stream/` (`make` there; needs the `x264_devel` package), that is installed as its own
+package, `hrecord_stream` (it is GPL, hrecord stays MIT), and that hrecord loads from
+`/boot/system/add-ons/hrecord/`, `~/config/non-packaged/add-ons/hrecord/` or
+`~/config/add-ons/hrecord/` when it is installed. `hrecord --detect-stream` tells whether it is. In the
+mixer window, a click on **Stream live** without the add-on opens the download page of the newest release.
+
 ## hRecord Mixer (window)
 
 `make gui` builds `hrecord_mixer`, a window that runs `hrecord --allaudio` as its engine

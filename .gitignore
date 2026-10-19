@@ -1,0 +1,7 @@
+*.o
+*.rsrc
+*.hpkg
+build/
+hrecord
+hrecord_mixer
+stream/hrecord_x264

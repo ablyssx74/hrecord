@@ -53,6 +53,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "stream/hrecord_stream.h" // --stream: live streaming over RTMP / RTSP
+
 bool g_running = true;
 
 // ============================================================================
@@ -1305,6 +1307,16 @@ void signalHandler(int signum) {
     g_running = false;
 }
 
+// Whether a live stream (--stream) is wanted; the frames the file's encoder gets are also handed to it.
+bool g_wantStream = false;
+
+// avcodec_send_frame() for the recording's own video encoder, which also gives the frame to the live stream when there is one.
+static int SendVideoFrame(AVCodecContext* codecCtx, AVFrame* frame) {
+    if (g_wantStream && StreamActive())
+        StreamPushVideo(frame, frame->pts);
+    return avcodec_send_frame(codecCtx, frame);
+}
+
 // Renders an FFmpeg AVERROR code as text, so failures name what actually
 // went wrong instead of just "it failed" -- useful since av_log is kept
 // quiet for routine chatter (see AV_LOG_ERROR below) and would otherwise
@@ -1551,6 +1563,10 @@ void EncodeAudioSamples(AudioEncoder* enc, const void* data, size_t size,
         const media_raw_audio_format& format) {
     if (!enc->codecCtx || !g_running)
         return;
+
+    if (g_wantStream && StreamActive())
+        StreamPushAudio(data, size, HaikuAudioFormatToAV(format.format), (int)format.channel_count,
+            (int)(format.frame_rate + 0.5f));
 
     int sampleSize = format.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
     int bytesPerFrame = sampleSize * (int)format.channel_count;
@@ -2609,10 +2625,12 @@ inline void AtomicMax(std::atomic<float>& a, float v) {
 
 struct MixMeter {
     // peaks since the last report (the reporter resets them), and since the start
-    std::atomic<float> srcPeak[kMeterMaxSources];
+    std::atomic<float> srcPeak[kMeterMaxSources];     // the left side, after the source's gain and balance
+    std::atomic<float> srcPeakR[kMeterMaxSources];    // the right side
     std::atomic<float> srcPeakAll[kMeterMaxSources];
     std::atomic<uint64_t> srcNear[kMeterMaxSources]; // samples at or over 0.99
     std::atomic<float> mixPre, mixPreAll, mixPost, mixPostAll;
+    std::atomic<float> mixPreR, mixPostR;             // mixPre/mixPost are the left side, these the right
     std::atomic<float> minGain, minGainAll;          // the lowest limiter gain (1 = no reduction)
     std::atomic<uint64_t> overCeiling, overOne;      // before the limiter
     int count = 0;
@@ -2620,9 +2638,9 @@ struct MixMeter {
     void Reset(int sources) {
         count = sources;
         for (int i = 0; i < kMeterMaxSources; i++) {
-            srcPeak[i] = 0; srcPeakAll[i] = 0; srcNear[i] = 0;
+            srcPeak[i] = 0; srcPeakR[i] = 0; srcPeakAll[i] = 0; srcNear[i] = 0;
         }
-        mixPre = 0; mixPreAll = 0; mixPost = 0; mixPostAll = 0;
+        mixPre = 0; mixPreAll = 0; mixPost = 0; mixPostAll = 0; mixPreR = 0; mixPostR = 0;
         minGain = 1.0f; minGainAll = 1.0f;
         overCeiling = 0; overOne = 0;
     }
@@ -2720,13 +2738,14 @@ void MeterReporterLoop() {
         char line[1024];
         int len = snprintf(line, sizeof(line), "[meter]");
         for (int i = 0; i < g_mixMeter.count && len < 700; i++) {
-            float peak = g_mixMeter.srcPeak[i].exchange(0.0f);
-            len += snprintf(line + len, sizeof(line) - len, " #%d %.1f", i + 1, LinearToDb(peak));
+            float left = g_mixMeter.srcPeak[i].exchange(0.0f), right = g_mixMeter.srcPeakR[i].exchange(0.0f);
+            len += snprintf(line + len, sizeof(line) - len, " #%d %.1f %.1f", i + 1, LinearToDb(left), LinearToDb(right));
         }
-        float pre = g_mixMeter.mixPre.exchange(0.0f), post = g_mixMeter.mixPost.exchange(0.0f);
+        float preL = g_mixMeter.mixPre.exchange(0.0f), preR = g_mixMeter.mixPreR.exchange(0.0f);
+        float postL = g_mixMeter.mixPost.exchange(0.0f), postR = g_mixMeter.mixPostR.exchange(0.0f);
         float gain = g_mixMeter.minGain.exchange(1.0f);
-        snprintf(line + len, sizeof(line) - len, " | mix before %.1f after %.1f dBFS | limiter %.1f dB",
-            LinearToDb(pre), LinearToDb(post), LinearToDb(gain));
+        snprintf(line + len, sizeof(line) - len, " | mix before %.1f %.1f after %.1f %.1f dBFS | limiter %.1f dB",
+            LinearToDb(preL), LinearToDb(preR), LinearToDb(postL), LinearToDb(postR), LinearToDb(gain));
         std::cout << line << std::endl;
     }
 }
@@ -2870,17 +2889,30 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
             if (pan > 0.0f) gainL *= 1.0f - pan;
             else if (pan < 0.0f) gainR *= 1.0f + pan;
         }
-        float peak = 0.0f;
+        // the meter shows each side after the source's own gain and balance (muted or not)
+        float meterL = 1.0f, meterR = 1.0f;
+        if (index < kMeterMaxSources) {
+            const float fader = DbToLinear(g_sourceGainDb[index].load());
+            const float pan = kMixBusChannels == 2 ? g_sourcePan[index].load() : 0.0f;
+            meterL = fader * (pan > 0.0f ? 1.0f - pan : 1.0f);
+            meterR = fader * (pan < 0.0f ? 1.0f + pan : 1.0f);
+        }
+        float peak = 0.0f, peakL = 0.0f, peakR = 0.0f;
         uint64_t near = 0;
         for (size_t i = 0; i < sampleCount; i++) {
             float v = scratch[i];
             float a = fabsf(v);
             if (a > peak) peak = a;
             if (a >= 0.99f) near++;
-            out[i] += v * ((kMixBusChannels == 2 && (i & 1)) ? gainR : gainL);
+            const bool right = kMixBusChannels == 2 && (i & 1);
+            float shown = a * (right ? meterR : meterL);
+            if (right) { if (shown > peakR) peakR = shown; }
+            else if (shown > peakL) peakL = shown;
+            out[i] += v * (right ? gainR : gainL);
         }
         if (index < kMeterMaxSources) {
-            AtomicMax(g_mixMeter.srcPeak[index], peak);
+            AtomicMax(g_mixMeter.srcPeak[index], peakL);
+            AtomicMax(g_mixMeter.srcPeakR[index], peakR);
             AtomicMax(g_mixMeter.srcPeakAll[index], peak);
             g_mixMeter.srcNear[index].fetch_add(near, std::memory_order_relaxed);
         }
@@ -2889,16 +2921,19 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
 
     // the mix before the limiter
     {
-        float pre = 0.0f;
+        float pre = 0.0f, preL = 0.0f, preR = 0.0f;
         uint64_t overCeiling = 0, overOne = 0;
         const float ceiling = DbToLinear(g_ceilingDb);
         for (size_t i = 0; i < sampleCount; i++) {
             float a = fabsf(out[i]);
             if (a > pre) pre = a;
+            if ((i & 1) && kMixBusChannels == 2) { if (a > preR) preR = a; }
+            else if (a > preL) preL = a;
             if (a > ceiling) overCeiling++;
             if (a > 1.0f) overOne++;
         }
-        AtomicMax(g_mixMeter.mixPre, pre);
+        AtomicMax(g_mixMeter.mixPre, preL);
+        AtomicMax(g_mixMeter.mixPreR, preR);
         AtomicMax(g_mixMeter.mixPreAll, pre);
         g_mixMeter.overCeiling.fetch_add(overCeiling, std::memory_order_relaxed);
         g_mixMeter.overOne.fetch_add(overOne, std::memory_order_relaxed);
@@ -2915,12 +2950,15 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
     }
 
     {
-        float post = 0.0f;
+        float post = 0.0f, postL = 0.0f, postR = 0.0f;
         for (size_t i = 0; i < sampleCount; i++) {
             float a = fabsf(out[i]);
             if (a > post) post = a;
+            if ((i & 1) && kMixBusChannels == 2) { if (a > postR) postR = a; }
+            else if (a > postL) postL = a;
         }
-        AtomicMax(g_mixMeter.mixPost, post);
+        AtomicMax(g_mixMeter.mixPost, postL);
+        AtomicMax(g_mixMeter.mixPostR, postR);
         AtomicMax(g_mixMeter.mixPostAll, post);
     }
 
@@ -3182,7 +3220,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.12.1";
+    const char* localVersion = "v1.13.0";
 
     CURL* curl = curl_easy_init();
     if (!curl)
@@ -3221,6 +3259,16 @@ int main(int argc, char* argv[]) {
     // For the mixer window: one line saying whether real-time audio is set on the active driver.
     //   "realtime on <frames>"   tuned      "realtime off known"   a known driver, not tuned
     //   "realtime off unknown"   no driver this app has a profile for (--realtime can still force it)
+    // Is the H.264 add-on for streaming installed? "stream on <version>" or "stream off".
+    if (argc >= 2 && strcmp(argv[1], "--detect-stream") == 0) {
+        std::string path, version;
+        if (StreamAddonAvailable(&path, &version))
+            std::cout << "stream on " << (version.empty() ? "?" : version) << std::endl;
+        else
+            std::cout << "stream off" << std::endl;
+        return 0;
+    }
+
     if (argc >= 2 && strcmp(argv[1], "--detect-realtime") == 0) {
         int32 frames = 0;
         if (DetectRealtimeAudioSettings(&frames))
@@ -3252,6 +3300,7 @@ int main(int argc, char* argv[]) {
     bool stopRequested = false;
     bool listAudioInputs = false;
     bool logFps = false;
+    StreamSettings streamSettings; // --stream <url> and --stream-* : see hrecord_stream.h
     int profileIndex = 1; // default: medium
 
     for (int i = 1; i < argc; i++) {
@@ -3289,6 +3338,28 @@ int main(int argc, char* argv[]) {
             g_meterMs = std::max(20, atoi(argv[++i]));
         } else if (strcmp(argv[i], "--control") == 0) {
             g_control = true;
+        } else if (strcmp(argv[i], "--stream") == 0 && i + 1 < argc) {
+            streamSettings.url = argv[++i];
+            g_wantStream = true;
+        } else if (strcmp(argv[i], "--stream-env") == 0) {
+            // the address (with the stream key in it) comes from the environment variable HRECORD_STREAM_URL, so that
+            // it is not in the command line, where any program can read it
+            const char* fromEnv = getenv("HRECORD_STREAM_URL");
+            if (fromEnv != nullptr && fromEnv[0] != '\0') {
+                streamSettings.url = fromEnv;
+                g_wantStream = true;
+            } else {
+                std::cerr << "[-] Error: --stream-env: HRECORD_STREAM_URL is not set." << std::endl;
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--stream-bitrate") == 0 && i + 1 < argc) {
+            streamSettings.videoKbps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--stream-audio-bitrate") == 0 && i + 1 < argc) {
+            streamSettings.audioKbps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--stream-preset") == 0 && i + 1 < argc) {
+            streamSettings.preset = argv[++i];
+        } else if (strcmp(argv[i], "--stream-keyint") == 0 && i + 1 < argc) {
+            streamSettings.keyintSeconds = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-limiter") == 0) {
             g_limiterOn = false;
         } else if (strcmp(argv[i], "--ceiling") == 0 && i + 1 < argc) {
@@ -3318,7 +3389,9 @@ int main(int argc, char* argv[]) {
                 "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
                 "[--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] "
                 "[--list-audio-inputs] [--logfps] [--meter] [--no-limiter] [--ceiling <dB>] "
-                "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control]" << std::endl;
+                "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control] "
+                "[--stream <rtmp[s]://... | rtsp://...> | --stream-env] [--stream-bitrate <kbps>] [--stream-audio-bitrate <kbps>] "
+                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--detect-realtime] [--detect-stream]" << std::endl;
             return 0;
         }
     }
@@ -3704,6 +3777,23 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    // The live stream (--stream): needs the screen, since the video is what the services want. It is opened before the audio is
+    // set up, so that a failure here (a wrong address, a server that refuses) ends hrecord before anything else is running.
+    if (g_wantStream) {
+        std::string streamError;
+        if (audioOnly) {
+            std::cerr << "[-] Error: --stream needs the screen as well; leave out --audioonly." << std::endl;
+            return -1;
+        }
+        if (!StreamStart(streamSettings, outWidth, outHeight, profile.fps, true, &streamError)) {
+            std::cerr << "[-] Error: Could not start the stream: " << streamError << std::endl;
+            return -1;
+        }
+        std::cout << "[+] Streaming to " << streamSettings.url.substr(0, streamSettings.url.find('/', 8))
+            << "/... (" << streamSettings.videoKbps << " kbps video, " << streamSettings.audioKbps
+            << " kbps audio, x264 " << streamSettings.preset << ")" << std::endl;
+    }
+
     // 5a. Hijack one currently-playing app's connection to the System Mixer
     // (or, with --allaudio, every currently-playing app at once -- see
     // SetupAllAudioTaps), then set up the Vorbis encoder using whatever
@@ -3761,6 +3851,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[-] Error: --audioonly requires desktop-audio capture, which could not be "
             "set up right now." << std::endl;
         avformat_free_context(fmtCtx);
+        StreamStop();
         return -1;
     }
 
@@ -3821,12 +3912,14 @@ int main(int argc, char* argv[]) {
         const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!codec) {
             std::cerr << "[-] Error: MJPEG Encoder subsystem not found." << std::endl;
+            StreamStop();
             return -1;
         }
 
         videoStream = avformat_new_stream(fmtCtx, codec);
         if (!videoStream) {
             std::cerr << "[-] Error: Failed to create output video stream." << std::endl;
+            StreamStop();
             return -1;
         }
 
@@ -3852,11 +3945,13 @@ int main(int argc, char* argv[]) {
 
         if (avcodec_open2(videoCodecCtx, codec, nullptr) < 0) {
             std::cerr << "[-] Error: Cannot open video encoder." << std::endl;
+            StreamStop();
             return -1;
         }
 
         if (avcodec_parameters_from_context(videoStream->codecpar, videoCodecCtx) < 0) {
             std::cerr << "[-] Error: Failed to transfer codec parameters." << std::endl;
+            StreamStop();
             return -1;
         }
     }
@@ -3864,14 +3959,17 @@ int main(int argc, char* argv[]) {
     if (!(fmtCtx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&fmtCtx->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
             std::cerr << "[-] Error: Failed to open output capture file." << std::endl;
+            StreamStop();
             return -1;
         }
     }
 
     if (avformat_write_header(fmtCtx, nullptr) < 0) {
         std::cerr << "[-] Error: Failed writing file container headers." << std::endl;
+        StreamStop();
         return -1;
     }
+
 
     // 6b. Setup Video Framing Allocations (skipped in --audioonly mode)
     if (!audioOnly) {
@@ -3882,6 +3980,7 @@ int main(int argc, char* argv[]) {
         if (av_image_alloc(encodingFrame->data, encodingFrame->linesize, outWidth, outHeight,
                 videoCodecCtx->pix_fmt, 32) < 0) {
             std::cerr << "[-] Error: Could not allocate raw video image buffers." << std::endl;
+            StreamStop();
             return -1;
         }
 
@@ -3898,6 +3997,7 @@ int main(int argc, char* argv[]) {
         screenBitmap = new BBitmap(screenFrame, screen.ColorSpace());
         if (screenBitmap->InitCheck() != B_OK) {
             std::cerr << "[-] Error: Could not allocate the screen capture bitmap." << std::endl;
+            StreamStop();
             return -1;
         }
     }
@@ -4034,7 +4134,7 @@ int main(int argc, char* argv[]) {
                 encodingFrame->pts = currentPresentationTime;
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
-                if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                if (SendVideoFrame(videoCodecCtx, encodingFrame) == 0) {
                     frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
@@ -4181,7 +4281,7 @@ int main(int argc, char* argv[]) {
                 encodingFrame->pts = currentPresentationTime;
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
-                if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                if (SendVideoFrame(videoCodecCtx, encodingFrame) == 0) {
                     frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
@@ -4229,7 +4329,7 @@ int main(int argc, char* argv[]) {
                     encodingFrame->pts = currentPresentationTime;
 
                     std::lock_guard<std::mutex> lock(g_muxMutex);
-                    if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                    if (SendVideoFrame(videoCodecCtx, encodingFrame) == 0) {
                         frameWritten = true; // --logfps: see its own declaration above the loop
                         while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                             av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
@@ -4259,7 +4359,7 @@ int main(int argc, char* argv[]) {
                 encodingFrame->pts = currentPresentationTime;
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
-                if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                if (SendVideoFrame(videoCodecCtx, encodingFrame) == 0) {
                     frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
@@ -4295,7 +4395,7 @@ int main(int argc, char* argv[]) {
                 encodingFrame->pts = currentPresentationTime;
 
                 std::lock_guard<std::mutex> lock(g_muxMutex);
-                if (avcodec_send_frame(videoCodecCtx, encodingFrame) == 0) {
+                if (SendVideoFrame(videoCodecCtx, encodingFrame) == 0) {
                     frameWritten = true; // --logfps: see its own declaration above the loop
                     while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
                         av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
@@ -4448,6 +4548,7 @@ int main(int argc, char* argv[]) {
         screenBitmap = nullptr;
     }
 
+    StreamStop();
     av_write_trailer(fmtCtx);
     av_packet_free(&pkt);
 
