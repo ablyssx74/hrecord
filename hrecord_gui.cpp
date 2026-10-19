@@ -840,7 +840,7 @@ public:
 		fStripsGroup->SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
 		BGroupLayout* stripsLayout = new BGroupLayout(B_HORIZONTAL, 6);
 		fStripsGroup->SetLayout(stripsLayout);
-		fHint = new BStringView("hint", "Start playing sound in the programs to record, then press Record. Each one gets a strip.");
+		fHint = new BStringView("hint", "Start playing sound in the programs to record, then press Record. Each one gets a strip; programs that start later join by themselves.");
 		stripsLayout->AddView(fHint);
 		stripsLayout->AddItem(BSpaceLayoutItem::CreateGlue());
 
@@ -1270,6 +1270,12 @@ private:
 			Log(line);
 			return;
 		}
+		// a source that has stopped (its program has quit) leaves the mix and loses its strip
+		if (sscanf(line, "[-] Removed source #%d", &number) == 1) {
+			RemoveStrip(number - 1);
+			Log(line);
+			return;
+		}
 		const char* written = strstr(line, "Output written to '");
 		if (written != NULL) {
 			std::string path = written + strlen("Output written to '");
@@ -1278,13 +1284,10 @@ private:
 				path.resize(end);
 			fOutputFile = path;
 		}
-		if (strstr(line, "[+] Streaming to ") != NULL) {
+		if (strstr(line, "[+] Streaming to ") != NULL)
 			fStreamingNow = true;
-			Log("[i] Don't unmute a browser's preview of your own stream: it would be recorded back into the stream as an echo.");
-		}
 		if (strstr(line, "[+] Tapped ") != NULL && strstr(line, "currently-playing") != NULL)
-			SetStatus(fStreamingNow ? "Live: streaming and recording. Keep a browser's preview of your own stream muted, or it echoes back into the stream."
-				: "Recording.");
+			SetStatus(fStreamingNow ? "Live: streaming and recording." : "Recording.");
 		if (strstr(line, "[meter]") != NULL || strstr(line, "    ") == line)
 			; // the summary lines go to the log too
 		Log(line);
@@ -1339,6 +1342,23 @@ private:
 		fStrips.push_back(strip);
 	}
 
+	void RemoveStrip(int index)
+	{
+		for (size_t i = 0; i < fStrips.size(); i++) {
+			if (fStrips[i]->Index() != index)
+				continue;
+			fStrips[i]->RemoveSelf();
+			delete fStrips[i];
+			fStrips.erase(fStrips.begin() + i);
+			break;
+		}
+		if (fStrips.empty() && fRecording) {
+			fHint->SetText("No source is playing now. A program that starts playing joins the recording by itself.");
+			if (fHint->IsHidden())
+				fHint->Show();
+		}
+	}
+
 	void ClearStrips()
 	{
 		for (size_t i = 0; i < fStrips.size(); i++) {
@@ -1346,6 +1366,7 @@ private:
 			delete fStrips[i];
 		}
 		fStrips.clear();
+		fHint->SetText("Start playing sound in the programs to record, then press Record. Each one gets a strip; programs that start later join by themselves.");
 		if (fHint->IsHidden())
 			fHint->Show();
 	}

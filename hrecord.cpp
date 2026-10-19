@@ -29,6 +29,8 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <set>
+#include <tuple>
 #include <atomic> // g_directCaptureVerified and friends -- see their own comment
 #include <csetjmp> // sigsetjmp/siglongjmp -- SetupDirectCapture()'s SIGSEGV/SIGBUS safety net
 #include <signal.h>
@@ -2116,6 +2118,7 @@ struct AllAudioTapEntry {
     media_node appNode;
     media_output originalAppOutput;
     std::string appName = "(unknown)"; // for diagnostics only, e.g. overflow/underrun reports
+    int slot = -1;                     // this source's place in AllAudioHandles::mixSources (its number - 1)
 };
 
 // Everything SetupAllAudioTaps() needs to remember so TeardownAllAudioTaps()
@@ -2124,9 +2127,16 @@ struct AllAudioTapEntry {
 // combined mix -- see MixedPlaybackCallback.
 struct AllAudioHandles {
     std::vector<AllAudioTapEntry> taps;
-    std::vector<AudioRingBuffer*> mixSources; // same rings as taps[].ring; the callback's cookie
+    // The rings of the sources, by slot (a source's number - 1); nullptr for a slot that is free. The callback's cookie.
+    // Sources that start playing during the session are added to a free slot, and those that stop are removed from
+    // theirs: see SourceWatcherLoop. Everything that changes it takes g_mixMutex, which the callback takes too.
+    std::vector<AudioRingBuffer*> mixSources;
     BSoundPlayer* player = nullptr;
     bool active = false;
+    media_raw_audio_format busFormat;
+    bool busRateChosen = false;
+    std::thread watcher;
+    std::atomic<bool> watcherStop{false};
 };
 
 // Printed whenever the System Mixer's own bookkeeping doesn't match reality
@@ -2162,7 +2172,7 @@ void WarnStaleMediaServerState() {
 // currently-playing app, without a second copy of it.
 AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInput,
         media_node* outAppNode, media_output* outOriginalAppOutput,
-        media_raw_audio_format* outNegotiated) {
+        media_raw_audio_format* outNegotiated, bool quietStale = false) {
     // The Mixer says something is connected at mixerInput.source -- but if
     // that producer has since disappeared without telling the Mixer, this
     // lookup fails even though GetConnectedInputsFor() just reported it as
@@ -2170,7 +2180,8 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
     media_node_id appNodeId = roster->NodeIDFor(mixerInput.source.port);
     media_node appNode;
     if (appNodeId < 0 || roster->GetNodeFor(appNodeId, &appNode) != B_OK) {
-        WarnStaleMediaServerState();
+        if (!quietStale)
+            WarnStaleMediaServerState();
         return nullptr;
     }
 
@@ -2188,7 +2199,8 @@ AudioTapNode* HijackAppIntoTap(BMediaRoster* roster, const media_input& mixerInp
     int32 outCount = 0;
     if (roster->GetConnectedOutputsFor(appNode, &appOutput, 1, &outCount) != B_OK || outCount < 1
             || appOutput.destination != mixerInput.destination) {
-        WarnStaleMediaServerState();
+        if (!quietStale)
+            WarnStaleMediaServerState();
         roster->ReleaseNode(appNode);
         return nullptr;
     }
@@ -2633,12 +2645,13 @@ struct MixMeter {
     std::atomic<float> mixPreR, mixPostR;             // mixPre/mixPost are the left side, these the right
     std::atomic<float> minGain, minGainAll;          // the lowest limiter gain (1 = no reduction)
     std::atomic<uint64_t> overCeiling, overOne;      // before the limiter
-    int count = 0;
+    std::atomic<int> count{0};                        // slots in use or once used (the highest slot + 1)
+    std::atomic<bool> srcActive[kMeterMaxSources];    // a slot holds a source right now
     std::vector<std::string> names;
     void Reset(int sources) {
         count = sources;
         for (int i = 0; i < kMeterMaxSources; i++) {
-            srcPeak[i] = 0; srcPeakR[i] = 0; srcPeakAll[i] = 0; srcNear[i] = 0;
+            srcPeak[i] = 0; srcPeakR[i] = 0; srcPeakAll[i] = 0; srcNear[i] = 0; srcActive[i] = false;
         }
         mixPre = 0; mixPreAll = 0; mixPost = 0; mixPostAll = 0; mixPreR = 0; mixPostR = 0;
         minGain = 1.0f; minGainAll = 1.0f;
@@ -2647,6 +2660,9 @@ struct MixMeter {
 };
 
 MixMeter g_mixMeter;
+
+// Held by MixedPlaybackCallback while it mixes and by whatever adds or removes a source (see SourceWatcherLoop).
+std::mutex g_mixMutex;
 
 // A lookahead peak limiter on interleaved stereo float frames, linked across
 // the two channels. The audio is delayed by the lookahead; the gain that keeps
@@ -2738,6 +2754,8 @@ void MeterReporterLoop() {
         char line[1024];
         int len = snprintf(line, sizeof(line), "[meter]");
         for (int i = 0; i < g_mixMeter.count && len < 700; i++) {
+            if (!g_mixMeter.srcActive[i].load())
+                continue;
             float left = g_mixMeter.srcPeak[i].exchange(0.0f), right = g_mixMeter.srcPeakR[i].exchange(0.0f);
             len += snprintf(line + len, sizeof(line) - len, " #%d %.1f %.1f", i + 1, LinearToDb(left), LinearToDb(right));
         }
@@ -2850,6 +2868,8 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
             int idx = 0;
             for (AudioRingBuffer* ring : *sources) {
                 idx++;
+                if (ring == nullptr)
+                    continue;
                 size_t avail = ring->Available();
                 double seconds = g_mixBusRate > 0
                     ? (double)avail / (kMixBusChannels * sizeof(float) * g_mixBusRate) : 0.0;
@@ -2863,17 +2883,27 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
     size_t sampleCount = size / sizeof(float);
     std::fill(out, out + sampleCount, 0.0f);
 
-    if (sources == nullptr || sources->empty())
+    if (sources == nullptr)
         return;
+    // (with no source at all the buffer is silence, and still goes to the encoder below, so that the file's time goes on)
+    std::lock_guard<std::mutex> mixLock(g_mixMutex);
 
     static thread_local std::vector<float> scratch;
     if (scratch.size() < sampleCount)
         scratch.resize(sampleCount);
 
     // each source at its own gain, scaled by 1/sqrt(N); the limiter takes care of what is left
-    const float base = (1.0f / sqrtf((float)sources->size())) * DbToLinear(g_mixGainDb);
-    int index = 0;
+    int activeSources = 0;
     for (AudioRingBuffer* ring : *sources) {
+        if (ring != nullptr)
+            activeSources++;
+    }
+    const float base = (activeSources > 0 ? 1.0f / sqrtf((float)activeSources) : 1.0f) * DbToLinear(g_mixGainDb);
+    int index = -1;
+    for (AudioRingBuffer* ring : *sources) {
+        index++;
+        if (ring == nullptr)
+            continue;
         ring->Read(scratch.data(), size);
         float gain = base * DbToLinear(index < kMeterMaxSources ? g_sourceGainDb[index].load() : 0.0f);
         if (index < kMeterMaxSources) {
@@ -2916,7 +2946,6 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
             AtomicMax(g_mixMeter.srcPeakAll[index], peak);
             g_mixMeter.srcNear[index].fetch_add(near, std::memory_order_relaxed);
         }
-        index++;
     }
 
     // the mix before the limiter
@@ -3006,6 +3035,216 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles);
 // drive them. Individual sources that fail to tap are skipped with a
 // warning rather than aborting the whole thing; failure is only returned
 // if *no* source could be tapped at all.
+// Taps one more source into the mix: hijacks the app connected at `input`, sets up its resampler and ring, gives it a free slot
+// in the mix and starts it. Used for the sources that are playing when recording starts and, by SourceWatcherLoop, for those
+// that start during it. Returns false (and leaves the app as it was) when the source could not be tapped.
+bool AddTapForInput(BMediaRoster* roster, AllAudioHandles* handles, const media_input& input, bool quietStale) {
+    media_node appNode;
+    media_output originalAppOutput;
+    media_raw_audio_format negotiated;
+    AudioTapNode* tap = HijackAppIntoTap(roster, input, &appNode, &originalAppOutput, &negotiated, quietStale);
+    if (!tap)
+        return false; // that source's own error was already printed; keep tapping the rest
+
+    media_raw_audio_format& busFormat = handles->busFormat;
+    if (!handles->busRateChosen) {
+        handles->busRateChosen = true;
+        // Lock the bus rate to whatever the first successfully tapped source already negotiated
+        // (see g_mixBusRate above) before setting up its resampler below, so even this first
+        // source picks up the real rate rather than the fallback.
+        busFormat.frame_rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : kMixBusRate;
+        g_mixBusRate = busFormat.frame_rate;
+    }
+
+    AVChannelLayout busLayout;
+    av_channel_layout_default(&busLayout, kMixBusChannels);
+    AVChannelLayout inLayout;
+    av_channel_layout_default(&inLayout, negotiated.channel_count > 0 ? negotiated.channel_count : 2);
+
+    SwrContext* resampler = nullptr;
+    int swrErr = swr_alloc_set_opts2(&resampler, &busLayout, AV_SAMPLE_FMT_FLT,
+        (int)busFormat.frame_rate, &inLayout, HaikuAudioFormatToAV(negotiated.format),
+        (int)(negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100), 0, nullptr);
+    if (swrErr >= 0 && resampler)
+        swrErr = swr_init(resampler);
+    av_channel_layout_uninit(&inLayout);
+    av_channel_layout_uninit(&busLayout);
+    if (swrErr < 0 || !resampler) {
+        std::cerr << "[!] Warning: Failed to set up a resampler for one audio source ("
+            << AvErr(swrErr) << "); skipping it." << std::endl;
+        if (resampler) swr_free(&resampler);
+        UndoHijack(roster, tap, appNode, originalAppOutput);
+        return false;
+    }
+
+    AllAudioTapEntry entry;
+    entry.node = tap;
+    entry.resampler = resampler;
+    entry.ring = new AudioRingBuffer();
+    // Deliberately more generous than the single-tap ring's half
+    // second (see SetupDesktopAudioTap): a source whose own producer
+    // delivers audio in bursts rather than a steady drip -- a network
+    // stream doing its own internal buffering/rebuffering being the
+    // clearest example -- can overflow (dropping audio -> a pop at the
+    // seam) or underrun (zero-filled gaps -> a blip) a too-small ring
+    // well before any rate mismatch is even in play. Two seconds costs
+    // only ~1.5MB per tapped source and trades a bit more live-
+    // monitoring lag for a lot more headroom against exactly that.
+    //
+    // Now that AudioTapNode paces its own consumption to real time
+    // (see BufferReceived), this ring's steady-state fill level tracks
+    // genuine jitter, not a growing backlog -- so under --realtime it
+    // trades some of that jitter headroom back for a lower worst-case
+    // latency ceiling instead, on the theory that a real-time
+    // monitoring use case would rather risk an occasional glitch than
+    // accept seconds of guaranteed slack it's very unlikely to ever
+    // need. Confirmed clean in testing at this number with three
+    // simultaneous sources.
+    double ringSeconds = g_realtimeAudio ? 0.07 : 2.0;
+    size_t ringCapacity = (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * ringSeconds);
+    entry.ring->Init(ringCapacity);
+    entry.appNode = appNode;
+    entry.originalAppOutput = originalAppOutput;
+    {
+        live_node_info info;
+        if (roster->GetLiveNodeInfo(appNode, &info) == B_OK)
+            entry.appName = info.name;
+    }
+    tap->SetMixOutput(resampler, entry.ring);
+
+    // a free slot in the mix, and the controls of the strip that will show it back at their defaults
+    int slot = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_mixMutex);
+        for (size_t i = 0; i < handles->mixSources.size(); i++) {
+            if (handles->mixSources[i] == nullptr) {
+                slot = (int)i;
+                break;
+            }
+        }
+        if (slot < 0 && handles->mixSources.size() < (size_t)kMeterMaxSources) {
+            slot = (int)handles->mixSources.size();
+            handles->mixSources.push_back(nullptr);
+        }
+        if (slot >= 0) {
+            g_sourceGainDb[slot] = 0.0f;
+            g_sourcePan[slot] = 0.0f;
+            g_sourceMute[slot] = false;
+            g_soloMask.fetch_and(~(1u << slot));
+            g_mixMeter.srcPeak[slot] = 0; g_mixMeter.srcPeakR[slot] = 0;
+            g_mixMeter.srcPeakAll[slot] = 0; g_mixMeter.srcNear[slot] = 0;
+            if ((int)g_mixMeter.names.size() <= slot)
+                g_mixMeter.names.resize(slot + 1);
+            g_mixMeter.names[slot] = entry.appName;
+            if (g_mixMeter.count < slot + 1)
+                g_mixMeter.count = slot + 1;
+            handles->mixSources[slot] = entry.ring;
+            g_mixMeter.srcActive[slot] = true;
+        }
+    }
+    if (slot < 0) {
+        std::cerr << "[!] Warning: Too many audio sources (" << kMeterMaxSources << "); not adding \"" << entry.appName
+            << "\"." << std::endl;
+        RestoreHijackedApp(roster, tap, appNode, originalAppOutput);
+        swr_free(&resampler);
+        delete entry.ring;
+        return false;
+    }
+    entry.slot = slot;
+    handles->taps.push_back(entry);
+    std::cout << "[+] Tapped source #" << (slot + 1) << ": \"" << entry.appName << "\"" << std::endl;
+
+    roster->StartNode(tap->Node(), 0);
+    roster->StartNode(appNode, 0);
+    return true;
+}
+
+
+// Takes a source that has stopped (its app has quit) out of the mix: its slot is freed and its tap released.
+void RemoveTapEntry(BMediaRoster* roster, AllAudioHandles* handles, size_t tapIndex) {
+    AllAudioTapEntry entry = handles->taps[tapIndex];
+    handles->taps.erase(handles->taps.begin() + tapIndex);
+
+    // out of the mix first (the callback no longer reads its ring), then the tap is let go
+    {
+        std::lock_guard<std::mutex> lock(g_mixMutex);
+        handles->mixSources[entry.slot] = nullptr;
+        g_mixMeter.srcActive[entry.slot] = false;
+        g_soloMask.fetch_and(~(1u << entry.slot));
+    }
+    std::cout << "[-] Removed source #" << (entry.slot + 1) << ": \"" << entry.appName << "\" has stopped"
+        << std::endl;
+
+    const media_node tapNode = entry.node->Node();
+    roster->StopNode(tapNode, 0, true);
+    // (no Disconnect: the app is gone, and asking the Media Kit to disconnect a dead node only fills the log with errors)
+    roster->ReleaseNode(tapNode);
+    // the reference that HijackAppIntoTap took on the app's node: without letting it go the dead node would stay listed
+    roster->ReleaseNode(entry.appNode);
+    snooze(150000); // the tap's thread is gone by then, and with it any write into the ring
+
+    if (entry.ring) {
+        size_t overflow = entry.ring->OverflowBytes();
+        size_t underrun = entry.ring->UnderrunBytes();
+        if (overflow > 0 || underrun > 0) {
+            std::cout << "[i] Audio source \"" << entry.appName << "\": " << overflow << " bytes dropped, "
+                << underrun << " bytes silence-filled while it was in the mix." << std::endl;
+        }
+    }
+    if (entry.resampler)
+        swr_free(&entry.resampler);
+    delete entry.ring;
+}
+
+// Runs for the whole --allaudio session: sources that start playing after the recording began are tapped and join the mix, and
+// those whose app has quit are taken out of it. (An app that stays open but has finished playing keeps its strip, silent, until
+// it quits: nothing tells hrecord that its sound player has gone while the app lives.)
+void SourceWatcherLoop(BMediaRoster* roster, AllAudioHandles* handles) {
+    media_node mixerNode;
+    if (roster->GetAudioMixer(&mixerNode) != B_OK)
+        return;
+    std::set<std::tuple<int32, int32, int32> > givenUp; // mixer inputs that could not be tapped: not tried again
+    const team_id ourTeam = getpid();
+
+    while (!handles->watcherStop.load()) {
+        for (int waited = 0; waited < 40 && !handles->watcherStop.load(); waited++)
+            snooze(10000);
+        if (handles->watcherStop.load())
+            break;
+
+        // sources whose app has gone: the port of its node is gone with it
+        for (size_t i = 0; i < handles->taps.size();) {
+            port_info portInfo;
+            if (get_port_info(handles->taps[i].appNode.port, &portInfo) != B_OK)
+                RemoveTapEntry(roster, handles, i);
+            else
+                i++;
+        }
+
+        // sources that have started: they show up as connected inputs of the Mixer (ours is hrecord's own playback)
+        const int32 kMaxInputs = kMeterMaxSources + 8;
+        media_input inputs[kMaxInputs];
+        int32 count = 0;
+        if (roster->GetConnectedInputsFor(mixerNode, inputs, kMaxInputs, &count) != B_OK)
+            continue;
+        for (int32 i = 0; i < count && !handles->watcherStop.load(); i++) {
+            const std::tuple<int32, int32, int32> key(inputs[i].source.port, inputs[i].source.id, inputs[i].destination.id);
+            if (givenUp.count(key))
+                continue;
+            port_info portInfo;
+            if (get_port_info(inputs[i].source.port, &portInfo) != B_OK) {
+                givenUp.insert(key); // a stale entry of the Mixer's, left by an app that is gone
+                continue;
+            }
+            if (portInfo.team == ourTeam)
+                continue;
+            if (!AddTapForInput(roster, handles, inputs[i], true))
+                givenUp.insert(key);
+        }
+    }
+    roster->ReleaseNode(mixerNode);
+}
+
 bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         media_raw_audio_format* outFormat) {
     g_allAudioSetupStartTime = system_time();
@@ -3027,107 +3266,22 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         return false;
     }
 
-    media_raw_audio_format busFormat = MixBusFormat(); // .frame_rate here is just the fallback
-    bool busRateChosen = false;
-    AVChannelLayout busLayout;
-    av_channel_layout_default(&busLayout, kMixBusChannels);
+    handles->busFormat = MixBusFormat(); // .frame_rate here is just the fallback
+    handles->busRateChosen = false;      // chosen by the first source that is tapped
+    g_mixMeter.Reset(0);
+    g_mixMeter.names.clear();
+    handles->mixSources.reserve(kMeterMaxSources);
 
-    for (int32 i = 0; i < inCount; i++) {
-        media_node appNode;
-        media_output originalAppOutput;
-        media_raw_audio_format negotiated;
-        AudioTapNode* tap = HijackAppIntoTap(roster, mixerInputs[i], &appNode,
-            &originalAppOutput, &negotiated);
-        if (!tap)
-            continue; // that source's own error was already printed; keep tapping the rest
-
-        if (!busRateChosen) {
-            // Lock the bus rate to whatever this first successfully
-            // tapped source already negotiated (see g_mixBusRate above)
-            // before setting up its resampler below, so even this first
-            // source picks up the real rate rather than the fallback.
-            busFormat.frame_rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : kMixBusRate;
-            g_mixBusRate = busFormat.frame_rate;
-            busRateChosen = true;
-        }
-
-        AVChannelLayout inLayout;
-        av_channel_layout_default(&inLayout, negotiated.channel_count > 0
-            ? negotiated.channel_count : 2);
-
-        SwrContext* resampler = nullptr;
-        int swrErr = swr_alloc_set_opts2(&resampler, &busLayout, AV_SAMPLE_FMT_FLT,
-            (int)busFormat.frame_rate, &inLayout, HaikuAudioFormatToAV(negotiated.format),
-            (int)(negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100), 0, nullptr);
-        if (swrErr >= 0 && resampler)
-            swrErr = swr_init(resampler);
-        av_channel_layout_uninit(&inLayout);
-        if (swrErr < 0 || !resampler) {
-            std::cerr << "[!] Warning: Failed to set up a resampler for one audio source ("
-                << AvErr(swrErr) << "); skipping it." << std::endl;
-            if (resampler) swr_free(&resampler);
-            UndoHijack(roster, tap, appNode, originalAppOutput);
-            continue;
-        }
-
-        AllAudioTapEntry entry;
-        entry.node = tap;
-        entry.resampler = resampler;
-        entry.ring = new AudioRingBuffer();
-        // Deliberately more generous than the single-tap ring's half
-        // second (see SetupDesktopAudioTap): a source whose own producer
-        // delivers audio in bursts rather than a steady drip -- a network
-        // stream doing its own internal buffering/rebuffering being the
-        // clearest example -- can overflow (dropping audio -> a pop at the
-        // seam) or underrun (zero-filled gaps -> a blip) a too-small ring
-        // well before any rate mismatch is even in play. Two seconds costs
-        // only ~1.5MB per tapped source and trades a bit more live-
-        // monitoring lag for a lot more headroom against exactly that.
-        //
-        // Now that AudioTapNode paces its own consumption to real time
-        // (see BufferReceived), this ring's steady-state fill level tracks
-        // genuine jitter, not a growing backlog -- so under --realtime it
-        // trades some of that jitter headroom back for a lower worst-case
-        // latency ceiling instead, on the theory that a real-time
-        // monitoring use case would rather risk an occasional glitch than
-        // accept seconds of guaranteed slack it's very unlikely to ever
-        // need. Confirmed clean in testing at this number with three
-        // simultaneous sources.
-        double ringSeconds = g_realtimeAudio ? 0.07 : 2.0;
-        size_t ringCapacity =
-            (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * ringSeconds);
-        entry.ring->Init(ringCapacity);
-        entry.appNode = appNode;
-        entry.originalAppOutput = originalAppOutput;
-        {
-            live_node_info info;
-            if (roster->GetLiveNodeInfo(appNode, &info) == B_OK)
-                entry.appName = info.name;
-        }
-        tap->SetMixOutput(resampler, entry.ring);
-        handles->taps.push_back(entry);
-        std::cout << "[+] Tapped source #" << handles->taps.size() << ": \"" << entry.appName
-            << "\"" << std::endl;
-
-        roster->StartNode(tap->Node(), 0);
-        roster->StartNode(appNode, 0);
-    }
-    av_channel_layout_uninit(&busLayout);
+    for (int32 i = 0; i < inCount; i++)
+        AddTapForInput(roster, handles, mixerInputs[i], false);
 
     if (handles->taps.empty()) {
         std::cerr << "[-] Error: Could not tap any currently-playing app." << std::endl;
         return false;
     }
+    media_raw_audio_format busFormat = handles->busFormat;
 
-    handles->mixSources.clear();
-    for (auto& entry : handles->taps)
-        handles->mixSources.push_back(entry.ring);
-
-    // the mix bus: the meters, and the limiter (lookahead 2 ms, released over 80 ms)
-    g_mixMeter.Reset((int)std::min((size_t)kMeterMaxSources, handles->taps.size()));
-    g_mixMeter.names.clear();
-    for (auto& entry : handles->taps)
-        g_mixMeter.names.push_back(entry.appName);
+    // the mix bus: the limiter (lookahead 2 ms, released over 80 ms)
     g_mixLimiter.Init(g_mixBusRate, 2.0f);
 
     BSoundPlayer* player = new BSoundPlayer(&busFormat, "hrecord Mixed Playback",
@@ -3156,14 +3310,24 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
     *outFormat = busFormat;
     std::cout << "[+] Tapped " << handles->taps.size() << " currently-playing audio source(s)."
         << std::endl;
+
+    // from here on, sources that start or stop are followed
+    handles->watcherStop = false;
+    handles->watcher = std::thread(SourceWatcherLoop, roster, handles);
     return true;
 }
 
 // Stops the shared playback, then disconnects and restores every tapped
 // app -- the --allaudio equivalent of TeardownDesktopAudioTap.
 void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
-    if (!handles->active || handles->taps.empty())
+    if (!handles->active)
         return;
+
+    // no more sources are added or removed from here on
+    if (handles->watcher.joinable()) {
+        handles->watcherStop = true;
+        handles->watcher.join();
+    }
 
     for (auto& entry : handles->taps) {
         roster->StopNode(entry.appNode, 0, true);
@@ -3220,7 +3384,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.13.1";
+    const char* localVersion = "v1.14.0";
 
     CURL* curl = curl_easy_init();
     if (!curl)

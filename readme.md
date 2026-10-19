@@ -41,6 +41,8 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realt
   `--control` reads commands from stdin while recording (`gain <n> <dB>`, `mute <n> <0|1>`,
   `solo <n> <0|1>`, `pan <n> <-1..1>`, `mixgain <dB>`, `ceiling <dB>`, `release <ms>`,
   `limiter <0|1>`, `quit`), which is how the mixer window below drives it.
+- With `--allaudio`, programs that start playing after the recording began join the mix by themselves, and
+  those that quit leave it (their number is then free for the next one to start).
 - `hrecord start --realtime` — tighter audio buffers for live monitoring
   (e.g. playing through effects while recording). Usually **not needed**
   — hrecord auto-detects an already-tuned driver's own buffer settings at
