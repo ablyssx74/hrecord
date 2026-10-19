@@ -361,6 +361,8 @@ public:
 	int Index() const { return fIndex; }
 	float Pan() const { return fPan->Pan(); }
 	float Gain() const { return fFader->Db(); }
+	bool Muted() const { return fMute->Value() == B_CONTROL_ON; }
+	bool Soloed() const { return fSolo->Value() == B_CONTROL_ON; }
 
 private:
 	int				fIndex;
@@ -991,13 +993,16 @@ public:
 			case kMsgMute:
 			case kMsgSolo:
 			{
-				int32 source, on = 0;
-				BControl* control = NULL;
-				if (message->FindInt32("source", &source) == B_OK && message->FindPointer("source", (void**)&control) != B_OK) {
-					// "be:source" holds the control that was clicked
-					if (message->FindPointer("be:source", (void**)&control) == B_OK && control != NULL)
-						on = control->Value() == B_CONTROL_ON ? 1 : 0;
-					SendCommand(message->what == kMsgMute ? "mute %d %d\n" : "solo %d %d\n", (int)source + 1, (int)on);
+				// the strip knows whether its box is ticked (the message itself does not say: BControl adds its own
+				// "source" pointer to it, which cannot go next to the strip's number of that name)
+				int32 source;
+				if (message->FindInt32("source", &source) == B_OK) {
+					for (size_t i = 0; i < fStrips.size(); i++) {
+						if (fStrips[i]->Index() != source)
+							continue;
+						const bool on = message->what == kMsgMute ? fStrips[i]->Muted() : fStrips[i]->Soloed();
+						SendCommand(message->what == kMsgMute ? "mute %d %d\n" : "solo %d %d\n", (int)source + 1, on ? 1 : 0);
+					}
 				}
 				break;
 			}
@@ -1273,10 +1278,13 @@ private:
 				path.resize(end);
 			fOutputFile = path;
 		}
-		if (strstr(line, "[+] Streaming to ") != NULL)
+		if (strstr(line, "[+] Streaming to ") != NULL) {
 			fStreamingNow = true;
+			Log("[i] Don't unmute a browser's preview of your own stream: it would be recorded back into the stream as an echo.");
+		}
 		if (strstr(line, "[+] Tapped ") != NULL && strstr(line, "currently-playing") != NULL)
-			SetStatus(fStreamingNow ? "Live: streaming and recording." : "Recording.");
+			SetStatus(fStreamingNow ? "Live: streaming and recording. Keep a browser's preview of your own stream muted, or it echoes back into the stream."
+				: "Recording.");
 		if (strstr(line, "[meter]") != NULL || strstr(line, "    ") == line)
 			; // the summary lines go to the log too
 		Log(line);
