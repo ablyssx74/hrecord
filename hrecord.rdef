@@ -6,7 +6,7 @@ resource app_version {
     middle = 9,
     variety = B_APPV_DEVELOPMENT,
     internal = 0,
-    short_info = "hrecord v1.11.9",
+    short_info = "hrecord v1.12.0",
     long_info = "Haiku Recorder - Screen, Desktop Audio & Real-Time Mixing"
 };
 

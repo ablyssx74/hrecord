@@ -30,6 +30,17 @@ hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realt
 - `hrecord start --allaudio` — mixes *every* currently-playing app's audio
   together, instead of just one. Combine with plain `hrecord start` for
   screen recording with every source mixed in.
+- `hrecord start --allaudio` mixes every source at its own gain, scaled by 1/sqrt(N)
+  (-3 dB each time the number of sources doubles), and a lookahead peak limiter keeps
+  the mix under a ceiling of -1 dBFS, so several loud sources no longer clip. Options:
+  `--meter` prints each source's peak and the mix's peak before and after the limiter once a
+  second, with a summary at the end; `--ceiling <dB>` sets the limiter's ceiling;
+  `--no-limiter` turns it off; `--mix-gain <dB>` raises or lowers the whole mix;
+  `--source-gain <n>=<dB>` sets the gain of the n-th source (numbered as they are tapped);
+  `--meter-ms <n>` sets how often the meter line is printed (default 1000);
+  `--control` reads commands from stdin while recording (`gain <n> <dB>`, `mute <n> <0|1>`,
+  `solo <n> <0|1>`, `pan <n> <-1..1>`, `mixgain <dB>`, `ceiling <dB>`, `release <ms>`,
+  `limiter <0|1>`, `quit`), which is how the mixer window below drives it.
 - `hrecord start --realtime` — tighter audio buffers for live monitoring
   (e.g. playing through effects while recording). Usually **not needed**
   — hrecord auto-detects an already-tuned driver's own buffer settings at
@@ -125,6 +136,22 @@ warning) in the default mode, or fails outright under `--audioonly`.
 `--allaudio` and `--realtime`/auto-detection are covered above; the full
 design history (buffer sizing, pacing/backpressure fixes, and open
 issues) is in [`research.md`](research.md).
+
+## hRecord Mixer (window)
+
+`make gui` builds `hrecord_mixer`, a window that runs `hrecord --allaudio` as its engine
+(keep the two programs in the same folder). Press Record and every tapped source gets a
+strip with a level meter, a volume fader, left/right balance, mute and solo; the master
+section has a mix fader, before/after limiter meters, the limiter's on/off, ceiling and
+release, and a gain-reduction bar. A right-click on a fader or balance slider resets it.
+
+## Apps that were recorded no longer linger in Media preferences
+
+An app's sound player disconnects from the Mixer input it first connected to when it quits.
+Recording moves that app to a new Mixer input, so its own disconnect used to miss, and the
+app stayed listed in Media preferences' Audio mixer. After putting an app back, hrecord now
+leaves a tiny helper (`hrecord --reap ...`) that waits for the app to quit and then removes
+the leftover input.
 
 ## Known issue: "stale" Mixer connection
 

@@ -1,7 +1,7 @@
 # hrecord Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
-VERSION = 1.11.9
+VERSION = 1.12.0
 PACKAGE_DIR := build/package
 DUMMY_PC_PATH := $(shell pwd)/build/pkgconfig
 
@@ -54,7 +54,11 @@ CXXFLAGS += $(shell $(PKG_CONFIG_CMD) --cflags libavformat libavcodec libavutil 
 
 LIBS = $(LIB_PATH) $(EXTRA_LIBS) $(HAIKU_LIBS)
 
-.PHONY: all clean 
+.PHONY: all clean gui
+
+# The mixer window: runs hrecord as its engine
+gui: hrecord_gui.cpp
+	$(CXX) -std=c++17 -O2 -Wall $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lroot
 
 all: $(GUI_TARGET)
 

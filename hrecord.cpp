@@ -2261,6 +2261,107 @@ void UndoHijack(BMediaRoster* roster, AudioTapNode* tap, const media_node& appNo
     roster->ReleaseNode(appNode);
 }
 
+// A hijacked app's BSoundPlayer remembers the Mixer input it was first
+// connected to and, when it quits cleanly, disconnects from THAT input. The
+// Mixer never reuses input ids, so after hijack + restore the app's real
+// input has a new id, the app's disconnect misses it, and the Mixer keeps
+// listing the app in Media preferences' Audio mixer as a zombie.
+//
+// hrecord can't fix this from inside the app, and it usually exits long
+// before the app does. So after restoring an app it starts a tiny detached
+// copy of itself ("--reap") that waits for the app's team to end and then
+// removes the leftover Mixer input.
+void SpawnInputReaper(const media_node& appNode, const media_source& source,
+        const media_destination& destination) {
+    port_info portInfo;
+    if (get_port_info(appNode.port, &portInfo) != B_OK)
+        return;
+    image_info image;
+    int32 cookie = 0;
+    char program[B_PATH_NAME_LENGTH] = "";
+    while (get_next_image_info(0, &cookie, &image) == B_OK) {
+        if (image.type == B_APP_IMAGE) {
+            strlcpy(program, image.name, sizeof(program));
+            break;
+        }
+    }
+    if (program[0] == '\0')
+        return;
+    char team[16], srcPort[16], srcId[16], dstPort[16], dstId[16], nodeId[16];
+    snprintf(team, sizeof(team), "%d", (int)portInfo.team);
+    snprintf(srcPort, sizeof(srcPort), "%d", (int)source.port);
+    snprintf(srcId, sizeof(srcId), "%d", (int)source.id);
+    snprintf(dstPort, sizeof(dstPort), "%d", (int)destination.port);
+    snprintf(dstId, sizeof(dstId), "%d", (int)destination.id);
+    snprintf(nodeId, sizeof(nodeId), "%d", (int)appNode.node);
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        int devNull = open("/dev/null", O_RDWR);
+        if (devNull >= 0) {
+            dup2(devNull, 0);
+            dup2(devNull, 1);
+            dup2(devNull, 2);
+        }
+        execl(program, program, "--reap", team, srcPort, srcId, dstPort, dstId, nodeId, (char*)NULL);
+        _exit(127);
+    }
+}
+
+// The "--reap" helper described above. Waits for the app's team to end, gives
+// the app a moment to run its own (stale) disconnect, then removes the
+// Mixer input that's still connected from that app's output.
+int RunInputReaper(int argc, char* argv[]) {
+    if (argc < 8)
+        return 1;
+    team_id team = atoi(argv[2]);
+    media_source source;
+    source.port = atoi(argv[3]);
+    source.id = atoi(argv[4]);
+    media_destination destination;
+    destination.port = atoi(argv[5]);
+    destination.id = atoi(argv[6]);
+    media_node_id appNodeId = atoi(argv[7]);
+
+    signal(SIGINT, SIG_IGN);
+    BMediaRoster* roster = BMediaRoster::Roster();
+    if (roster == nullptr)
+        return 1;
+    media_node mixerNode;
+    if (roster->GetAudioMixer(&mixerNode) != B_OK)
+        return 1;
+
+    team_info teamInfo;
+    for (;;) {
+        snooze(500000);
+        // Has the Mixer input already gone (the app disconnected properly, or
+        // the media_server was restarted)? Then there's nothing to clean up.
+        media_input inputs[64];
+        int32 count = 0;
+        if (roster->GetConnectedInputsFor(mixerNode, inputs, 64, &count) != B_OK)
+            return 0;
+        bool present = false;
+        for (int32 i = 0; i < count; i++) {
+            if (inputs[i].destination == destination && inputs[i].source == source)
+                present = true;
+        }
+        if (!present)
+            return 0;
+        if (get_team_info(team, &teamInfo) != B_OK)
+            break;
+    }
+    snooze(700000); // let the app's own disconnect finish first
+    media_input inputs[64];
+    int32 count = 0;
+    if (roster->GetConnectedInputsFor(mixerNode, inputs, 64, &count) == B_OK) {
+        for (int32 i = 0; i < count; i++) {
+            if (inputs[i].destination == destination && inputs[i].source == source)
+                roster->Disconnect(appNodeId, source, mixerNode.node, destination);
+        }
+    }
+    return 0;
+}
+
 // Disconnects a running tap and reconnects its app directly back to the
 // System Mixer, exactly where it was before hrecord touched it -- used at
 // the end of a full recording session (see TeardownDesktopAudioTap /
@@ -2292,6 +2393,8 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
     // Mixer treats any of its free inputs identically.
     status_t err = B_ERROR;
     media_node mixerNode;
+    media_input reconnectedInput;
+    bool reconnected = false;
     if (roster->GetAudioMixer(&mixerNode) == B_OK) {
         media_input freeInput;
         int32 freeCount = 0;
@@ -2318,6 +2421,8 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
             // path to tell the other app to resync, so restarting it is
             // the only real fix once this fires.
             if (err == B_OK) {
+                reconnectedInput = restoredInput;
+                reconnected = true;
                 const media_raw_audio_format& before = originalAppOutput.format.u.raw_audio;
                 const media_raw_audio_format& after = restoredOutput.format.u.raw_audio;
                 if (before.frame_rate != after.frame_rate || before.buffer_size != after.buffer_size) {
@@ -2339,6 +2444,8 @@ void RestoreHijackedApp(BMediaRoster* roster, AudioTapNode* tap, const media_nod
     }
 
     roster->StartNode(appNode, 0);
+    if (reconnected)
+        SpawnInputReaper(appNode, originalAppOutput.source, reconnectedInput.destination);
     // Release the reference HijackAppIntoTap's GetNodeFor() acquired and
     // handed us via appNode -- see its own comment on this. Confirmed, in
     // practice, as the reason hijacked apps stayed listed in Media
@@ -2461,6 +2568,219 @@ AudioRingBuffer g_mixEncodeQueue;
 // measured elapsed time rather than a stopwatch guess.
 bigtime_t g_allAudioSetupStartTime = 0;
 
+// ---------------------------------------------------------------------------
+// --allaudio: the mix bus -- source gains, meters and a limiter
+// ---------------------------------------------------------------------------
+//
+// The mix used to be a plain average (each source scaled by 1/N). That can't
+// clip, but it gets quieter with every source that joins, and it gave no
+// look at the levels. The mix now takes each source at its own gain, scaled by
+// 1/sqrt(N) (-3 dB per doubling of the number of sources, the way uncorrelated
+// signals add up), and a lookahead brickwall limiter keeps what is left under
+// a ceiling (-1 dBFS by default). --meter prints the peaks of every source and
+// of the mix once a second, and a summary at the end.
+
+const int kMeterMaxSources = 32;
+
+// These can be changed while recording through --control (see ControlLoop), so they are atomics.
+bool g_meter = false;                           // --meter
+std::atomic<int> g_meterMs(1000);               // --meter-ms <n>: how often --meter reports
+bool g_control = false;                         // --control: commands are read from stdin
+std::atomic<bool> g_limiterOn(true);            // --no-limiter turns it off
+std::atomic<float> g_ceilingDb(-1.0f);          // --ceiling <dB>
+std::atomic<float> g_releaseMs(80.0f);          // the limiter's release
+std::atomic<float> g_mixGainDb(0.0f);           // --mix-gain <dB>, on top of the 1/sqrt(N)
+std::atomic<float> g_sourceGainDb[kMeterMaxSources]; // --source-gain <n>=<dB>; zero (unity) until set
+std::atomic<float> g_sourcePan[kMeterMaxSources];    // -1 (left) .. +1 (right) balance; 0 until set
+std::atomic<bool> g_sourceMute[kMeterMaxSources];    // false until set
+std::atomic<uint32_t> g_soloMask(0);            // bit n-1 set: source n is soloed (none set: all are heard)
+
+inline float DbToLinear(float db) { return powf(10.0f, db / 20.0f); }
+inline float LinearToDb(float lin) { return lin > 0.000001f ? 20.0f * log10f(lin) : -120.0f; }
+
+inline void AtomicMax(std::atomic<float>& a, float v) {
+    float cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
+
+struct MixMeter {
+    // peaks since the last report (the reporter resets them), and since the start
+    std::atomic<float> srcPeak[kMeterMaxSources];
+    std::atomic<float> srcPeakAll[kMeterMaxSources];
+    std::atomic<uint64_t> srcNear[kMeterMaxSources]; // samples at or over 0.99
+    std::atomic<float> mixPre, mixPreAll, mixPost, mixPostAll;
+    std::atomic<float> minGain, minGainAll;          // the lowest limiter gain (1 = no reduction)
+    std::atomic<uint64_t> overCeiling, overOne;      // before the limiter
+    int count = 0;
+    std::vector<std::string> names;
+    void Reset(int sources) {
+        count = sources;
+        for (int i = 0; i < kMeterMaxSources; i++) {
+            srcPeak[i] = 0; srcPeakAll[i] = 0; srcNear[i] = 0;
+        }
+        mixPre = 0; mixPreAll = 0; mixPost = 0; mixPostAll = 0;
+        minGain = 1.0f; minGainAll = 1.0f;
+        overCeiling = 0; overOne = 0;
+    }
+};
+
+MixMeter g_mixMeter;
+
+// A lookahead peak limiter on interleaved stereo float frames, linked across
+// the two channels. The audio is delayed by the lookahead; the gain that keeps
+// a peak under the ceiling is worked out from the audio that is still to come
+// (a sliding minimum of the wanted gain over the lookahead), smoothed over the
+// same length so that it is at full reduction when the peak comes out, and
+// released slowly afterwards. Nothing in Process() allocates or blocks.
+class MixLimiter {
+public:
+    static const int kMaxLook = 1024;
+
+    void Init(float rate, float lookaheadMs) {
+        fRate = rate;
+        fLook = (int)(rate * lookaheadMs / 1000.0f);
+        if (fLook < 8) fLook = 8;
+        if (fLook > kMaxLook) fLook = kMaxLook;
+        for (int i = 0; i < kMaxLook; i++) { fDelay[i][0] = 0; fDelay[i][1] = 0; fSmooth[i] = 1.0f; }
+        fDelayPos = 0; fSmoothPos = 0; fEnv = 1.0f;
+        fHead = fTail = 0; fPos = 0;
+    }
+
+    // Limits `frames` frames in place; `minGain` is the lowest gain used.
+    void Process(float* x, int frames, float ceilingLinear, float releaseMs, float& minGain) {
+        minGain = 1.0f;
+        fCeiling = ceilingLinear;
+        fRelease = 1.0f - expf(-1.0f / (fRate * (releaseMs < 1.0f ? 1.0f : releaseMs) / 1000.0f));
+        double sum = 0;
+        for (int i = 0; i < fLook; i++) sum += fSmooth[i];
+        for (int n = 0; n < frames; n++) {
+            float l = x[2 * n], r = x[2 * n + 1];
+            float peak = std::max(fabsf(l), fabsf(r));
+            float target = peak > fCeiling ? fCeiling / peak : 1.0f;
+
+            // the sliding minimum of the target over the last fLook frames
+            while (fHead != fTail && fDeque[(fTail + kQ - 1) % kQ].value >= target)
+                fTail = (fTail + kQ - 1) % kQ;
+            fDeque[fTail].value = target;
+            fDeque[fTail].pos = fPos;
+            fTail = (fTail + 1) % kQ;
+            while (fDeque[fHead].pos + (uint64_t)fLook <= fPos)
+                fHead = (fHead + 1) % kQ;
+            float windowMin = fDeque[fHead].value;
+            fPos++;
+
+            // averaged over the same length: the gain is down by the time the peak is out
+            sum += windowMin - fSmooth[fSmoothPos];
+            fSmooth[fSmoothPos] = windowMin;
+            fSmoothPos = (fSmoothPos + 1) % fLook;
+            float wanted = (float)(sum / fLook);
+
+            // down at once (the averaging is the attack), back up slowly
+            fEnv = wanted < fEnv ? wanted : fEnv + (wanted - fEnv) * fRelease;
+            if (fEnv < minGain) minGain = fEnv;
+
+            float outL = fDelay[fDelayPos][0] * fEnv, outR = fDelay[fDelayPos][1] * fEnv;
+            fDelay[fDelayPos][0] = l;
+            fDelay[fDelayPos][1] = r;
+            fDelayPos = (fDelayPos + 1) % fLook;
+            x[2 * n] = std::max(-1.0f, std::min(1.0f, outL));
+            x[2 * n + 1] = std::max(-1.0f, std::min(1.0f, outR));
+        }
+    }
+
+private:
+    struct Entry { float value; uint64_t pos; };
+    static const int kQ = kMaxLook + 2;
+    int fLook = 96;
+    float fRate = 48000.0f;
+    float fCeiling = 0.89f, fRelease = 0.001f, fEnv = 1.0f;
+    float fDelay[kMaxLook][2];
+    float fSmooth[kMaxLook];
+    Entry fDeque[kQ];
+    int fDelayPos = 0, fSmoothPos = 0, fHead = 0, fTail = 0;
+    uint64_t fPos = 0;
+};
+
+MixLimiter g_mixLimiter;
+
+std::atomic<bool> g_meterStop(false);
+std::thread g_meterThread;
+
+// Once a second: the peaks of every source and of the mix since the last line.
+void MeterReporterLoop() {
+    while (!g_meterStop.load()) {
+        for (int waited = 0; waited < g_meterMs.load() && !g_meterStop.load(); waited += 10)
+            snooze(10000);
+        if (g_meterStop.load())
+            break;
+        char line[1024];
+        int len = snprintf(line, sizeof(line), "[meter]");
+        for (int i = 0; i < g_mixMeter.count && len < 700; i++) {
+            float peak = g_mixMeter.srcPeak[i].exchange(0.0f);
+            len += snprintf(line + len, sizeof(line) - len, " #%d %.1f", i + 1, LinearToDb(peak));
+        }
+        float pre = g_mixMeter.mixPre.exchange(0.0f), post = g_mixMeter.mixPost.exchange(0.0f);
+        float gain = g_mixMeter.minGain.exchange(1.0f);
+        snprintf(line + len, sizeof(line) - len, " | mix before %.1f after %.1f dBFS | limiter %.1f dB",
+            LinearToDb(pre), LinearToDb(post), LinearToDb(gain));
+        std::cout << line << std::endl;
+    }
+}
+
+void PrintMeterSummary() {
+    if (!g_meter)
+        return;
+    std::cout << "[meter] Summary of the mix:" << std::endl;
+    for (int i = 0; i < g_mixMeter.count; i++) {
+        std::cout << "    source #" << (i + 1);
+        if (i < (int)g_mixMeter.names.size())
+            std::cout << " \"" << g_mixMeter.names[i] << "\"";
+        std::cout << ": peak " << LinearToDb(g_mixMeter.srcPeakAll[i].load()) << " dBFS, "
+            << g_mixMeter.srcNear[i].load() << " samples at or over 0.99" << std::endl;
+    }
+    std::cout << "    mix before the limiter: peak " << LinearToDb(g_mixMeter.mixPreAll.load())
+        << " dBFS, " << g_mixMeter.overCeiling.load() << " samples over the ceiling, "
+        << g_mixMeter.overOne.load() << " over full scale" << std::endl;
+    std::cout << "    mix after the limiter: peak " << LinearToDb(g_mixMeter.mixPostAll.load())
+        << " dBFS, most gain reduction " << LinearToDb(g_mixMeter.minGainAll.load()) << " dB" << std::endl;
+}
+
+// --control: a program that runs hrecord (the GUI) writes commands to its stdin, one per line, while it records:
+//   gain <n> <dB>     the n-th source's gain          mute <n> <0|1>     mute a source
+//   solo <n> <0|1>    solo a source                   mixgain <dB>       the whole mix
+//   ceiling <dB>      the limiter's ceiling           release <ms>       the limiter's release
+//   pan <n> <-1..1>   a source's balance, left to right
+//   limiter <0|1>     the limiter on or off           quit               stop recording
+// When stdin closes (the program that started hrecord has gone) it stops as if it had been interrupted.
+void ControlLoop() {
+    char line[256];
+    while (fgets(line, sizeof(line), stdin) != nullptr) {
+        int n = 0, v = 0;
+        float f = 0.0f;
+        if (sscanf(line, "gain %d %f", &n, &f) == 2 && n >= 1 && n <= kMeterMaxSources) {
+            g_sourceGainDb[n - 1] = f;
+        } else if (sscanf(line, "pan %d %f", &n, &f) == 2 && n >= 1 && n <= kMeterMaxSources) {
+            g_sourcePan[n - 1] = f < -1.0f ? -1.0f : (f > 1.0f ? 1.0f : f);
+        } else if (sscanf(line, "mute %d %d", &n, &v) == 2 && n >= 1 && n <= kMeterMaxSources) {
+            g_sourceMute[n - 1] = (v != 0);
+        } else if (sscanf(line, "solo %d %d", &n, &v) == 2 && n >= 1 && n <= kMeterMaxSources) {
+            if (v != 0) g_soloMask.fetch_or(1u << (n - 1));
+            else g_soloMask.fetch_and(~(1u << (n - 1)));
+        } else if (sscanf(line, "mixgain %f", &f) == 1) {
+            g_mixGainDb = f;
+        } else if (sscanf(line, "ceiling %f", &f) == 1) {
+            g_ceilingDb = f > 0.0f ? 0.0f : f;
+        } else if (sscanf(line, "release %f", &f) == 1) {
+            g_releaseMs = f < 1.0f ? 1.0f : f;
+        } else if (sscanf(line, "limiter %d", &v) == 1) {
+            g_limiterOn = (v != 0);
+        } else if (strncmp(line, "quit", 4) == 0) {
+            break;
+        }
+    }
+    kill(getpid(), SIGINT); // the same clean stop as Ctrl+C or "hrecord stop"
+}
+
 // BSoundPlayer::BufferPlayerFunc used only in --allaudio mode. Unlike
 // PlaybackCallback (which just drains one ring for one hijacked app), this
 // pulls an equal-size chunk from every tapped source's own ring buffer
@@ -2527,11 +2847,77 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
     if (scratch.size() < sampleCount)
         scratch.resize(sampleCount);
 
-    float gain = 1.0f / (float)sources->size();
+    // each source at its own gain, scaled by 1/sqrt(N); the limiter takes care of what is left
+    const float base = (1.0f / sqrtf((float)sources->size())) * DbToLinear(g_mixGainDb);
+    int index = 0;
     for (AudioRingBuffer* ring : *sources) {
         ring->Read(scratch.data(), size);
-        for (size_t i = 0; i < sampleCount; i++)
-            out[i] += scratch[i] * gain;
+        float gain = base * DbToLinear(index < kMeterMaxSources ? g_sourceGainDb[index].load() : 0.0f);
+        if (index < kMeterMaxSources) {
+            // muted, or another source is soloed: still drained and metered, but not in the mix
+            const uint32_t solo = g_soloMask.load();
+            if (g_sourceMute[index].load() || (solo != 0 && (solo & (1u << index)) == 0))
+                gain = 0.0f;
+        }
+        // balance: the side away from the pan is turned down, the other stays as it is
+        float gainL = gain, gainR = gain;
+        if (index < kMeterMaxSources && kMixBusChannels == 2) {
+            const float pan = g_sourcePan[index].load();
+            if (pan > 0.0f) gainL *= 1.0f - pan;
+            else if (pan < 0.0f) gainR *= 1.0f + pan;
+        }
+        float peak = 0.0f;
+        uint64_t near = 0;
+        for (size_t i = 0; i < sampleCount; i++) {
+            float v = scratch[i];
+            float a = fabsf(v);
+            if (a > peak) peak = a;
+            if (a >= 0.99f) near++;
+            out[i] += v * ((kMixBusChannels == 2 && (i & 1)) ? gainR : gainL);
+        }
+        if (index < kMeterMaxSources) {
+            AtomicMax(g_mixMeter.srcPeak[index], peak);
+            AtomicMax(g_mixMeter.srcPeakAll[index], peak);
+            g_mixMeter.srcNear[index].fetch_add(near, std::memory_order_relaxed);
+        }
+        index++;
+    }
+
+    // the mix before the limiter
+    {
+        float pre = 0.0f;
+        uint64_t overCeiling = 0, overOne = 0;
+        const float ceiling = DbToLinear(g_ceilingDb);
+        for (size_t i = 0; i < sampleCount; i++) {
+            float a = fabsf(out[i]);
+            if (a > pre) pre = a;
+            if (a > ceiling) overCeiling++;
+            if (a > 1.0f) overOne++;
+        }
+        AtomicMax(g_mixMeter.mixPre, pre);
+        AtomicMax(g_mixMeter.mixPreAll, pre);
+        g_mixMeter.overCeiling.fetch_add(overCeiling, std::memory_order_relaxed);
+        g_mixMeter.overOne.fetch_add(overOne, std::memory_order_relaxed);
+    }
+
+    if (g_limiterOn && kMixBusChannels == 2) {
+        float minGain = 1.0f;
+        g_mixLimiter.Process(out, (int)(sampleCount / 2), DbToLinear(g_ceilingDb), g_releaseMs, minGain);
+        // the lowest gain since the last report / since the start
+        float m = g_mixMeter.minGain.load(std::memory_order_relaxed);
+        if (minGain < m) g_mixMeter.minGain.store(minGain, std::memory_order_relaxed);
+        m = g_mixMeter.minGainAll.load(std::memory_order_relaxed);
+        if (minGain < m) g_mixMeter.minGainAll.store(minGain, std::memory_order_relaxed);
+    }
+
+    {
+        float post = 0.0f;
+        for (size_t i = 0; i < sampleCount; i++) {
+            float a = fabsf(out[i]);
+            if (a > post) post = a;
+        }
+        AtomicMax(g_mixMeter.mixPost, post);
+        AtomicMax(g_mixMeter.mixPostAll, post);
     }
 
     if (g_running)
@@ -2695,6 +3081,13 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
     for (auto& entry : handles->taps)
         handles->mixSources.push_back(entry.ring);
 
+    // the mix bus: the meters, and the limiter (lookahead 2 ms, released over 80 ms)
+    g_mixMeter.Reset((int)std::min((size_t)kMeterMaxSources, handles->taps.size()));
+    g_mixMeter.names.clear();
+    for (auto& entry : handles->taps)
+        g_mixMeter.names.push_back(entry.appName);
+    g_mixLimiter.Init(g_mixBusRate, 2.0f);
+
     BSoundPlayer* player = new BSoundPlayer(&busFormat, "hrecord Mixed Playback",
         MixedPlaybackCallback, nullptr, &handles->mixSources);
     if (player->InitCheck() != B_OK) {
@@ -2709,6 +3102,10 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
     }
     player->SetHasData(true);
     player->Start();
+    if (g_meter) {
+        g_meterStop = false;
+        g_meterThread = std::thread(MeterReporterLoop);
+    }
     std::cout << "[i] BSoundPlayer::Start() returned " << ((system_time() - g_allAudioSetupStartTime) / 1000)
         << "ms after tap setup began." << std::endl;
 
@@ -2738,6 +3135,12 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
         delete handles->player;
         handles->player = nullptr;
     }
+
+    if (g_meterThread.joinable()) {
+        g_meterStop = true;
+        g_meterThread.join();
+    }
+    PrintMeterSummary();
 
     for (auto& entry : handles->taps) {
         if (entry.ring) {
@@ -2775,7 +3178,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.11.9";
+    const char* localVersion = "v1.12.0";
 
     CURL* curl = curl_easy_init();
     if (!curl)
@@ -2808,6 +3211,9 @@ static int32 BackgroundUpdateChecker(void* data) {
 }
 
 int main(int argc, char* argv[]) {
+    if (argc >= 2 && strcmp(argv[1], "--reap") == 0)
+        return RunInputReaper(argc, argv);
+
     // libcurl's global init is not thread-safe against other concurrently
     // running threads, so do it explicitly up front (before any background
     // thread might trigger an implicit lazy global init and race it).
@@ -2861,6 +3267,29 @@ int main(int argc, char* argv[]) {
             listAudioInputs = true;
         } else if (strcmp(argv[i], "--logfps") == 0) {
             logFps = true;
+        } else if (strcmp(argv[i], "--meter") == 0) {
+            g_meter = true;
+        } else if (strcmp(argv[i], "--meter-ms") == 0 && i + 1 < argc) {
+            g_meterMs = std::max(20, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--control") == 0) {
+            g_control = true;
+        } else if (strcmp(argv[i], "--no-limiter") == 0) {
+            g_limiterOn = false;
+        } else if (strcmp(argv[i], "--ceiling") == 0 && i + 1 < argc) {
+            g_ceilingDb = (float)atof(argv[++i]);
+            if (g_ceilingDb > 0.0f) g_ceilingDb = 0.0f;
+        } else if (strcmp(argv[i], "--mix-gain") == 0 && i + 1 < argc) {
+            g_mixGainDb = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--source-gain") == 0 && i + 1 < argc) {
+            // "<n>=<dB>": the n-th source (as numbered when it is tapped), 1 first
+            int n = 0;
+            float db = 0.0f;
+            if (sscanf(argv[++i], "%d=%f", &n, &db) == 2 && n >= 1 && n <= kMeterMaxSources)
+                g_sourceGainDb[n - 1] = db;
+            else {
+                std::cout << "--source-gain takes <n>=<dB>, for example 2=-6" << std::endl;
+                return 0;
+            }
         } else if (strcmp(argv[i], "--low") == 0) {
             profileIndex = 0;
         } else if (strcmp(argv[i], "--medium") == 0) {
@@ -2872,7 +3301,8 @@ int main(int argc, char* argv[]) {
                 "[--allaudio] [--realtime] [--experimental-screen-capture] "
                 "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
                 "[--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] "
-                "[--list-audio-inputs] [--logfps]" << std::endl;
+                "[--list-audio-inputs] [--logfps] [--meter] [--no-limiter] [--ceiling <dB>] "
+                "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control]" << std::endl;
             return 0;
         }
     }
@@ -3159,7 +3589,7 @@ int main(int argc, char* argv[]) {
             // Absolute verification: Only signal if the binary images match exactly
             // and the target process does NOT contain our transient shutdown command flag.
             if (targetBinary == myPath || (targetBinary.find("hrecord") != std::string::npos && targetBinary != "stop")) {
-                if (targetArgs.find("stop") == std::string::npos) {
+                if (targetArgs.find("stop") == std::string::npos && targetArgs.find("--reap") == std::string::npos) {
                     kill(info.team, SIGINT); // Fire clean Ctrl+C directly into the recorder
                     found = true;
                 }
@@ -3186,6 +3616,9 @@ int main(int argc, char* argv[]) {
 
     // 3. Initialize Haiku Application Context
     BApplication haikuApp("application/x-vnd.hrecord");
+
+    if (g_control && !stopRequested)
+        std::thread(ControlLoop).detach();
 
     if (listAudioInputs) {
         BMediaRoster* roster = BMediaRoster::Roster();
