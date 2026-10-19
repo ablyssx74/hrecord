@@ -46,7 +46,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <map>
 #include <string>
 #include <vector>
 
@@ -75,8 +74,7 @@ enum {
 };
 
 static const float kFaderMin = -60.0f, kFaderMax = 12.0f;		// dB, on a fader
-static const float kMeterMin = -60.0f;
-static const float kSilenceDb = -70.0f;					// a source quieter than this has made no sound yet: it has no strip							// dB, the bottom of a meter
+static const float kMeterMin = -60.0f;							// dB, the bottom of a meter
 
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1333,15 +1331,12 @@ private:
 			const char* quote = strchr(line, '"');
 			const char* last = quote != NULL ? strrchr(line, '"') : NULL;
 			std::string name = (quote != NULL && last != NULL && last > quote) ? std::string(quote + 1, last - quote - 1) : "source";
-			// the strip appears when the source makes its first sound (see UpdateMeters): a program that is connected but
-			// silent, such as a browser tab's idle player, would only show a strip with nothing on it
-			fPendingSources[number - 1] = name;
+			AddStrip(number - 1, name.c_str());
 			Log(line);
 			return;
 		}
 		// a source that has stopped (its program has quit) leaves the mix and loses its strip
 		if (sscanf(line, "[-] Removed source #%d", &number) == 1) {
-			fPendingSources.erase(number - 1);
 			RemoveStrip(number - 1);
 			Log(line);
 			return;
@@ -1376,11 +1371,6 @@ private:
 			if (sscanf(cursor, " #%d %f %f%n", &number, &left, &right, &used) < 3)
 				break;
 			cursor += used;
-			std::map<int, std::string>::iterator waiting = fPendingSources.find(number - 1);
-			if (waiting != fPendingSources.end() && std::max(left, right) > kSilenceDb) {
-				AddStrip(number - 1, waiting->second.c_str());
-				fPendingSources.erase(waiting);
-			}
 			for (size_t i = 0; i < fStrips.size(); i++) {
 				if (fStrips[i]->Index() == number - 1)
 					fStrips[i]->SetLevels(left, right);
@@ -1441,7 +1431,6 @@ private:
 			delete fStrips[i];
 		}
 		fStrips.clear();
-		fPendingSources.clear();
 		fHint->SetText("Start playing sound in the programs to record, then press Record. Each one gets a strip; programs that start later join by themselves.");
 		if (fHint->IsHidden())
 			fHint->Show();
@@ -1485,7 +1474,6 @@ private:
 	BView*				fStripsGroup;
 	BStringView*		fHint;
 	std::vector<SourceStrip*> fStrips;
-	std::map<int, std::string> fPendingSources;		// tapped but not heard yet: number - 1, name
 	DbSlider*			fMixGain;
 	StereoMeter*		fPreMeter;
 	StereoMeter*		fPostMeter;
