@@ -57,8 +57,11 @@ LIBS = $(LIB_PATH) $(EXTRA_LIBS) $(HAIKU_LIBS)
 .PHONY: all clean gui
 
 # The mixer window: runs hrecord as its engine
-gui: hrecord_gui.cpp
+gui: hrecord_gui.cpp hrecord_mixer.rdef
 	$(CXX) -std=c++17 -O2 -Wall $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lroot
+	rc -o hrecord_mixer.rsrc hrecord_mixer.rdef
+	xres -o hrecord_mixer hrecord_mixer.rsrc
+	mimeset -f hrecord_mixer
 
 all: $(GUI_TARGET)
 
