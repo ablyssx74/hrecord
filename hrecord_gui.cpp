@@ -622,6 +622,7 @@ static const StreamService kStreamServices[] = {
 	{ "RTSP server",					"" }
 };
 static const int kStreamServiceCount = sizeof(kStreamServices) / sizeof(kStreamServices[0]);
+static_assert(sizeof(kStreamServices) / sizeof(kStreamServices[0]) == 6, "StreamConfig keeps 6 services");
 static const int kServiceCustomRtmp = 4;
 static const int kServiceRtsp = 5;
 
@@ -634,8 +635,8 @@ static const int kStreamPresetCount = sizeof(kStreamPresets) / sizeof(kStreamPre
 struct StreamConfig {
 	bool		enabled = false;		// the "Stream live" box
 	int			service = 0;
-	std::string	server;					// for the services that have no fixed address
-	std::string	key;
+	std::string	servers[6];				// by service: the address of those that have no fixed one (kStreamServiceCount)
+	std::string	keys[6];				// by service: each server has a stream key of its own
 	int			videoKbps = 2500;
 	int			audioKbps = 128;
 	int			preset = 2;				// veryfast
@@ -643,7 +644,7 @@ struct StreamConfig {
 
 	std::string BaseAddress() const
 	{
-		std::string base = service < kServiceCustomRtmp ? kStreamServices[service].base : server;
+		std::string base = service < kServiceCustomRtmp ? kStreamServices[service].base : servers[service];
 		while (!base.empty() && (base[base.size() - 1] == '/' || base[base.size() - 1] == ' '))
 			base.resize(base.size() - 1);
 		return base;
@@ -653,9 +654,9 @@ struct StreamConfig {
 	std::string Url() const
 	{
 		std::string base = BaseAddress();
-		if (service == kServiceRtsp || key.empty())
+		if (service == kServiceRtsp || keys[service].empty())
 			return base;
-		return base + "/" + key;
+		return base + "/" + keys[service];
 	}
 
 	// What is missing, or empty when it is fine.
@@ -669,7 +670,7 @@ struct StreamConfig {
 		}
 		if (service == kServiceCustomRtmp && base.compare(0, 7, "rtmp://") != 0 && base.compare(0, 8, "rtmps://") != 0)
 			return "Stream settings: the server address must start with rtmp:// or rtmps://";
-		if (key.empty())
+		if (keys[service].empty())
 			return "Stream settings: enter the stream key.";
 		return "";
 	}
@@ -694,8 +695,16 @@ struct StreamConfig {
 		bool flag;
 		if (message.FindBool("stream", &flag) == B_OK) enabled = flag;
 		if (message.FindInt32("service", &number) == B_OK && number >= 0 && number < kStreamServiceCount) service = number;
-		if (message.FindString("server", &text) == B_OK) server = text;
-		if (message.FindString("key", &text) == B_OK) key = text;
+		// (an older file has one key and one address, for the service that was chosen then)
+		if (message.FindString("server", &text) == B_OK) servers[service] = text;
+		if (message.FindString("key", &text) == B_OK) keys[service] = text;
+		for (int i = 0; i < kStreamServiceCount; i++) {
+			char name[16];
+			snprintf(name, sizeof(name), "server%d", i);
+			if (message.FindString(name, &text) == B_OK) servers[i] = text;
+			snprintf(name, sizeof(name), "key%d", i);
+			if (message.FindString(name, &text) == B_OK) keys[i] = text;
+		}
 		if (message.FindInt32("video", &number) == B_OK) videoKbps = number;
 		if (message.FindInt32("audio", &number) == B_OK) audioKbps = number;
 		if (message.FindInt32("preset", &number) == B_OK && number >= 0 && number < kStreamPresetCount) preset = number;
@@ -707,8 +716,13 @@ struct StreamConfig {
 		BMessage message;
 		message.AddBool("stream", enabled);
 		message.AddInt32("service", service);
-		message.AddString("server", server.c_str());
-		message.AddString("key", key.c_str());
+		for (int i = 0; i < kStreamServiceCount; i++) {
+			char name[16];
+			snprintf(name, sizeof(name), "server%d", i);
+			message.AddString(name, servers[i].c_str());
+			snprintf(name, sizeof(name), "key%d", i);
+			message.AddString(name, keys[i].c_str());
+		}
 		message.AddInt32("video", videoKbps);
 		message.AddInt32("audio", audioKbps);
 		message.AddInt32("preset", preset);
@@ -741,9 +755,11 @@ public:
 		fServiceMenu->ItemAt(config.service)->SetMarked(true);
 		fService = new BMenuField("service", "Stream to:", fServiceMenu);
 
-		fServer = new BTextControl("server", "Server address:", config.server.c_str(), NULL);
-		fKey = new BTextControl("key", "Stream key:", config.key.c_str(), NULL);
+		fServer = new BTextControl("server", "Server address:", "", NULL);
+		// HideTyping() deletes what the field holds, so the key is put in after it
+		fKey = new BTextControl("key", "Stream key:", "", NULL);
 		fKey->TextView()->HideTyping(true);
+
 
 		fVideo = new BSpinner("video", "Video bitrate (kbps):", NULL);
 		fVideo->SetRange(300, 20000);
@@ -796,8 +812,12 @@ public:
 				.Add(save)
 			.End();
 
-		fSavedServer = config.server;
-		UpdateServiceFields(false);
+		for (int i = 0; i < kStreamServiceCount; i++) {
+			fKeys[i] = config.keys[i];
+			fServers[i] = config.servers[i];
+		}
+		fShown = config.service;
+		FillFields();
 		CenterOnScreen();
 	}
 
@@ -805,14 +825,23 @@ public:
 	{
 		switch (message->what) {
 			case kMsgStreamService:
-				UpdateServiceFields(true);
+				// what is in the fields belongs to the service that was shown; the new one brings its own
+				RememberFields();
+				fShown = Service();
+				FillFields();
 				break;
 			case kMsgStreamSave:
 			{
 				BMessage saved(kMsgStreamSaved);
+				RememberFields();
 				saved.AddInt32("service", Service());
-				saved.AddString("server", Service() >= kServiceCustomRtmp ? fServer->Text() : fSavedServer.c_str());
-				saved.AddString("key", fKey->Text());
+				for (int i = 0; i < kStreamServiceCount; i++) {
+					char name[16];
+					snprintf(name, sizeof(name), "server%d", i);
+					saved.AddString(name, fServers[i].c_str());
+					snprintf(name, sizeof(name), "key%d", i);
+					saved.AddString(name, fKeys[i].c_str());
+				}
 				saved.AddInt32("video", fVideo->Value());
 				saved.AddInt32("audio", fAudio->Value());
 				BMenuItem* marked = fPresetMenu->FindMarked();
@@ -834,22 +863,28 @@ private:
 		return marked != NULL ? fServiceMenu->IndexOf(marked) : 0;
 	}
 
-	// The fixed services show their address (and cannot be changed); the others have a box to fill in.
-	void UpdateServiceFields(bool changed)
+	// What the fields hold is kept for the service that is shown.
+	void RememberFields()
 	{
-		const int service = Service();
-		if (service < kServiceCustomRtmp) {
-			if (changed && fServer->IsEnabled())
-				fSavedServer = fServer->Text();
-			fServer->SetText(kStreamServices[service].base);
+		fKeys[fShown] = fKey->Text();
+		if (fShown >= kServiceCustomRtmp)
+			fServers[fShown] = fServer->Text();
+	}
+
+	// The fields show the key (and the address) of the service that is shown. The fixed services show their address and cannot
+	// change it; the others have a box to fill in.
+	void FillFields()
+	{
+		fKey->SetText(fKeys[fShown].c_str());
+		if (fShown < kServiceCustomRtmp) {
+			fServer->SetText(kStreamServices[fShown].base);
 			fServer->SetEnabled(false);
 			fKey->SetEnabled(true);
 		} else {
-			if (!fServer->IsEnabled())
-				fServer->SetText(fSavedServer.c_str());
+			fServer->SetText(fServers[fShown].c_str());
 			fServer->SetEnabled(true);
-			fKey->SetEnabled(service != kServiceRtsp);
-			fServer->SetLabel(service == kServiceRtsp ? "RTSP address:" : "Server address:");
+			fKey->SetEnabled(fShown != kServiceRtsp);
+			fServer->SetLabel(fShown == kServiceRtsp ? "RTSP address:" : "Server address:");
 		}
 	}
 
@@ -863,7 +898,9 @@ private:
 	BSpinner*		fKeyint;
 	BPopUpMenu*		fPresetMenu;
 	BMenuField*		fPreset;
-	std::string		fSavedServer;
+	std::string		fKeys[6];		// by service, as edited in this window
+	std::string		fServers[6];
+	int				fShown;			// the service that the fields show
 };
 
 
@@ -1105,8 +1142,13 @@ public:
 				int32 number;
 				const char* text;
 				if (message->FindInt32("service", &number) == B_OK) fStreamConfig.service = number;
-				if (message->FindString("server", &text) == B_OK) fStreamConfig.server = text;
-				if (message->FindString("key", &text) == B_OK) fStreamConfig.key = text;
+				for (int i = 0; i < kStreamServiceCount; i++) {
+					char name[16];
+					snprintf(name, sizeof(name), "server%d", i);
+					if (message->FindString(name, &text) == B_OK) fStreamConfig.servers[i] = text;
+					snprintf(name, sizeof(name), "key%d", i);
+					if (message->FindString(name, &text) == B_OK) fStreamConfig.keys[i] = text;
+				}
 				if (message->FindInt32("video", &number) == B_OK) fStreamConfig.videoKbps = number;
 				if (message->FindInt32("audio", &number) == B_OK) fStreamConfig.audioKbps = number;
 				if (message->FindInt32("preset", &number) == B_OK) fStreamConfig.preset = number;
