@@ -442,6 +442,9 @@ public:
 			kill(fPid, SIGKILL);
 	}
 
+	// hrecord next to this program, else the one on the path.
+	static std::string ProgramPath();
+
 private:
 	static int32 ReaderThread(void* data)
 	{
@@ -467,8 +470,7 @@ private:
 		return 0;
 	}
 
-	// hrecord next to this program, else the one on the path.
-	static std::string ProgramPath()
+	static std::string ProgramPathImpl()
 	{
 		app_info info;
 		if (be_app->GetAppInfo(&info) == B_OK) {
@@ -489,6 +491,13 @@ private:
 	thread_id	fReader;
 	BMessenger	fTarget;
 };
+
+
+std::string
+Engine::ProgramPath()
+{
+	return ProgramPathImpl();
+}
 
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -599,6 +608,8 @@ public:
 			.End()
 			.Add(fStatus)
 			.Add(logScroll);
+
+		RefreshRealtime();
 	}
 
 	bool QuitRequested()
@@ -714,10 +725,40 @@ private:
 		fEngine.Send(text);
 	}
 
+	// Asks hrecord whether real-time audio is set on the sound driver and shows it: on or off and greyed out when
+	// that is known, a box to choose only for a driver hrecord has no profile for.
+	void RefreshRealtime()
+	{
+		std::string command = "\"" + Engine::ProgramPath() + "\" --detect-realtime 2>/dev/null";
+		char answer[128] = "";
+		FILE* pipe = popen(command.c_str(), "r");
+		if (pipe != NULL) {
+			if (fgets(answer, sizeof(answer), pipe) == NULL)
+				answer[0] = '\0';
+			pclose(pipe);
+		}
+		int frames = 0;
+		if (sscanf(answer, "realtime on %d", &frames) == 1) {
+			BString label;
+			label << "Real-time audio: on (" << frames << " frames)";
+			fRealtime->SetLabel(label.String());
+			fRealtime->SetValue(B_CONTROL_ON);
+			fRealtime->SetEnabled(false);
+		} else if (strncmp(answer, "realtime off known", 18) == 0) {
+			fRealtime->SetLabel("Real-time audio: off (set in the driver settings)");
+			fRealtime->SetValue(B_CONTROL_OFF);
+			fRealtime->SetEnabled(false);
+		} else {
+			fRealtime->SetLabel("Real-time (low latency)");
+			fRealtime->SetEnabled(!fRecording);
+		}
+	}
+
 	void StartRecording()
 	{
 		if (fEngine.Running())
 			return;
+		RefreshRealtime();
 		ClearStrips();
 		std::vector<std::string> arguments;
 		arguments.push_back("start");
@@ -728,7 +769,7 @@ private:
 		arguments.push_back("--meter-ms");
 		arguments.push_back("70");
 		arguments.push_back("--control");
-		if (fRealtime->Value() == B_CONTROL_ON)
+		if (fRealtime->IsEnabled() && fRealtime->Value() == B_CONTROL_ON)
 			arguments.push_back("--realtime");
 		if (fScreen->Value() == B_CONTROL_ON) {
 			BMenuItem* marked = fQualityMenu->FindMarked();
@@ -786,7 +827,7 @@ private:
 		fRecord->SetEnabled(true);
 		fStop->SetEnabled(false);
 		fScreen->SetEnabled(true);
-		fRealtime->SetEnabled(true);
+		RefreshRealtime();
 		for (size_t i = 0; i < fStrips.size(); i++)
 			fStrips[i]->SetLevel(kMeterMin);
 		fPreMeter->SetLevel(kMeterMin);

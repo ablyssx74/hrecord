@@ -144,6 +144,8 @@ issues) is in [`research.md`](research.md).
 strip with a level meter, a volume fader, left/right balance, mute and solo; the master
 section has a mix fader, before/after limiter meters, the limiter's on/off, ceiling and
 release, and a gain-reduction bar. A right-click on a fader or balance slider resets it.
+The window shows whether real-time audio is set on the sound driver (`hrecord --detect-realtime`);
+the box can be changed only for a driver hrecord has no profile for.
 
 ## Apps that were recorded no longer linger in Media preferences
 

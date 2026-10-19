@@ -194,6 +194,9 @@ static bool FindActiveSettingValue(const std::string& content, const char* key,
 // mere presence of an active line is itself strong evidence real-time
 // buffers are actually in play, since every cataloged driver ships that
 // key fully commented out by default.
+// Set by DetectRealtimeAudioSettings: whether the active driver is one this app has a profile for.
+static bool g_knownRealtimeDriver = false;
+
 static bool DetectRealtimeAudioSettings(int32* outFrames) {
     DIR* dir = opendir("/dev/audio/hmulti");
     if (dir == nullptr)
@@ -217,6 +220,7 @@ static bool DetectRealtimeAudioSettings(int32* outFrames) {
 
     if (profile == nullptr)
         return false;
+    g_knownRealtimeDriver = true;
 
     BPath settingsDirPath;
     std::string settingsDir;
@@ -3178,7 +3182,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
 // notifies the user if it differs from the version baked into this binary.
 static int32 BackgroundUpdateChecker(void* data) {
     const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/hrecord/refs/heads/main/VERSION";
-    const char* localVersion = "v1.12.0";
+    const char* localVersion = "v1.12.1";
 
     CURL* curl = curl_easy_init();
     if (!curl)
@@ -3213,6 +3217,18 @@ static int32 BackgroundUpdateChecker(void* data) {
 int main(int argc, char* argv[]) {
     if (argc >= 2 && strcmp(argv[1], "--reap") == 0)
         return RunInputReaper(argc, argv);
+
+    // For the mixer window: one line saying whether real-time audio is set on the active driver.
+    //   "realtime on <frames>"   tuned      "realtime off known"   a known driver, not tuned
+    //   "realtime off unknown"   no driver this app has a profile for (--realtime can still force it)
+    if (argc >= 2 && strcmp(argv[1], "--detect-realtime") == 0) {
+        int32 frames = 0;
+        if (DetectRealtimeAudioSettings(&frames))
+            std::cout << "realtime on " << frames << std::endl;
+        else
+            std::cout << "realtime off " << (g_knownRealtimeDriver ? "known" : "unknown") << std::endl;
+        return 0;
+    }
 
     // libcurl's global init is not thread-safe against other concurrently
     // running threads, so do it explicitly up front (before any background
