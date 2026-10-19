@@ -89,13 +89,16 @@ clean:
 
 
 
-release: all
+release: all gui
 	@[ -n "$(PACKAGE_DIR)" ] || { echo "PACKAGE_DIR is undefined"; exit 1; }
 	rm -rf "./$(PACKAGE_DIR)"
 	mkdir -p $(PACKAGE_DIR)
 	sed -e 's/$$(GUI_TARGET)/$(GUI_TARGET)/g' -e 's/$$(VERSION)/$(VERSION)/g' -e 's/$$(ARCH)/$(ARCH)/' -e 's/$$(YEAR)/$(shell date +%Y)/' $(GUI_TARGET).tpl > $(PACKAGE_DIR)/.PackageInfo
 	mkdir -p $(PACKAGE_DIR)/bin
 	cp $(GUI_TARGET) $(PACKAGE_DIR)/bin/$(GUI_TARGET)
+	mkdir -p $(PACKAGE_DIR)/apps $(PACKAGE_DIR)/data/deskbar/menu/Applications
+	cp hrecord_mixer $(PACKAGE_DIR)/apps/hrecord_mixer
+	ln -s ../../../../apps/hrecord_mixer "$(PACKAGE_DIR)/data/deskbar/menu/Applications/hRecord Mixer"
 	package create -C $(PACKAGE_DIR) $(GUI_TARGET)-$(VERSION)-1-$(ARCH).hpkg	
 
 
