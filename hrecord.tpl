@@ -16,8 +16,8 @@ provides {
 }
 requires {
 	haiku
-	ffmpeg8
-	curl
+	ffmpeg8$(DEP_SUFFIX)
+	curl$(DEP_SUFFIX)
 }	
 urls {
 	"https://github.com/ablyssx74/hrecord"

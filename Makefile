@@ -25,11 +25,14 @@ ifeq ($(UNAME_M), BePC)
     LIB_ARCH_DIR = /x86
     DEFINES += -DIS_HAIKU_32BIT
     PKG_CONFIG_CMD = pkg-config-x86
+    # the 32-bit libraries come from the secondary-architecture packages (ffmpeg8_x86, curl_x86)
+    DEP_SUFFIX = _x86
 else
     CXX = g++
     ARCH = x86_64
     LIB_ARCH_DIR = 
     PKG_CONFIG_CMD = pkg-config
+    DEP_SUFFIX =
 endif
 
 export PKG_CONFIG_PATH := $(DUMMY_PC_PATH):/boot/home/config/non-packaged/lib/pkgconfig:/boot/home/config/non-packaged/lib$(LIB_ARCH_DIR)/pkgconfig:/boot/system/develop/lib$(LIB_ARCH_DIR)/pkgconfig:
@@ -93,7 +96,7 @@ release: all gui
 	@[ -n "$(PACKAGE_DIR)" ] || { echo "PACKAGE_DIR is undefined"; exit 1; }
 	rm -rf "./$(PACKAGE_DIR)"
 	mkdir -p $(PACKAGE_DIR)
-	sed -e 's/$$(GUI_TARGET)/$(GUI_TARGET)/g' -e 's/$$(VERSION)/$(VERSION)/g' -e 's/$$(ARCH)/$(ARCH)/' -e 's/$$(YEAR)/$(shell date +%Y)/' $(GUI_TARGET).tpl > $(PACKAGE_DIR)/.PackageInfo
+	sed -e 's/$$(GUI_TARGET)/$(GUI_TARGET)/g' -e 's/$$(VERSION)/$(VERSION)/g' -e 's/$$(ARCH)/$(ARCH)/' -e 's/$$(DEP_SUFFIX)/$(DEP_SUFFIX)/g' -e 's/$$(YEAR)/$(shell date +%Y)/' $(GUI_TARGET).tpl > $(PACKAGE_DIR)/.PackageInfo
 	mkdir -p $(PACKAGE_DIR)/bin
 	cp $(GUI_TARGET) $(PACKAGE_DIR)/bin/$(GUI_TARGET)
 	mkdir -p $(PACKAGE_DIR)/apps $(PACKAGE_DIR)/data/deskbar/menu/Applications
