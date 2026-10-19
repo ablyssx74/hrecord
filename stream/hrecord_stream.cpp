@@ -77,13 +77,23 @@ FileExists(const std::string& path)
 std::string
 FindAddonFile()
 {
+	// The same folder is meant everywhere ("add-ons/hrecord"), but a program built for Haiku's secondary architecture is told by
+	// find_directory() to look in an "x86" subfolder of the add-ons folders, while the packages put the add-on in the plain one. So both.
 	std::vector<std::string> folders;
 	folders.push_back("/boot/system/add-ons/hrecord");
-	BPath path;
-	if (find_directory(B_USER_NONPACKAGED_ADDONS_DIRECTORY, &path) == B_OK)
-		folders.push_back(std::string(path.Path()) + "/hrecord");
-	if (find_directory(B_USER_ADDONS_DIRECTORY, &path) == B_OK)
-		folders.push_back(std::string(path.Path()) + "/hrecord");
+	const directory_which places[] = { B_SYSTEM_ADDONS_DIRECTORY, B_SYSTEM_NONPACKAGED_ADDONS_DIRECTORY,
+		B_USER_ADDONS_DIRECTORY, B_USER_NONPACKAGED_ADDONS_DIRECTORY };
+	for (size_t i = 0; i < sizeof(places) / sizeof(places[0]); i++) {
+		BPath path;
+		if (find_directory(places[i], &path) != B_OK)
+			continue;
+		std::string base = path.Path();
+		folders.push_back(base + "/hrecord");
+		if (base.size() > 4 && base.compare(base.size() - 4, 4, "/x86") == 0) {
+			base.resize(base.size() - 4);
+			folders.push_back(base + "/hrecord");
+		}
+	}
 	for (size_t i = 0; i < folders.size(); i++) {
 		std::string file = folders[i] + "/hrecord_x264";
 		if (FileExists(file))
