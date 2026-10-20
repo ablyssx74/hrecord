@@ -1,4 +1,4 @@
-# Haiku Recorder - Screen, Desktop Audio & Real-Time Mixing
+# Haiku Recorder / Streamer - Screen, Desktop Audio & Real-Time Mixing
 
 Record your desktop to mkv format with or without audio.
 Or just record one audio source or multiple audio sources to ogg file.
