@@ -5,3 +5,4 @@ build/
 hrecord
 hrecord_mixer
 stream/hrecord_x264
+*.version.rdef

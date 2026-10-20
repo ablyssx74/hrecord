@@ -1,7 +1,12 @@
 # hrecord Build Script (Native Haiku OS Conversion)
 SHELL := /bin/bash
 GUI_TARGET = hrecord
-VERSION = 1.14.3
+# The one place a release changes is the VERSION file (e.g. v1.14.3): the program, its update check, the packages and the
+# resources all take it from there.
+VERSION := $(shell tr -d 'v \r\n' < VERSION)
+V_MAJOR := $(word 1,$(subst ., ,$(VERSION)))
+V_MINOR := $(word 2,$(subst ., ,$(VERSION)))
+V_MIDDLE := $(word 3,$(subst ., ,$(VERSION)))
 PACKAGE_DIR := build/package
 DUMMY_PC_PATH := $(shell pwd)/build/pkgconfig
 
@@ -37,7 +42,7 @@ endif
 
 export PKG_CONFIG_PATH := $(DUMMY_PC_PATH):/boot/home/config/non-packaged/lib/pkgconfig:/boot/home/config/non-packaged/lib$(LIB_ARCH_DIR)/pkgconfig:/boot/system/develop/lib$(LIB_ARCH_DIR)/pkgconfig:
 
-CXXFLAGS = -std=c++17 -O3 -Wall -rdynamic
+CXXFLAGS = -std=c++17 -O3 -Wall -rdynamic -DHRECORD_VERSION=\"v$(VERSION)\"
 # private/interface and private/app hold <WindowInfo.h> (get_window_info(),
 # BPrivate::get_window_order()) -- used by --experimental-screen-capture's
 # window tracking, the same private Window Kit API hDesktop uses.
@@ -60,9 +65,10 @@ LIBS = $(LIB_PATH) $(EXTRA_LIBS) $(HAIKU_LIBS)
 .PHONY: all clean gui
 
 # The mixer window: runs hrecord as its engine
-gui: hrecord_gui.cpp hrecord_mixer.rdef
+gui: hrecord_gui.cpp hrecord_mixer.rdef VERSION
 	$(CXX) -std=c++17 -O2 -Wall $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lroot -lnetwork
-	rc -o hrecord_mixer.rsrc hrecord_mixer.rdef
+	sed -e 's/@V_MAJOR@/$(V_MAJOR)/' -e 's/@V_MINOR@/$(V_MINOR)/' -e 's/@V_MIDDLE@/$(V_MIDDLE)/' -e 's/@VERSION@/$(VERSION)/' hrecord_mixer.rdef > hrecord_mixer.version.rdef
+	rc -o hrecord_mixer.rsrc hrecord_mixer.version.rdef
 	xres -o hrecord_mixer hrecord_mixer.rsrc
 	mimeset -f hrecord_mixer
 
@@ -77,8 +83,12 @@ endif
 	mimeset -f $(GUI_TARGET)
 
 # FIXED: Explicitly mapped resource target to guarantee rc runs cleanly
-$(GUI_RSRCS): hrecord.rdef
-	rc -o $@ $<
+$(GUI_RSRCS): hrecord.rdef VERSION
+	sed -e 's/@V_MAJOR@/$(V_MAJOR)/' -e 's/@V_MINOR@/$(V_MINOR)/' -e 's/@V_MIDDLE@/$(V_MIDDLE)/' -e 's/@VERSION@/$(VERSION)/' $< > hrecord.version.rdef
+	rc -o $@ hrecord.version.rdef
+
+# The version is compiled in: a new VERSION means a new build of the file that has it
+hrecord.o: VERSION
 
 # General object file compilation hooks
 %.o: %.cpp
@@ -86,7 +96,7 @@ $(GUI_RSRCS): hrecord.rdef
 
 # Deep system cleaning target
 clean:
-	rm -f *.o stream/*.o *.rsrc *.hpkg $(GUI_TARGET) hrecord_mixer stream/hrecord_x264 
+	rm -f *.o stream/*.o *.rsrc *.version.rdef *.hpkg $(GUI_TARGET) hrecord_mixer stream/hrecord_x264 
 	rm -rf build
 
 
