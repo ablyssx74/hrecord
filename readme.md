@@ -165,6 +165,13 @@ release, and a gain-reduction bar. A right-click on a fader or balance slider re
 The window shows whether real-time audio is set on the sound driver (`hrecord --detect-realtime`);
 the box can be changed only for a driver hrecord has no profile for.
 
+The window starts `hrecord --allaudio --standby --control`: the sources are connected as soon as
+it opens (before Record) and put back when it closes. Its **Nodes** tab shows the audio nodes and
+their connections: select a box to disconnect or reconnect it, take a program off the mix, or send
+it into the mix as Stereo, Left or Right (hardware inputs have L and R boxes). Ticking **Share this
+input with programs** makes hrecord the system's audio input (the input hub), so several programs
+(for example Guitarix and rakarrack) can use one line-in, each getting Stereo, Left or Right.
+
 ## Apps that were recorded no longer linger in Media preferences
 
 An app's sound player disconnects from the Mixer input it first connected to when it quits.

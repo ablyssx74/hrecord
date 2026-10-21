@@ -15,6 +15,8 @@
 #include <MediaDefs.h>
 #include <MediaNode.h>
 #include <BufferConsumer.h>
+#include <BufferProducer.h>
+#include <BufferGroup.h>
 #include <MediaEventLooper.h>
 #include <TimeSource.h>
 #include <Buffer.h>
@@ -29,6 +31,9 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <map>
 #include <set>
 #include <tuple>
 #include <atomic> // g_directCaptureVerified and friends -- see their own comment
@@ -57,7 +62,10 @@ extern "C" {
 
 #include "stream/hrecord_stream.h" // --stream: live streaming over RTMP / RTSP
 
+// g_running: the current recording goes on. In --standby mode it is false between recordings (and the audio session carries on),
+// g_quit asks the whole program to end (Ctrl+C, "hrecord stop", "quit" on the control channel).
 bool g_running = true;
+std::atomic<bool> g_quit(false);
 
 // ============================================================================
 // Real-time audio: auto-detected from the user's own driver settings
@@ -1307,6 +1315,7 @@ std::mutex g_muxMutex;
 
 void signalHandler(int signum) {
     g_running = false;
+    g_quit = true;
 }
 
 // Whether a live stream (--stream) is wanted; the frames the file's encoder gets are also handed to it.
@@ -1784,11 +1793,37 @@ media_raw_audio_format MixBusFormat() {
 // runs on the tap's own real-time control thread, one call per incoming
 // buffer, and buffer sizes aren't bounded tightly enough to size a stack
 // array with confidence.
+// Where a tap's resampled audio goes: a ring of the mix, and which part of the stereo signal it takes. One tap can feed several
+// rings: its whole stereo signal, and/or its left channel and its right channel alone, each as a mono source of its own.
+struct MixOutput {
+    AudioRingBuffer* ring = nullptr;
+    int mode = 0;       // 0: the stereo signal, 1: the left channel alone, 2: the right channel alone (as mono, on both sides)
+};
+
+// Writes `frames` interleaved stereo float frames to a ring, as its mode says.
+static void WriteMixOutput(const MixOutput& out, const float* stereo, int frames) {
+    if (out.ring == nullptr || frames <= 0)
+        return;
+    if (out.mode == 0) {
+        out.ring->Write(stereo, (size_t)frames * kMixBusChannels * sizeof(float));
+        return;
+    }
+    static thread_local std::vector<float> mono;
+    mono.resize((size_t)frames * kMixBusChannels);
+    const int channel = out.mode == 2 ? 1 : 0;
+    for (int i = 0; i < frames; i++) {
+        const float v = stereo[i * kMixBusChannels + (kMixBusChannels > 1 ? channel : 0)];
+        for (int c = 0; c < kMixBusChannels; c++)
+            mono[(size_t)i * kMixBusChannels + c] = v;
+    }
+    out.ring->Write(mono.data(), (size_t)frames * kMixBusChannels * sizeof(float));
+}
+
 void MixAndBuffer(SwrContext* swr, const void* data, size_t size,
-        const media_raw_audio_format& format, AudioRingBuffer* ring) {
+        const media_raw_audio_format& format, std::mutex& outputsMutex, const std::vector<MixOutput>& outputs) {
     int sampleSize = format.format & media_raw_audio_format::B_AUDIO_SIZE_MASK;
     int bytesPerFrame = sampleSize * (int)format.channel_count;
-    if (bytesPerFrame <= 0 || !swr || !ring)
+    if (bytesPerFrame <= 0 || !swr)
         return;
     int nbSamples = (int)(size / bytesPerFrame);
     if (nbSamples <= 0)
@@ -1817,8 +1852,11 @@ void MixAndBuffer(SwrContext* swr, const void* data, size_t size,
 
     const uint8_t* inData[1] = { (const uint8_t*)data };
     int produced = swr_convert(swr, converted, maxOutSamples, inData, nbSamples);
-    if (produced > 0)
-        ring->Write(converted[0], (size_t)produced * kMixBusChannels * sizeof(float));
+    if (produced > 0) {
+        std::lock_guard<std::mutex> lock(outputsMutex);
+        for (size_t i = 0; i < outputs.size(); i++)
+            WriteMixOutput(outputs[i], (const float*)converted[0], produced);
+    }
     av_freep(&converted[0]);
 
     // Belt-and-suspenders: drain anything swr still had buffered from a
@@ -1835,8 +1873,11 @@ void MixAndBuffer(SwrContext* swr, const void* data, size_t size,
                 AV_SAMPLE_FMT_FLT, 0) < 0)
             break;
         int flushedCount = swr_convert(swr, flushed, pending, nullptr, 0);
-        if (flushedCount > 0)
-            ring->Write(flushed[0], (size_t)flushedCount * kMixBusChannels * sizeof(float));
+        if (flushedCount > 0) {
+            std::lock_guard<std::mutex> lock(outputsMutex);
+            for (size_t i = 0; i < outputs.size(); i++)
+                WriteMixOutput(outputs[i], (const float*)flushed[0], flushedCount);
+        }
         av_freep(&flushed[0]);
 
         if (flushedCount <= 0)
@@ -1882,7 +1923,33 @@ public:
     // never both.
     void SetMixOutput(SwrContext* resampler, AudioRingBuffer* ring) {
         fMixResampler = resampler;
-        fMixRing = ring;
+        if (ring != nullptr)
+            AddMixOutput(ring, 0);
+    }
+    void SetMixResampler(SwrContext* resampler) { fMixResampler = resampler; }
+
+    // What the tap passes on, as it comes, to something else (the input hub: see InputHubNode).
+    typedef void (*ForwardFn)(void* cookie, const void* data, size_t size, bigtime_t startTime);
+    void SetForward(ForwardFn function, void* cookie) {
+        fForwardCookie = cookie;
+        fForwardFn = function;
+    }
+    void AddMixOutput(AudioRingBuffer* ring, int mode) {
+        std::lock_guard<std::mutex> lock(fOutputsMutex);
+        MixOutput out;
+        out.ring = ring;
+        out.mode = mode;
+        fOutputs.push_back(out);
+    }
+    // After this returns, the tap no longer writes into `ring`.
+    void RemoveMixOutput(AudioRingBuffer* ring) {
+        std::lock_guard<std::mutex> lock(fOutputsMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            if (fOutputs[i].ring == ring) {
+                fOutputs.erase(fOutputs.begin() + i);
+                break;
+            }
+        }
     }
 
     // --- BMediaNode ---
@@ -1940,10 +2007,13 @@ public:
         size_t size = buffer->SizeUsed();
         bool feedsLivePlayback = false;
 
-        if (fMixResampler != nullptr && fMixRing != nullptr) {
+        if (fMixResampler != nullptr) {
             // --allaudio path: this source only ever feeds the shared mix,
             // never the encoder or a playback ring directly.
-            MixAndBuffer(fMixResampler, data, size, fInput.format.u.raw_audio, fMixRing);
+            MixAndBuffer(fMixResampler, data, size, fInput.format.u.raw_audio, fOutputsMutex, fOutputs);
+            ForwardFn forward = fForwardFn.load();
+            if (forward != nullptr)
+                forward(fForwardCookie.load(), data, size, buffer->Header()->start_time);
             feedsLivePlayback = true;
         } else {
             if (fEncoder != nullptr && g_running)
@@ -2088,12 +2158,342 @@ private:
     AudioEncoder* fEncoder = nullptr;
     AudioRingBuffer* fRing = nullptr;
     SwrContext* fMixResampler = nullptr;
-    AudioRingBuffer* fMixRing = nullptr;
+    std::atomic<ForwardFn> fForwardFn{nullptr};
+    std::atomic<void*> fForwardCookie{nullptr};
+    std::mutex fOutputsMutex;            // guards fOutputs: the rings this tap writes into (--allaudio)
+    std::vector<MixOutput> fOutputs;
 
     // --allaudio pacing state (see BufferReceived) -- unused, and so
     // harmless, in single-tap mode.
     bigtime_t fPacingStartTime = 0;
     bigtime_t fPacedDurationUs = 0;
+};
+
+// ============================================================================
+// The input hub
+//
+// The sound hardware offers its input as one stereo stream that only one program at a time can connect to (Guitarix and
+// rakarrack each want it, and the second one finds "no free pins"). hrecord can take that one connection and hand the input out
+// itself: this node is a producer that has an output for every program that connects to it, each with its own choice of what to
+// pass on: the stereo signal, or the left or right channel alone (as stereo, so that a program that reads both sides hears it).
+// The tap on the hardware (AudioTapNode) feeds it with every buffer it receives.
+// ============================================================================
+
+// Copies a buffer of interleaved samples (any sample size), keeping both channels (mode 0) or the left (1) or the right (2) channel
+// on both sides.
+static void MapChannels(const uint8_t* source, uint8_t* destination, size_t bytes, int sampleSize, int channels, int mode) {
+    if (mode == 0 || channels != 2 || sampleSize <= 0) {
+        memcpy(destination, source, bytes);
+        return;
+    }
+    const size_t frameBytes = (size_t)sampleSize * 2;
+    const size_t frames = bytes / frameBytes;
+    for (size_t i = 0; i < frames; i++) {
+        const uint8_t* from = source + i * frameBytes + (mode == 2 ? (size_t)sampleSize : 0);
+        memcpy(destination + i * frameBytes, from, (size_t)sampleSize);
+        memcpy(destination + i * frameBytes + sampleSize, from, (size_t)sampleSize);
+    }
+    const size_t rest = bytes - frames * frameBytes;
+    if (rest > 0)
+        memcpy(destination + frames * frameBytes, source + frames * frameBytes, rest);
+}
+
+class InputHubNode : public BBufferProducer, public BMediaEventLooper {
+public:
+    struct Connection {
+        media_source source;
+        media_destination destination;
+        int mode = 0;
+        media_node_id consumer = -1;    // the program's node, once the engine has looked it up
+    };
+
+    explicit InputHubNode(const media_raw_audio_format& format)
+        : BMediaNode("hrecord Input"),
+          BBufferProducer(B_MEDIA_RAW_AUDIO),
+          BMediaEventLooper(),
+          fFormat(format)
+    {
+        AddNodeKind(B_PHYSICAL_INPUT);
+        SetRunMode(BMediaNode::B_RECORDING);
+        std::lock_guard<std::mutex> lock(fMutex);
+        AddFreeOutputLocked();
+    }
+
+    virtual ~InputHubNode() {
+        BMediaEventLooper::Quit();
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            delete fOutputs[i]->group;
+            delete fOutputs[i];
+        }
+        fOutputs.clear();
+    }
+
+    // One buffer from the hardware, for every program that is connected.
+    void Feed(const void* data, size_t size, bigtime_t startTime) {
+        if (size == 0)
+            return;
+        const int sampleSize = (int)(fFormat.format & media_raw_audio_format::B_AUDIO_SIZE_MASK);
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            Output* o = fOutputs[i];
+            if (o->out.destination == media_destination::null || !o->enabled || o->group == nullptr)
+                continue;
+            if (size > o->groupBufferSize) {
+                o->dropped++;
+                continue;
+            }
+            BBuffer* buffer = o->group->RequestBuffer(size, 0); // never waits: this runs on the hardware's own thread
+            if (buffer == nullptr) {
+                o->dropped++;
+                continue;
+            }
+            MapChannels((const uint8_t*)data, (uint8_t*)buffer->Data(), size, sampleSize, (int)fFormat.channel_count, o->mode);
+            media_header* header = buffer->Header();
+            header->type = B_MEDIA_RAW_AUDIO;
+            header->size_used = size;
+            header->start_time = startTime;
+            header->time_source = fTimeSourceId;
+            if (SendBuffer(buffer, o->out.source, o->out.destination) != B_OK) {
+                buffer->Recycle();
+                o->dropped++;
+            } else
+                o->sent++;
+        }
+    }
+
+    // The programs that are connected now.
+    std::vector<Connection> Snapshot() {
+        std::vector<Connection> list;
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            if (fOutputs[i]->out.destination == media_destination::null)
+                continue;
+            Connection c;
+            c.source = fOutputs[i]->out.source;
+            c.destination = fOutputs[i]->out.destination;
+            c.mode = fOutputs[i]->mode;
+            c.consumer = fOutputs[i]->consumer;
+            list.push_back(c);
+        }
+        return list;
+    }
+
+    void SetModeOfDestination(const media_destination& destination, int mode, media_node_id consumer) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            if (fOutputs[i]->out.destination == destination) {
+                fOutputs[i]->mode = mode;
+                fOutputs[i]->consumer = consumer;
+            }
+        }
+    }
+
+    // A program that is gone without having disconnected: its output is freed.
+    void DropDestination(const media_destination& destination) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            if (fOutputs[i]->out.destination == destination) {
+                delete fOutputs[i]->group;
+                delete fOutputs[i];
+                fOutputs.erase(fOutputs.begin() + i);
+                break;
+            }
+        }
+        EnsureFreeOutputLocked();
+    }
+
+    // --- BMediaNode ---
+    virtual BMediaAddOn* AddOn(int32* internalID) const { return nullptr; }
+
+    virtual void NodeRegistered() {
+        SetRunMode(BMediaNode::B_RECORDING);
+        BTimeSource* timeSource = TimeSource();
+        fTimeSourceId = timeSource != nullptr ? timeSource->ID() : 0;
+        Run();
+        set_thread_priority(ControlThread(), B_REAL_TIME_PRIORITY);
+    }
+
+    virtual status_t HandleMessage(int32 code, const void* data, size_t size) {
+        if (BBufferProducer::HandleMessage(code, data, size) == B_OK) return B_OK;
+        if (BMediaEventLooper::HandleMessage(code, data, size) == B_OK) return B_OK;
+        return BMediaNode::HandleMessage(code, data, size);
+    }
+
+    virtual void HandleEvent(const media_timed_event* event, bigtime_t lateness, bool realTimeEvent = false) {
+        // nothing is scheduled: buffers go out as the hardware's come in
+    }
+
+protected:
+    // --- BBufferProducer ---
+    virtual status_t FormatSuggestionRequested(media_type type, int32 quality, media_format* format) {
+        if (type != B_MEDIA_RAW_AUDIO && type != B_MEDIA_UNKNOWN_TYPE)
+            return B_MEDIA_BAD_FORMAT;
+        format->type = B_MEDIA_RAW_AUDIO;
+        static_cast<media_raw_audio_format&>(format->u.raw_audio) = fFormat;
+        return B_OK;
+    }
+
+    virtual status_t FormatProposal(const media_source& output, media_format* format) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        if (FindLocked(output) == nullptr)
+            return B_MEDIA_BAD_SOURCE;
+        return Negotiate(format) ? B_OK : B_MEDIA_BAD_FORMAT;
+    }
+
+    virtual status_t FormatChangeRequested(const media_source& source, const media_destination& destination,
+            media_format* format, int32* _deprecated_) {
+        return B_ERROR;
+    }
+
+    virtual status_t GetNextOutput(int32* cookie, media_output* output) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        if (*cookie < 0 || *cookie >= (int32)fOutputs.size())
+            return B_BAD_INDEX;
+        *output = fOutputs[*cookie]->out;
+        output->node = Node();
+        (*cookie)++;
+        return B_OK;
+    }
+
+    virtual status_t DisposeOutputCookie(int32 cookie) { return B_OK; }
+
+    virtual status_t SetBufferGroup(const media_source& forSource, BBufferGroup* group) {
+        return B_ERROR; // each output has a group of its own
+    }
+
+    virtual status_t GetLatency(bigtime_t* latency) {
+        *latency = fLatency;
+        return B_OK;
+    }
+
+    virtual status_t PrepareToConnect(const media_source& what, const media_destination& where, media_format* format,
+            media_source* source, char* name) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        Output* o = FindLocked(what);
+        if (o == nullptr)
+            return B_MEDIA_BAD_SOURCE;
+        if (o->out.destination != media_destination::null)
+            return B_MEDIA_ALREADY_CONNECTED;
+        if (!Negotiate(format))
+            return B_MEDIA_BAD_FORMAT;
+        *source = what;
+        strlcpy(name, o->out.name, B_MEDIA_NAME_LENGTH);
+        return B_OK;
+    }
+
+    virtual void Connect(status_t error, const media_source& source, const media_destination& destination,
+            const media_format& format, char* name) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        Output* o = FindLocked(source);
+        if (o == nullptr || error != B_OK)
+            return;
+        o->out.destination = destination;
+        o->out.format = format;
+        strlcpy(name, o->out.name, B_MEDIA_NAME_LENGTH);
+        delete o->group;
+        o->groupBufferSize = std::max<size_t>(fFormat.buffer_size, 32768);
+        o->group = new BBufferGroup(o->groupBufferSize, 8);
+        if (o->group->InitCheck() != B_OK) {
+            delete o->group;
+            o->group = nullptr;
+        }
+        o->mode = 0;
+        EnsureFreeOutputLocked();
+    }
+
+    virtual void Disconnect(const media_source& what, const media_destination& where) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            if (fOutputs[i]->out.source == what && fOutputs[i]->out.destination == where) {
+                delete fOutputs[i]->group;
+                delete fOutputs[i];
+                fOutputs.erase(fOutputs.begin() + i);
+                break;
+            }
+        }
+        EnsureFreeOutputLocked();
+    }
+
+    virtual void LateNoticeReceived(const media_source& what, bigtime_t howMuch, bigtime_t performanceTime) {}
+
+    virtual void EnableOutput(const media_source& what, bool enabled, int32* _deprecated_) {
+        std::lock_guard<std::mutex> lock(fMutex);
+        Output* o = FindLocked(what);
+        if (o != nullptr)
+            o->enabled = enabled;
+    }
+
+    virtual void AdditionalBufferRequested(const media_source& source, media_buffer_id previousBuffer,
+            bigtime_t previousTime, const media_seek_tag* previousTag) {}
+
+    virtual void LatencyChanged(const media_source& source, const media_destination& destination,
+            bigtime_t newLatency, uint32 flags) {}
+
+private:
+    struct Output {
+        media_output out;
+        BBufferGroup* group = nullptr;
+        size_t groupBufferSize = 0;
+        int mode = 0;               // 0: both channels, 1: the left alone, 2: the right alone
+        media_node_id consumer = -1;
+        bool enabled = true;
+        uint64_t sent = 0, dropped = 0;
+    };
+
+    Output* FindLocked(const media_source& source) {
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            if (fOutputs[i]->out.source.id == source.id && fOutputs[i]->out.source.port == source.port)
+                return fOutputs[i];
+        }
+        return nullptr;
+    }
+
+    // There is always one output that nobody is connected to, for the next program.
+    void EnsureFreeOutputLocked() {
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            if (fOutputs[i]->out.destination == media_destination::null)
+                return;
+        }
+        AddFreeOutputLocked();
+    }
+
+    void AddFreeOutputLocked() {
+        Output* o = new Output();
+        o->out.node = Node();
+        o->out.source = media_source(ControlPort(), fNextSourceId);
+        o->out.destination = media_destination::null;
+        o->out.format.type = B_MEDIA_RAW_AUDIO;
+        static_cast<media_raw_audio_format&>(o->out.format.u.raw_audio) = fFormat;
+        snprintf(o->out.name, sizeof(o->out.name), "input %d", (int)fNextSourceId);
+        fNextSourceId++;
+        fOutputs.push_back(o);
+    }
+
+    // Fills in what the program left open; false when it asked for something else than the hardware's format.
+    bool Negotiate(media_format* format) {
+        const media_raw_audio_format wildcard = media_raw_audio_format::wildcard;
+        bool good = true;
+        if (format->type != B_MEDIA_RAW_AUDIO && format->type != B_MEDIA_UNKNOWN_TYPE)
+            good = false;
+        else {
+            const media_raw_audio_format& r = format->u.raw_audio;
+            if (r.frame_rate != wildcard.frame_rate && r.frame_rate != fFormat.frame_rate) good = false;
+            if (r.format != wildcard.format && r.format != fFormat.format) good = false;
+            if (r.channel_count != wildcard.channel_count && r.channel_count != fFormat.channel_count) good = false;
+            if (r.byte_order != wildcard.byte_order && r.byte_order != fFormat.byte_order) good = false;
+        }
+        format->type = B_MEDIA_RAW_AUDIO;
+        static_cast<media_raw_audio_format&>(format->u.raw_audio) = fFormat;
+        return good;
+    }
+
+    media_raw_audio_format fFormat;
+    std::mutex fMutex;
+    std::vector<Output*> fOutputs;
+    int32 fNextSourceId = 0;
+    bigtime_t fLatency = 3000;
+    media_node_id fTimeSourceId = 0;
 };
 
 // Everything SetupDesktopAudioTap() needs to remember so
@@ -2111,14 +2511,23 @@ struct AudioTapHandles {
 // AudioTapHandles' node/appNode/originalAppOutput trio, plus the per-source
 // resampler and ring buffer that feed it into the shared mix (see
 // MixAndBuffer/MixedPlaybackCallback above and below).
+struct TapSlot {
+    int slot = -1;                    // its place in AllAudioHandles::mixSources (its number - 1)
+    AudioRingBuffer* ring = nullptr;
+    int mode = 0;                     // 0: the stereo signal, 1: the left channel alone, 2: the right channel alone
+};
+
 struct AllAudioTapEntry {
     AudioTapNode* node = nullptr;
     SwrContext* resampler = nullptr;
-    AudioRingBuffer* ring = nullptr;
-    media_node appNode;
-    media_output originalAppOutput;
+    media_node appNode;               // the app's node (or, for an input device, the device's)
+    media_output originalAppOutput;   // an app: its output as it was before hrecord touched it; a device: the output that feeds the tap
+    media_input tapInput;             // a device: the tap's input
     std::string appName = "(unknown)"; // for diagnostics only, e.g. overflow/underrun reports
-    int slot = -1;                     // this source's place in AllAudioHandles::mixSources (its number - 1)
+    bool hardware = false;            // an input device (the microphone, the line in) instead of an app
+    int outputIndex = 0;              // a device: which of its outputs
+    media_raw_audio_format deviceFormat; // a device: what it delivers
+    std::vector<TapSlot> slots;       // what the mix takes from this source (see TapSlot)
 };
 
 // Everything SetupAllAudioTaps() needs to remember so TeardownAllAudioTaps()
@@ -2786,12 +3195,53 @@ void PrintMeterSummary() {
         << " dBFS, most gain reduction " << LinearToDb(g_mixMeter.minGainAll.load()) << " dB" << std::endl;
 }
 
+// --standby (with --allaudio): hrecord connects to every audio source, mixes and meters them, and plays the mix, without recording
+// anything. A recording starts on the control channel's "record" and ends on "stoprecord"; the sources stay connected between
+// recordings, and are put back on the Mixer only when hrecord ends. These are what a recording needs to know:
+struct RecordingSetup {
+    bool audioOnly = false;
+    bool allAudio = true;
+    const VideoProfile* profile = nullptr;
+    bool logFps = false;
+    bool wantStream = false;
+    StreamSettings stream;
+};
+
+bool g_standby = false;          // --standby
+bool g_standbySession = false;   // the audio session outlives a recording (true while RunStandby is in charge)
+std::mutex g_recordRequestMutex;
+RecordingSetup g_baseSetup;      // what the command line said; a "record" command changes only the parts it names
+RecordingSetup g_pendingSetup;
+bool g_recordRequested = false;
+StreamSettings g_pendingStream;
+bool g_pendingStreamOn = false;
+
+// What the control channel's source commands do (defined with the sources of the mix, below).
+void EngineRoute(int nodeId, bool stereo, bool left, bool right);
+void EngineHardwareInput(int nodeId, int outputIndex, bool stereo, bool left, bool right);
+void EngineAttach(int nodeId);
+void EngineHub(bool on);
+void EngineHubMode(int consumerNode, int mode);
+
 // --control: a program that runs hrecord (the GUI) writes commands to its stdin, one per line, while it records:
 //   gain <n> <dB>     the n-th source's gain          mute <n> <0|1>     mute a source
 //   solo <n> <0|1>    solo a source                   mixgain <dB>       the whole mix
 //   ceiling <dB>      the limiter's ceiling           release <ms>       the limiter's release
 //   pan <n> <-1..1>   a source's balance, left to right
-//   limiter <0|1>     the limiter on or off           quit               stop recording
+//   limiter <0|1>     the limiter on or off           quit               stop recording (and, in --standby, end hrecord)
+//   route <node> <stereo 0|1> <left 0|1> <right 0|1>   what the mix takes from a source (the program or input device with that Media
+//                     Kit node id): its stereo signal, and/or its left and right channel as two mono sources; all 0 takes it off the mix
+//   hwin <node> <output> <stereo> <left> <right>   the same for an input device's output (the microphone, the line in): it is
+//                     connected when it is first asked for and disconnected when nothing is asked for any more
+//   hub <0|1>         share the audio input: programs connect to hrecord's input hub instead of the hardware (one program at a
+//                     time can use the hardware's input; the hub gives every program its own), each with a channel of its own
+//   hubmap <node> <0|1|2>   what the program with that node id gets from the hub: both channels, the left or the right alone
+//   detach <node>     the program with that node id is put back on the Mixer and left alone (until "attach")
+//   attach <node>     it may be tapped again
+//   record <screen 0|1> <quality 0|1|2>     --standby only: start a recording (the screen too, and its quality: low, medium, high)
+//   stoprecord        --standby only: end the recording; the sources stay connected
+//   stream <video kbps> <audio kbps> <preset> <key frame seconds> <address>   the next recording is streamed too (--standby)
+//   nostream          the next recording is not streamed
 // When stdin closes (the program that started hrecord has gone) it stops as if it had been interrupted.
 void ControlLoop() {
     char line[256];
@@ -2815,6 +3265,45 @@ void ControlLoop() {
             g_releaseMs = f < 1.0f ? 1.0f : f;
         } else if (sscanf(line, "limiter %d", &v) == 1) {
             g_limiterOn = (v != 0);
+        } else if (sscanf(line, "record %d %d", &n, &v) == 2 && g_standby) {
+            std::lock_guard<std::mutex> lock(g_recordRequestMutex);
+            g_pendingSetup = g_baseSetup;
+            g_pendingSetup.audioOnly = (n == 0);
+            g_pendingSetup.profile = &kVideoProfiles[v < 0 ? 0 : (v > 2 ? 2 : v)];
+            g_pendingSetup.wantStream = g_pendingStreamOn;
+            g_pendingSetup.stream = g_pendingStream;
+            g_recordRequested = true;
+        } else if (strncmp(line, "stoprecord", 10) == 0 && g_standby) {
+            g_running = false;
+        } else if (strncmp(line, "nostream", 8) == 0) {
+            g_pendingStreamOn = false;
+        } else if (strncmp(line, "stream ", 7) == 0) {
+            int vk = 0, ak = 0, ki = 0;
+            char preset[32] = "", url[1024] = "";
+            if (sscanf(line, "stream %d %d %31s %d %1023s", &vk, &ak, preset, &ki, url) == 5) {
+                g_pendingStream.videoKbps = vk;
+                g_pendingStream.audioKbps = ak;
+                g_pendingStream.preset = preset;
+                g_pendingStream.keyintSeconds = ki;
+                g_pendingStream.url = url;
+                g_pendingStreamOn = true;
+            }
+        } else if (sscanf(line, "route %d %d", &n, &v) == 2) {
+            int stereo = 0, left = 0, right = 0;
+            if (sscanf(line, "route %d %d %d %d", &n, &stereo, &left, &right) == 4)
+                EngineRoute(n, stereo != 0, left != 0, right != 0);
+        } else if (strncmp(line, "hwin ", 5) == 0) {
+            int node = 0, output = 0, stereo = 0, left = 0, right = 0;
+            if (sscanf(line, "hwin %d %d %d %d %d", &node, &output, &stereo, &left, &right) == 5)
+                EngineHardwareInput(node, output, stereo != 0, left != 0, right != 0);
+        } else if (sscanf(line, "hubmap %d %d", &n, &v) == 2) {
+            EngineHubMode(n, v < 0 ? 0 : (v > 2 ? 2 : v));
+        } else if (sscanf(line, "hub %d", &v) == 1) {
+            EngineHub(v != 0);
+        } else if (sscanf(line, "detach %d", &n) == 1) {
+            EngineRoute(n, false, false, false);
+        } else if (sscanf(line, "attach %d", &n) == 1) {
+            EngineAttach(n);
         } else if (strncmp(line, "quit", 4) == 0) {
             break;
         }
@@ -3035,52 +3524,39 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles);
 // drive them. Individual sources that fail to tap are skipped with a
 // warning rather than aborting the whole thing; failure is only returned
 // if *no* source could be tapped at all.
-// Taps one more source into the mix: hijacks the app connected at `input`, sets up its resampler and ring, gives it a free slot
-// in the mix and starts it. Used for the sources that are playing when recording starts and, by SourceWatcherLoop, for those
-// that start during it. Returns false (and leaves the app as it was) when the source could not be tapped.
-bool AddTapForInput(BMediaRoster* roster, AllAudioHandles* handles, const media_input& input, bool quietStale) {
-    media_node appNode;
-    media_output originalAppOutput;
-    media_raw_audio_format negotiated;
-    AudioTapNode* tap = HijackAppIntoTap(roster, input, &appNode, &originalAppOutput, &negotiated, quietStale);
-    if (!tap)
-        return false; // that source's own error was already printed; keep tapping the rest
+// ---- the sources of the mix: apps that play into the Mixer, and input devices (the microphone, the line in) ----
 
-    media_raw_audio_format& busFormat = handles->busFormat;
-    if (!handles->busRateChosen) {
-        handles->busRateChosen = true;
-        // Lock the bus rate to whatever the first successfully tapped source already negotiated
-        // (see g_mixBusRate above) before setting up its resampler below, so even this first
-        // source picks up the real rate rather than the fallback.
-        busFormat.frame_rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : kMixBusRate;
-        g_mixBusRate = busFormat.frame_rate;
+// Closures that change the sources (route, detach, attach) are run by the watcher thread, which is the only one that
+// touches the list of taps while the session runs.
+typedef std::function<void(BMediaRoster*, AllAudioHandles*)> EngineTask;
+static std::mutex g_engineTaskMutex;
+static std::deque<EngineTask> g_engineTasks;
+static std::set<int32> g_detachedNodes;                           // apps that were taken off the mix on request: not tapped again
+static std::map<std::tuple<int32, int32, int32>, int> g_watcherAttempts; // mixer inputs that could not be tapped: how often it was tried
+const int kMaxTapAttempts = 8;     // (an app that is only just connecting may need more than one try)
+
+static void QueueEngineTask(EngineTask task) {
+    std::lock_guard<std::mutex> lock(g_engineTaskMutex);
+    g_engineTasks.push_back(task);
+}
+
+static void RunEngineTasks(BMediaRoster* roster, AllAudioHandles* handles) {
+    for (;;) {
+        EngineTask task;
+        {
+            std::lock_guard<std::mutex> lock(g_engineTaskMutex);
+            if (g_engineTasks.empty())
+                return;
+            task = g_engineTasks.front();
+            g_engineTasks.pop_front();
+        }
+        task(roster, handles);
     }
+}
 
-    AVChannelLayout busLayout;
-    av_channel_layout_default(&busLayout, kMixBusChannels);
-    AVChannelLayout inLayout;
-    av_channel_layout_default(&inLayout, negotiated.channel_count > 0 ? negotiated.channel_count : 2);
-
-    SwrContext* resampler = nullptr;
-    int swrErr = swr_alloc_set_opts2(&resampler, &busLayout, AV_SAMPLE_FMT_FLT,
-        (int)busFormat.frame_rate, &inLayout, HaikuAudioFormatToAV(negotiated.format),
-        (int)(negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100), 0, nullptr);
-    if (swrErr >= 0 && resampler)
-        swrErr = swr_init(resampler);
-    av_channel_layout_uninit(&inLayout);
-    av_channel_layout_uninit(&busLayout);
-    if (swrErr < 0 || !resampler) {
-        std::cerr << "[!] Warning: Failed to set up a resampler for one audio source ("
-            << AvErr(swrErr) << "); skipping it." << std::endl;
-        if (resampler) swr_free(&resampler);
-        UndoHijack(roster, tap, appNode, originalAppOutput);
-        return false;
-    }
-
-    AllAudioTapEntry entry;
-    entry.node = tap;
-    entry.resampler = resampler;
-    entry.ring = new AudioRingBuffer();
+// A ring for one source of the mix.
+static AudioRingBuffer* NewSourceRing(const media_raw_audio_format& busFormat) {
+    AudioRingBuffer* ring = new AudioRingBuffer();
     // Deliberately more generous than the single-tap ring's half
     // second (see SetupDesktopAudioTap): a source whose own producer
     // delivers audio in bursts rather than a steady drip -- a network
@@ -3102,7 +3578,152 @@ bool AddTapForInput(BMediaRoster* roster, AllAudioHandles* handles, const media_
     // simultaneous sources.
     double ringSeconds = g_realtimeAudio ? 0.07 : 2.0;
     size_t ringCapacity = (size_t)(kMixBusChannels * sizeof(float) * busFormat.frame_rate * ringSeconds);
-    entry.ring->Init(ringCapacity);
+    ring->Init(ringCapacity);
+    return ring;
+}
+
+// A free slot in the mix for `ring`, with the controls of the strip that will show it back at their defaults; -1 when all are taken.
+static int AllocateMixSlot(AllAudioHandles* handles, AudioRingBuffer* ring, const std::string& name) {
+    std::lock_guard<std::mutex> lock(g_mixMutex);
+    int slot = -1;
+    for (size_t i = 0; i < handles->mixSources.size(); i++) {
+        if (handles->mixSources[i] == nullptr) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0 && handles->mixSources.size() < (size_t)kMeterMaxSources) {
+        slot = (int)handles->mixSources.size();
+        handles->mixSources.push_back(nullptr);
+    }
+    if (slot < 0)
+        return -1;
+    g_sourceGainDb[slot] = 0.0f;
+    g_sourcePan[slot] = 0.0f;
+    g_sourceMute[slot] = false;
+    g_soloMask.fetch_and(~(1u << slot));
+    g_mixMeter.srcPeak[slot] = 0; g_mixMeter.srcPeakR[slot] = 0;
+    g_mixMeter.srcPeakAll[slot] = 0; g_mixMeter.srcNear[slot] = 0;
+    if ((int)g_mixMeter.names.size() <= slot)
+        g_mixMeter.names.resize(slot + 1);
+    g_mixMeter.names[slot] = name;
+    if (g_mixMeter.count < slot + 1)
+        g_mixMeter.count = slot + 1;
+    handles->mixSources[slot] = ring;
+    g_mixMeter.srcActive[slot] = true;
+    return slot;
+}
+
+// Out of the mix: the callback no longer reads the slot's ring once this returns.
+static void FreeMixSlot(AllAudioHandles* handles, int slot) {
+    std::lock_guard<std::mutex> lock(g_mixMutex);
+    handles->mixSources[slot] = nullptr;
+    g_mixMeter.srcActive[slot] = false;
+    g_soloMask.fetch_and(~(1u << slot));
+}
+
+static std::string SlotName(const AllAudioTapEntry& entry, int mode) {
+    return entry.appName + (mode == 1 ? " (L)" : (mode == 2 ? " (R)" : ""));
+}
+
+// Makes the slots of one source what is asked for: the whole stereo signal as one source, and/or its left and its right channel
+// as two mono sources of their own (two guitars on one stereo input). Slots that are not wanted go, those that are wanted and
+// are not there are added; the others stay as they are, with their fader and the rest.
+static void ApplySlots(AllAudioHandles* handles, AllAudioTapEntry& entry, bool stereo, bool left, bool right) {
+    const bool wanted[3] = { stereo, left, right };
+    for (size_t i = 0; i < entry.slots.size();) {
+        TapSlot slot = entry.slots[i];
+        if (wanted[slot.mode]) {
+            i++;
+            continue;
+        }
+        entry.node->RemoveMixOutput(slot.ring);
+        FreeMixSlot(handles, slot.slot);
+        std::cout << "[-] Removed source #" << (slot.slot + 1) << ": \"" << SlotName(entry, slot.mode) << "\"" << std::endl;
+        delete slot.ring;
+        entry.slots.erase(entry.slots.begin() + i);
+    }
+    for (int mode = 0; mode < 3; mode++) {
+        if (!wanted[mode])
+            continue;
+        bool have = false;
+        for (size_t i = 0; i < entry.slots.size(); i++) {
+            if (entry.slots[i].mode == mode)
+                have = true;
+        }
+        if (have)
+            continue;
+        AudioRingBuffer* ring = NewSourceRing(handles->busFormat);
+        const int number = AllocateMixSlot(handles, ring, SlotName(entry, mode));
+        if (number < 0) {
+            std::cerr << "[!] Warning: Too many audio sources (" << kMeterMaxSources << "); not adding \""
+                << SlotName(entry, mode) << "\"." << std::endl;
+            delete ring;
+            continue;
+        }
+        TapSlot slot;
+        slot.slot = number;
+        slot.ring = ring;
+        slot.mode = mode;
+        entry.slots.push_back(slot);
+        entry.node->AddMixOutput(ring, mode);
+        std::cout << "[+] Tapped source #" << (number + 1) << ": \"" << SlotName(entry, mode) << "\"" << std::endl;
+    }
+}
+
+// The resampler that turns what a source negotiated into the mix bus format; the first source that is tapped sets the bus rate.
+static SwrContext* MakeBusResampler(AllAudioHandles* handles, const media_raw_audio_format& negotiated) {
+    media_raw_audio_format& busFormat = handles->busFormat;
+    if (!handles->busRateChosen) {
+        handles->busRateChosen = true;
+        // Lock the bus rate to whatever the first successfully tapped source already negotiated
+        // (see g_mixBusRate above) before setting up its resampler, so even this first
+        // source picks up the real rate rather than the fallback.
+        busFormat.frame_rate = negotiated.frame_rate > 0 ? negotiated.frame_rate : kMixBusRate;
+        g_mixBusRate = busFormat.frame_rate;
+    }
+    AVChannelLayout busLayout;
+    av_channel_layout_default(&busLayout, kMixBusChannels);
+    AVChannelLayout inLayout;
+    av_channel_layout_default(&inLayout, negotiated.channel_count > 0 ? negotiated.channel_count : 2);
+    SwrContext* resampler = nullptr;
+    int swrErr = swr_alloc_set_opts2(&resampler, &busLayout, AV_SAMPLE_FMT_FLT,
+        (int)busFormat.frame_rate, &inLayout, HaikuAudioFormatToAV(negotiated.format),
+        (int)(negotiated.frame_rate > 0 ? negotiated.frame_rate : 44100), 0, nullptr);
+    if (swrErr >= 0 && resampler)
+        swrErr = swr_init(resampler);
+    av_channel_layout_uninit(&inLayout);
+    av_channel_layout_uninit(&busLayout);
+    if (swrErr < 0 || !resampler) {
+        std::cerr << "[!] Warning: Failed to set up a resampler for one audio source (" << AvErr(swrErr) << "); skipping it."
+            << std::endl;
+        if (resampler)
+            swr_free(&resampler);
+        return nullptr;
+    }
+    return resampler;
+}
+
+// Taps one more source into the mix: hijacks the app connected at `input`, sets up its resampler, gives it a slot in the mix
+// and starts it. Used for the sources that are playing when recording starts and, by SourceWatcherLoop, for those that start
+// during it. Returns false (and leaves the app as it was) when the source could not be tapped.
+bool AddTapForInput(BMediaRoster* roster, AllAudioHandles* handles, const media_input& input, bool quietStale) {
+    media_node appNode;
+    media_output originalAppOutput;
+    media_raw_audio_format negotiated;
+    AudioTapNode* tap = HijackAppIntoTap(roster, input, &appNode, &originalAppOutput, &negotiated, quietStale);
+    if (!tap)
+        return false; // that source's own error was already printed; keep tapping the rest
+
+    SwrContext* resampler = MakeBusResampler(handles, negotiated);
+    if (!resampler) {
+        UndoHijack(roster, tap, appNode, originalAppOutput);
+        return false;
+    }
+
+    AllAudioTapEntry entry;
+    entry.node = tap;
+    entry.resampler = resampler;
     entry.appNode = appNode;
     entry.originalAppOutput = originalAppOutput;
     {
@@ -3110,90 +3731,408 @@ bool AddTapForInput(BMediaRoster* roster, AllAudioHandles* handles, const media_
         if (roster->GetLiveNodeInfo(appNode, &info) == B_OK)
             entry.appName = info.name;
     }
-    tap->SetMixOutput(resampler, entry.ring);
-
-    // a free slot in the mix, and the controls of the strip that will show it back at their defaults
-    int slot = -1;
-    {
-        std::lock_guard<std::mutex> lock(g_mixMutex);
-        for (size_t i = 0; i < handles->mixSources.size(); i++) {
-            if (handles->mixSources[i] == nullptr) {
-                slot = (int)i;
-                break;
-            }
-        }
-        if (slot < 0 && handles->mixSources.size() < (size_t)kMeterMaxSources) {
-            slot = (int)handles->mixSources.size();
-            handles->mixSources.push_back(nullptr);
-        }
-        if (slot >= 0) {
-            g_sourceGainDb[slot] = 0.0f;
-            g_sourcePan[slot] = 0.0f;
-            g_sourceMute[slot] = false;
-            g_soloMask.fetch_and(~(1u << slot));
-            g_mixMeter.srcPeak[slot] = 0; g_mixMeter.srcPeakR[slot] = 0;
-            g_mixMeter.srcPeakAll[slot] = 0; g_mixMeter.srcNear[slot] = 0;
-            if ((int)g_mixMeter.names.size() <= slot)
-                g_mixMeter.names.resize(slot + 1);
-            g_mixMeter.names[slot] = entry.appName;
-            if (g_mixMeter.count < slot + 1)
-                g_mixMeter.count = slot + 1;
-            handles->mixSources[slot] = entry.ring;
-            g_mixMeter.srcActive[slot] = true;
-        }
-    }
-    if (slot < 0) {
-        std::cerr << "[!] Warning: Too many audio sources (" << kMeterMaxSources << "); not adding \"" << entry.appName
-            << "\"." << std::endl;
+    tap->SetMixResampler(resampler);
+    ApplySlots(handles, entry, true, false, false);
+    if (entry.slots.empty()) {
+        // no slot left in the mix
         RestoreHijackedApp(roster, tap, appNode, originalAppOutput);
         swr_free(&resampler);
-        delete entry.ring;
         return false;
     }
-    entry.slot = slot;
     handles->taps.push_back(entry);
-    std::cout << "[+] Tapped source #" << (slot + 1) << ": \"" << entry.appName << "\"" << std::endl;
 
     roster->StartNode(tap->Node(), 0);
     roster->StartNode(appNode, 0);
     return true;
 }
 
+// An input device (the microphone, the line in): its output `outputIndex` is connected to a tap of its own, and the mix takes what
+// is asked for from it (see ApplySlots). The device's own connections are not touched.
+bool AddHardwareInput(BMediaRoster* roster, AllAudioHandles* handles, int32 nodeId, int outputIndex,
+        bool stereo, bool left, bool right, bool allowNoSlots = false) {
+    media_node device;
+    if (roster->GetNodeFor(nodeId, &device) != B_OK) {
+        std::cerr << "[-] Error: Input device " << nodeId << " not found." << std::endl;
+        return false;
+    }
+    media_output outputs[16];
+    int32 count = 0;
+    if (roster->GetFreeOutputsFor(device, outputs, 16, &count, B_MEDIA_RAW_AUDIO) != B_OK || outputIndex < 0
+            || outputIndex >= count) {
+        std::cerr << "[-] Error: Input device " << nodeId << " has no free output " << outputIndex << "." << std::endl;
+        roster->ReleaseNode(device);
+        return false;
+    }
+    media_output output = outputs[outputIndex];
 
-// Takes a source that has stopped (its app has quit) out of the mix: its slot is freed and its tap released.
-void RemoveTapEntry(BMediaRoster* roster, AllAudioHandles* handles, size_t tapIndex) {
+    AudioTapNode* tap = new AudioTapNode();
+    tap->fInput.format = output.format;
+    if (roster->RegisterNode(tap) != B_OK) {
+        std::cerr << "[-] Error: Failed to register an audio tap node." << std::endl;
+        delete tap;
+        roster->ReleaseNode(device);
+        return false;
+    }
+    media_format format = output.format;
+    media_output connectedOutput;
+    media_input connectedInput;
+    status_t err = roster->Connect(output.source, tap->fInput.destination, &format, &connectedOutput, &connectedInput);
+    if (err != B_OK) {
+        std::cerr << "[-] Error: Could not connect to the input device (error " << err << ")." << std::endl;
+        roster->ReleaseNode(tap->Node());
+        roster->ReleaseNode(device);
+        return false;
+    }
+    SwrContext* resampler = MakeBusResampler(handles, connectedInput.format.u.raw_audio);
+    if (!resampler) {
+        roster->Disconnect(connectedOutput, connectedInput);
+        roster->ReleaseNode(tap->Node());
+        roster->ReleaseNode(device);
+        return false;
+    }
+
+    AllAudioTapEntry entry;
+    entry.node = tap;
+    entry.resampler = resampler;
+    entry.appNode = device;
+    entry.originalAppOutput = connectedOutput;
+    entry.tapInput = connectedInput;
+    entry.hardware = true;
+    entry.outputIndex = outputIndex;
+    entry.deviceFormat = connectedInput.format.u.raw_audio;
+    {
+        live_node_info info;
+        if (roster->GetLiveNodeInfo(device, &info) == B_OK)
+            entry.appName = info.name;
+    }
+    tap->SetMixResampler(resampler);
+    ApplySlots(handles, entry, stereo, left, right);
+    if (entry.slots.empty() && !allowNoSlots) {
+        roster->Disconnect(connectedOutput, connectedInput);
+        roster->ReleaseNode(tap->Node());
+        roster->ReleaseNode(device);
+        swr_free(&resampler);
+        return false;
+    }
+    handles->taps.push_back(entry);
+    roster->StartNode(tap->Node(), 0);
+    roster->StartNode(device, 0);
+    return true;
+}
+
+static void FinishEntry(AllAudioTapEntry& entry) {
+    for (size_t i = 0; i < entry.slots.size(); i++) {
+        AudioRingBuffer* ring = entry.slots[i].ring;
+        size_t overflow = ring->OverflowBytes();
+        size_t underrun = ring->UnderrunBytes();
+        if (overflow > 0 || underrun > 0) {
+            std::cout << "[i] Audio source \"" << SlotName(entry, entry.slots[i].mode) << "\": " << overflow
+                << " bytes dropped, " << underrun << " bytes silence-filled while it was in the mix." << std::endl;
+        }
+        delete ring;
+    }
+    entry.slots.clear();
+    if (entry.resampler)
+        swr_free(&entry.resampler);
+}
+
+// Takes a source out of the mix: its slots are freed and its tap released. An app is put back on the Mixer unless it has
+// gone (`appGone`); an input device is disconnected from the tap.
+void RemoveTapEntry(BMediaRoster* roster, AllAudioHandles* handles, size_t tapIndex, bool appGone) {
     AllAudioTapEntry entry = handles->taps[tapIndex];
     handles->taps.erase(handles->taps.begin() + tapIndex);
 
-    // out of the mix first (the callback no longer reads its ring), then the tap is let go
-    {
-        std::lock_guard<std::mutex> lock(g_mixMutex);
-        handles->mixSources[entry.slot] = nullptr;
-        g_mixMeter.srcActive[entry.slot] = false;
-        g_soloMask.fetch_and(~(1u << entry.slot));
+    // out of the mix first (the callback no longer reads its rings), then the tap is let go
+    for (size_t i = 0; i < entry.slots.size(); i++) {
+        FreeMixSlot(handles, entry.slots[i].slot);
+        std::cout << "[-] Removed source #" << (entry.slots[i].slot + 1) << ": \"" << SlotName(entry, entry.slots[i].mode)
+            << (appGone ? "\" has stopped" : "\" is no longer connected") << std::endl;
     }
-    std::cout << "[-] Removed source #" << (entry.slot + 1) << ": \"" << entry.appName << "\" has stopped"
-        << std::endl;
 
     const media_node tapNode = entry.node->Node();
-    roster->StopNode(tapNode, 0, true);
-    // (no Disconnect: the app is gone, and asking the Media Kit to disconnect a dead node only fills the log with errors)
-    roster->ReleaseNode(tapNode);
-    // the reference that HijackAppIntoTap took on the app's node: without letting it go the dead node would stay listed
-    roster->ReleaseNode(entry.appNode);
-    snooze(150000); // the tap's thread is gone by then, and with it any write into the ring
+    if (entry.hardware) {
+        roster->StopNode(tapNode, 0, true);
+        status_t disconnectError = roster->Disconnect(entry.appNode.node, entry.originalAppOutput.source, tapNode.node,
+            entry.tapInput.destination);
+        if (disconnectError != B_OK)
+            std::cerr << "[!] Warning: Could not disconnect the input device (error " << disconnectError << ")." << std::endl;
+        roster->ReleaseNode(tapNode);
+        roster->ReleaseNode(entry.appNode);
+        snooze(150000);
+    } else if (appGone) {
+        roster->StopNode(tapNode, 0, true);
+        // (no Disconnect: the app is gone, and asking the Media Kit to disconnect a dead node only fills the log with errors)
+        roster->ReleaseNode(tapNode);
+        // the reference that HijackAppIntoTap took on the app's node: without letting it go the dead node would stay listed
+        roster->ReleaseNode(entry.appNode);
+        snooze(150000); // the tap's thread is gone by then, and with it any write into the rings
+    } else {
+        roster->StopNode(entry.appNode, 0, true);
+        roster->StopNode(tapNode, 0, true);
+        snooze(50000);
+        RestoreHijackedApp(roster, entry.node, entry.appNode, entry.originalAppOutput); // releases both nodes
+    }
+    FinishEntry(entry);
+}
 
-    if (entry.ring) {
-        size_t overflow = entry.ring->OverflowBytes();
-        size_t underrun = entry.ring->UnderrunBytes();
-        if (overflow > 0 || underrun > 0) {
-            std::cout << "[i] Audio source \"" << entry.appName << "\": " << overflow << " bytes dropped, "
-                << underrun << " bytes silence-filled while it was in the mix." << std::endl;
+static int FindEntry(AllAudioHandles* handles, int32 nodeId, int outputIndex, bool hardwareOnly) {
+    for (size_t i = 0; i < handles->taps.size(); i++) {
+        const AllAudioTapEntry& e = handles->taps[i];
+        if (e.appNode.node != nodeId)
+            continue;
+        if (hardwareOnly && !e.hardware)
+            continue;
+        if (e.hardware && e.outputIndex != outputIndex)
+            continue;
+        return (int)i;
+    }
+    return -1;
+}
+
+// ---- the input hub, as the engine runs it ----
+
+struct InputHubState {
+    InputHubNode* node = nullptr;
+    media_node_id device = -1;          // the hardware node whose input it shares
+    int outputIndex = 0;
+    media_node previousDefault;         // the system's default audio input before the hub took its place
+    bool defaultChanged = false;
+    struct Moved {
+        media_destination destination;
+        media_node_id consumer = -1;
+    };
+    std::vector<Moved> moved;           // programs that were connected to the hardware when the hub came on
+};
+static InputHubState g_hub;
+static std::map<media_node_id, int> g_hubModes;   // by program: 0 stereo, 1 left, 2 right
+
+static void HubForward(void* cookie, const void* data, size_t size, bigtime_t startTime) {
+    static_cast<InputHubNode*>(cookie)->Feed(data, size, startTime);
+}
+
+static int FindEntry(AllAudioHandles* handles, int32 nodeId, int outputIndex, bool hardwareOnly);
+
+// If hrecord ended without putting the system's default input back (it was killed), the default is a node that is gone, and no
+// program can get an input. Put the hardware back.
+static void HubRecoverDefault(BMediaRoster* roster) {
+    media_node current;
+    if (roster->GetAudioInput(&current) == B_OK) {
+        live_node_info info;
+        if (roster->GetLiveNodeInfo(current, &info) == B_OK)
+            return;
+    }
+    live_node_info infos[32];
+    int32 count = 32;
+    if (roster->GetLiveNodes(infos, &count, nullptr, nullptr, nullptr, B_BUFFER_PRODUCER | B_PHYSICAL_INPUT) != B_OK)
+        return;
+    for (int32 i = 0; i < count; i++) {
+        if (strncmp(infos[i].name, "hrecord ", 8) == 0)
+            continue;
+        if (roster->SetAudioInput(infos[i].node) == B_OK) {
+            std::cout << "[i] The system's audio input had been left on a node that is gone; it is set back to \""
+                << infos[i].name << "\"." << std::endl;
+            return;
         }
     }
-    if (entry.resampler)
-        swr_free(&entry.resampler);
-    delete entry.ring;
+}
+
+static void HubEnable(BMediaRoster* roster, AllAudioHandles* handles) {
+    if (g_hub.node != nullptr)
+        return;
+    media_node device;
+    if (roster->GetAudioInput(&device) != B_OK) {
+        std::cerr << "[-] Error: There is no audio input to share." << std::endl;
+        return;
+    }
+    // the programs that use the input now are moved to the hub, so the hardware's one output is free for hrecord
+    std::vector<InputHubState::Moved> moved;
+    media_output outputs[16];
+    int32 count = 0;
+    if (roster->GetConnectedOutputsFor(device, outputs, 16, &count) == B_OK) {
+        for (int32 i = 0; i < count; i++) {
+            media_node_id consumer = roster->NodeIDFor(outputs[i].destination.port);
+            if (consumer < 0)
+                continue; // a stale connection of the Media Server's
+            roster->Disconnect(device.node, outputs[i].source, consumer, outputs[i].destination);
+            InputHubState::Moved m;
+            m.destination = outputs[i].destination;
+            m.consumer = consumer;
+            moved.push_back(m);
+        }
+    }
+    if (!moved.empty())
+        snooze(100000);
+
+    if (!AddHardwareInput(roster, handles, device.node, 0, false, false, false, true)) {
+        // put the programs back where they were
+        for (size_t i = 0; i < moved.size() && i < 1; i++) {
+            media_output freeOutput;
+            int32 freeCount = 0;
+            if (roster->GetFreeOutputsFor(device, &freeOutput, 1, &freeCount, B_MEDIA_RAW_AUDIO) == B_OK && freeCount > 0) {
+                media_format format = freeOutput.format;
+                media_output newOutput;
+                media_input newInput;
+                roster->Connect(freeOutput.source, moved[i].destination, &format, &newOutput, &newInput);
+            }
+        }
+        return;
+    }
+    const int index = FindEntry(handles, device.node, 0, true);
+    if (index < 0)
+        return;
+    AllAudioTapEntry& entry = handles->taps[index];
+
+    InputHubNode* hub = new InputHubNode(entry.deviceFormat);
+    if (roster->RegisterNode(hub) != B_OK) {
+        std::cerr << "[-] Error: Could not register the input hub." << std::endl;
+        delete hub;
+        return;
+    }
+    roster->StartNode(hub->Node(), 0);
+    entry.node->SetForward(HubForward, hub);
+    g_hub.node = hub;
+    g_hub.device = device.node;
+    g_hub.outputIndex = 0;
+    g_hub.moved = moved;
+
+    for (size_t i = 0; i < moved.size(); i++) {
+        media_output hubOutput;
+        int32 freeCount = 0;
+        if (roster->GetFreeOutputsFor(hub->Node(), &hubOutput, 1, &freeCount, B_MEDIA_RAW_AUDIO) != B_OK || freeCount < 1)
+            continue;
+        media_format format = hubOutput.format;
+        media_output newOutput;
+        media_input newInput;
+        status_t error = roster->Connect(hubOutput.source, moved[i].destination, &format, &newOutput, &newInput);
+        if (error != B_OK)
+            std::cerr << "[!] Warning: A program could not be moved to the input hub (error " << error << ")." << std::endl;
+    }
+
+    if (roster->GetAudioInput(&g_hub.previousDefault) == B_OK && g_hub.previousDefault.node != hub->Node().node
+            && roster->SetAudioInput(hub->Node()) == B_OK)
+        g_hub.defaultChanged = true;
+    std::cout << "[+] Input hub on: programs that use the audio input connect to hrecord, which shares it ("
+        << moved.size() << " moved)." << std::endl;
+}
+
+static void HubDisable(BMediaRoster* roster, AllAudioHandles* handles) {
+    if (g_hub.node == nullptr)
+        return;
+    if (g_hub.defaultChanged) {
+        roster->SetAudioInput(g_hub.previousDefault);
+        g_hub.defaultChanged = false;
+    }
+    // the programs that were fed by the hub: the first one goes back to the hardware (it has one output only)
+    std::vector<InputHubNode::Connection> connected = g_hub.node->Snapshot();
+    std::vector<media_destination> destinations;
+    for (size_t i = 0; i < connected.size(); i++) {
+        media_node_id consumer = roster->NodeIDFor(connected[i].destination.port);
+        if (consumer >= 0) {
+            roster->Disconnect(g_hub.node->Node().node, connected[i].source, consumer, connected[i].destination);
+            destinations.push_back(connected[i].destination);
+        }
+    }
+    const int index = FindEntry(handles, g_hub.device, g_hub.outputIndex, true);
+    if (index >= 0) {
+        handles->taps[index].node->SetForward(nullptr, nullptr);
+        if (handles->taps[index].slots.empty())
+            RemoveTapEntry(roster, handles, (size_t)index, false);
+    }
+    media_node hardware;
+    if (!destinations.empty() && roster->GetNodeFor(g_hub.device, &hardware) == B_OK) {
+        media_output freeOutput;
+        int32 freeCount = 0;
+        if (roster->GetFreeOutputsFor(hardware, &freeOutput, 1, &freeCount, B_MEDIA_RAW_AUDIO) == B_OK && freeCount > 0) {
+            media_format format = freeOutput.format;
+            media_output newOutput;
+            media_input newInput;
+            roster->Connect(freeOutput.source, destinations[0], &format, &newOutput, &newInput);
+        } else
+            std::cout << "[i] The audio input is still used by hrecord's mix, so the programs that used it have no input now." << std::endl;
+        roster->ReleaseNode(hardware);
+    }
+    roster->ReleaseNode(g_hub.node->Node());
+    g_hub.node = nullptr;
+    g_hub.device = -1;
+    g_hub.moved.clear();
+    std::cout << "[+] Input hub off." << std::endl;
+}
+
+// Programs that are gone free their output (`full`), and each program gets the channel it was set to. Runs often, so a program
+// that has just connected is switched to its channel within a few milliseconds: only the programs not looked up yet cost a call.
+static void HubMaintain(BMediaRoster* roster, bool full) {
+    if (g_hub.node == nullptr)
+        return;
+    std::vector<InputHubNode::Connection> connected = g_hub.node->Snapshot();
+    for (size_t i = 0; i < connected.size(); i++) {
+        if (full) {
+            port_info portInfo;
+            if (get_port_info(connected[i].destination.port, &portInfo) != B_OK) {
+                g_hub.node->DropDestination(connected[i].destination);
+                continue;
+            }
+        }
+        media_node_id consumer = connected[i].consumer;
+        if (consumer < 0)
+            consumer = roster->NodeIDFor(connected[i].destination.port);
+        std::map<media_node_id, int>::iterator found = g_hubModes.find(consumer);
+        const int mode = found != g_hubModes.end() ? found->second : 0;
+        if (consumer != connected[i].consumer || mode != connected[i].mode)
+            g_hub.node->SetModeOfDestination(connected[i].destination, mode, consumer);
+    }
+}
+
+void EngineHub(bool on) {
+    QueueEngineTask([=](BMediaRoster* roster, AllAudioHandles* handles) {
+        if (on)
+            HubEnable(roster, handles);
+        else
+            HubDisable(roster, handles);
+    });
+}
+
+void EngineHubMode(int consumerNode, int mode) {
+    QueueEngineTask([=](BMediaRoster* roster, AllAudioHandles*) {
+        g_hubModes[consumerNode] = mode;
+        HubMaintain(roster, true);
+    });
+}
+
+// What the control channel's "route", "hwin" and "attach" ask for (they run on the watcher thread, see RunEngineTasks).
+void EngineRoute(int nodeId, bool stereo, bool left, bool right) {
+    QueueEngineTask([=](BMediaRoster* roster, AllAudioHandles* handles) {
+        int index = FindEntry(handles, nodeId, 0, false);
+        if (index < 0)
+            return;
+        if (!stereo && !left && !right) {
+            if (!handles->taps[index].hardware)
+                g_detachedNodes.insert(nodeId);
+            RemoveTapEntry(roster, handles, (size_t)index, false);
+        } else
+            ApplySlots(handles, handles->taps[index], stereo, left, right);
+    });
+}
+
+void EngineHardwareInput(int nodeId, int outputIndex, bool stereo, bool left, bool right) {
+    QueueEngineTask([=](BMediaRoster* roster, AllAudioHandles* handles) {
+        int index = FindEntry(handles, nodeId, outputIndex, true);
+        if (index >= 0) {
+            if (!stereo && !left && !right && g_hub.node != nullptr && g_hub.device == nodeId)
+                ApplySlots(handles, handles->taps[index], false, false, false); // the hub still uses the tap
+            else if (!stereo && !left && !right)
+                RemoveTapEntry(roster, handles, (size_t)index, false);
+            else
+                ApplySlots(handles, handles->taps[index], stereo, left, right);
+        } else if (stereo || left || right)
+            AddHardwareInput(roster, handles, nodeId, outputIndex, stereo, left, right);
+    });
+}
+
+void EngineAttach(int nodeId) {
+    QueueEngineTask([=](BMediaRoster*, AllAudioHandles*) {
+        g_detachedNodes.erase(nodeId);
+        g_watcherAttempts.clear();
+    });
 }
 
 // Runs for the whole --allaudio session: sources that start playing after the recording began are tapped and join the mix, and
@@ -3203,20 +4142,24 @@ void SourceWatcherLoop(BMediaRoster* roster, AllAudioHandles* handles) {
     media_node mixerNode;
     if (roster->GetAudioMixer(&mixerNode) != B_OK)
         return;
-    std::set<std::tuple<int32, int32, int32> > givenUp; // mixer inputs that could not be tapped: not tried again
     const team_id ourTeam = getpid();
+    int tick = 0;
 
     while (!handles->watcherStop.load()) {
-        for (int waited = 0; waited < 40 && !handles->watcherStop.load(); waited++)
-            snooze(10000);
-        if (handles->watcherStop.load())
-            break;
+        snooze(10000);
+        RunEngineTasks(roster, handles);
+        HubMaintain(roster, false);
+        if (++tick < 40)
+            continue;
+        tick = 0;
+
+        HubMaintain(roster, true);
 
         // sources whose app has gone: the port of its node is gone with it
         for (size_t i = 0; i < handles->taps.size();) {
             port_info portInfo;
-            if (get_port_info(handles->taps[i].appNode.port, &portInfo) != B_OK)
-                RemoveTapEntry(roster, handles, i);
+            if (!handles->taps[i].hardware && get_port_info(handles->taps[i].appNode.port, &portInfo) != B_OK)
+                RemoveTapEntry(roster, handles, i, true);
             else
                 i++;
         }
@@ -3229,24 +4172,28 @@ void SourceWatcherLoop(BMediaRoster* roster, AllAudioHandles* handles) {
             continue;
         for (int32 i = 0; i < count && !handles->watcherStop.load(); i++) {
             const std::tuple<int32, int32, int32> key(inputs[i].source.port, inputs[i].source.id, inputs[i].destination.id);
-            if (givenUp.count(key))
+            if (g_watcherAttempts[key] >= kMaxTapAttempts)
                 continue;
             port_info portInfo;
             if (get_port_info(inputs[i].source.port, &portInfo) != B_OK) {
-                givenUp.insert(key); // a stale entry of the Mixer's, left by an app that is gone
+                g_watcherAttempts[key] = kMaxTapAttempts; // a stale entry of the Mixer's, left by an app that is gone
                 continue;
             }
             if (portInfo.team == ourTeam)
                 continue;
-            if (!AddTapForInput(roster, handles, inputs[i], true))
-                givenUp.insert(key);
+            if (g_detachedNodes.count(roster->NodeIDFor(inputs[i].source.port)))
+                continue; // taken off the mix on request
+            if (!AddTapForInput(roster, handles, inputs[i], true)) {
+                if (++g_watcherAttempts[key] >= kMaxTapAttempts)
+                    std::cerr << "[!] Warning: giving up on a source that could not be connected to." << std::endl;
+            }
         }
     }
     roster->ReleaseNode(mixerNode);
 }
 
 bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
-        media_raw_audio_format* outFormat) {
+        media_raw_audio_format* outFormat, bool allowEmpty) {
     g_allAudioSetupStartTime = system_time();
     media_node mixerNode;
     if (roster->GetAudioMixer(&mixerNode) != B_OK) {
@@ -3261,9 +4208,12 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         == B_OK && inCount >= 1;
     roster->ReleaseNode(mixerNode); // not needed past this point
     if (!haveInputs) {
-        std::cerr << "[-] Error: Nothing is currently playing into the System Mixer to capture. "
-            "Start playback somewhere and try again." << std::endl;
-        return false;
+        inCount = 0;
+        if (!allowEmpty) {
+            std::cerr << "[-] Error: Nothing is currently playing into the System Mixer to capture. "
+                "Start playback somewhere and try again." << std::endl;
+            return false;
+        }
     }
 
     handles->busFormat = MixBusFormat(); // .frame_rate here is just the fallback
@@ -3276,8 +4226,12 @@ bool SetupAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles,
         AddTapForInput(roster, handles, mixerInputs[i], false);
 
     if (handles->taps.empty()) {
-        std::cerr << "[-] Error: Could not tap any currently-playing app." << std::endl;
-        return false;
+        if (!allowEmpty) {
+            std::cerr << "[-] Error: Could not tap any currently-playing app." << std::endl;
+            return false;
+        }
+        // standby with nothing playing yet: the mix bus keeps its default rate, and sources that start later are resampled to it
+        handles->busRateChosen = true;
     }
     media_raw_audio_format busFormat = handles->busFormat;
 
@@ -3328,9 +4282,12 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
         handles->watcherStop = true;
         handles->watcher.join();
     }
+    // the programs that were fed by the input hub get the hardware back, and the system's default input is put back
+    HubDisable(roster, handles);
 
     for (auto& entry : handles->taps) {
-        roster->StopNode(entry.appNode, 0, true);
+        if (!entry.hardware)
+            roster->StopNode(entry.appNode, 0, true);
         if (entry.node)
             roster->StopNode(entry.node->Node(), 0, true);
     }
@@ -3349,23 +4306,17 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
     PrintMeterSummary();
 
     for (auto& entry : handles->taps) {
-        if (entry.ring) {
-            size_t overflow = entry.ring->OverflowBytes();
-            size_t underrun = entry.ring->UnderrunBytes();
-            if (overflow > 0 || underrun > 0) {
-                std::cout << "[i] Audio source \"" << entry.appName << "\": " << overflow
-                    << " bytes dropped (arrived faster than the mix could take them), "
-                    << underrun << " bytes silence-filled (arrived slower, or with gaps, than "
-                    "the mix needed them) -- a likely cause of any popping or dropouts heard "
-                    "for this source." << std::endl;
-            }
+        if (entry.node) {
+            if (entry.hardware) {
+                roster->Disconnect(entry.appNode.node, entry.originalAppOutput.source, entry.node->Node().node,
+                    entry.tapInput.destination);
+                roster->ReleaseNode(entry.node->Node());
+                roster->ReleaseNode(entry.appNode);
+                snooze(100000);
+            } else
+                RestoreHijackedApp(roster, entry.node, entry.appNode, entry.originalAppOutput);
         }
-
-        if (entry.node)
-            RestoreHijackedApp(roster, entry.node, entry.appNode, entry.originalAppOutput);
-        if (entry.resampler)
-            swr_free(&entry.resampler);
-        delete entry.ring;
+        FinishEntry(entry);
     }
 
     handles->taps.clear();
@@ -3416,472 +4367,18 @@ static int32 BackgroundUpdateChecker(void* data) {
     return 0;
 }
 
-int main(int argc, char* argv[]) {
-    if (argc >= 2 && strcmp(argv[1], "--reap") == 0)
-        return RunInputReaper(argc, argv);
+// One recording: the screen and/or the sound to a file (and, with --stream, to a server). Without --standby this is the whole
+// program; with it, it runs once for each "record" command, on top of the audio session that RunStandby keeps up.
+static AllAudioHandles g_allAudioTap;
+static media_raw_audio_format g_standbyNegotiated;
 
-    // For the mixer window: one line saying whether real-time audio is set on the active driver.
-    //   "realtime on <frames>"   tuned      "realtime off known"   a known driver, not tuned
-    //   "realtime off unknown"   no driver this app has a profile for (--realtime can still force it)
-    // Is the H.264 add-on for streaming installed? "stream on <version>" or "stream off".
-    if (argc >= 2 && strcmp(argv[1], "--detect-stream") == 0) {
-        std::string path, version;
-        if (StreamAddonAvailable(&path, &version))
-            std::cout << "stream on " << (version.empty() ? "?" : version) << std::endl;
-        else
-            std::cout << "stream off" << std::endl;
-        return 0;
-    }
-
-    if (argc >= 2 && strcmp(argv[1], "--detect-realtime") == 0) {
-        int32 frames = 0;
-        if (DetectRealtimeAudioSettings(&frames))
-            std::cout << "realtime on " << frames << std::endl;
-        else
-            std::cout << "realtime off " << (g_knownRealtimeDriver ? "known" : "unknown") << std::endl;
-        return 0;
-    }
-
-    // libcurl's global init is not thread-safe against other concurrently
-    // running threads, so do it explicitly up front (before any background
-    // thread might trigger an implicit lazy global init and race it).
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-
-    // ========================================================================
-    // Argument parsing: "start" (default) / "stop", plus an optional
-    // --audioonly flag that restricts recording to desktop audio only.
-    // ========================================================================
-    bool audioOnly = false;
-    bool allAudio = false;
-    bool realtimeAudio = false;
-    bool experimentalScreenCapture = false;
-    bool screenCaptureRcserverMethod = false;
-    bool hybridCapture = false;
-    bool tiledCapture = false; // now the default; accepted as an inert, explicit confirmation
-    bool directTiledCapture = false;
-    bool directRawCapture = false;
-    bool rawCapture = false;
-    bool stopRequested = false;
-    bool listAudioInputs = false;
-    bool logFps = false;
-    StreamSettings streamSettings; // --stream <url> and --stream-* : see hrecord_stream.h
-    int profileIndex = 1; // default: medium
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "stop") == 0) {
-            stopRequested = true;
-        } else if (strcmp(argv[i], "start") == 0) {
-            // default behavior, nothing to flag
-        } else if (strcmp(argv[i], "--audioonly") == 0 || strcmp(argv[i], "--audoonly") == 0) {
-            audioOnly = true;
-        } else if (strcmp(argv[i], "--allaudio") == 0) {
-            allAudio = true;
-        } else if (strcmp(argv[i], "--realtime") == 0) {
-            realtimeAudio = true;
-        } else if (strcmp(argv[i], "--experimental-screen-capture") == 0) {
-            experimentalScreenCapture = true;
-        } else if (strcmp(argv[i], "--screen-capture-rcserver-method") == 0) {
-            screenCaptureRcserverMethod = true;
-        } else if (strcmp(argv[i], "--hybrid-capture") == 0) {
-            hybridCapture = true;
-        } else if (strcmp(argv[i], "--tiled-capture") == 0) {
-            tiledCapture = true;
-        } else if (strcmp(argv[i], "--direct-tiled-capture") == 0) {
-            directTiledCapture = true;
-        } else if (strcmp(argv[i], "--direct-raw-capture") == 0) {
-            directRawCapture = true;
-        } else if (strcmp(argv[i], "--raw-capture") == 0) {
-            rawCapture = true;
-        } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
-            listAudioInputs = true;
-        } else if (strcmp(argv[i], "--logfps") == 0) {
-            logFps = true;
-        } else if (strcmp(argv[i], "--meter") == 0) {
-            g_meter = true;
-        } else if (strcmp(argv[i], "--meter-ms") == 0 && i + 1 < argc) {
-            g_meterMs = std::max(20, atoi(argv[++i]));
-        } else if (strcmp(argv[i], "--control") == 0) {
-            g_control = true;
-        } else if (strcmp(argv[i], "--stream") == 0 && i + 1 < argc) {
-            streamSettings.url = argv[++i];
-            g_wantStream = true;
-        } else if (strcmp(argv[i], "--stream-env") == 0) {
-            // the address (with the stream key in it) comes from the environment variable HRECORD_STREAM_URL, so that
-            // it is not in the command line, where any program can read it
-            const char* fromEnv = getenv("HRECORD_STREAM_URL");
-            if (fromEnv != nullptr && fromEnv[0] != '\0') {
-                streamSettings.url = fromEnv;
-                g_wantStream = true;
-            } else {
-                std::cerr << "[-] Error: --stream-env: HRECORD_STREAM_URL is not set." << std::endl;
-                return -1;
-            }
-        } else if (strcmp(argv[i], "--stream-bitrate") == 0 && i + 1 < argc) {
-            streamSettings.videoKbps = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--stream-audio-bitrate") == 0 && i + 1 < argc) {
-            streamSettings.audioKbps = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--stream-preset") == 0 && i + 1 < argc) {
-            streamSettings.preset = argv[++i];
-        } else if (strcmp(argv[i], "--stream-keyint") == 0 && i + 1 < argc) {
-            streamSettings.keyintSeconds = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--no-limiter") == 0) {
-            g_limiterOn = false;
-        } else if (strcmp(argv[i], "--ceiling") == 0 && i + 1 < argc) {
-            g_ceilingDb = (float)atof(argv[++i]);
-            if (g_ceilingDb > 0.0f) g_ceilingDb = 0.0f;
-        } else if (strcmp(argv[i], "--mix-gain") == 0 && i + 1 < argc) {
-            g_mixGainDb = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--source-gain") == 0 && i + 1 < argc) {
-            // "<n>=<dB>": the n-th source (as numbered when it is tapped), 1 first
-            int n = 0;
-            float db = 0.0f;
-            if (sscanf(argv[++i], "%d=%f", &n, &db) == 2 && n >= 1 && n <= kMeterMaxSources)
-                g_sourceGainDb[n - 1] = db;
-            else {
-                std::cout << "--source-gain takes <n>=<dB>, for example 2=-6" << std::endl;
-                return 0;
-            }
-        } else if (strcmp(argv[i], "--low") == 0) {
-            profileIndex = 0;
-        } else if (strcmp(argv[i], "--medium") == 0) {
-            profileIndex = 1;
-        } else if (strcmp(argv[i], "--high") == 0) {
-            profileIndex = 2;
-        } else {
-            std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
-                "[--allaudio] [--realtime] [--experimental-screen-capture] "
-                "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
-                "[--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] "
-                "[--list-audio-inputs] [--logfps] [--meter] [--no-limiter] [--ceiling <dB>] "
-                "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control] "
-                "[--stream <rtmp[s]://... | rtsp://...> | --stream-env] [--stream-bitrate <kbps>] [--stream-audio-bitrate <kbps>] "
-                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--detect-realtime] [--detect-stream]" << std::endl;
-            return 0;
-        }
-    }
-
-    if (experimentalScreenCapture && audioOnly) {
-        std::cout << "[i] --experimental-screen-capture only affects video capture; ignored "
-            "under --audioonly." << std::endl;
-        experimentalScreenCapture = false;
-    }
-    if (screenCaptureRcserverMethod && audioOnly) {
-        std::cout << "[i] --screen-capture-rcserver-method only affects video capture; ignored "
-            "under --audioonly." << std::endl;
-        screenCaptureRcserverMethod = false;
-    }
-    if (hybridCapture && audioOnly) {
-        std::cout << "[i] --hybrid-capture only affects video capture; ignored under "
-            "--audioonly." << std::endl;
-        hybridCapture = false;
-    }
-    if (rawCapture && audioOnly) {
-        std::cout << "[i] --raw-capture only affects video capture; ignored under "
-            "--audioonly." << std::endl;
-        rawCapture = false;
-    }
-    if (directRawCapture && audioOnly) {
-        std::cout << "[i] --direct-raw-capture only affects video capture; ignored under "
-            "--audioonly." << std::endl;
-        directRawCapture = false;
-    }
-    if (logFps && audioOnly) {
-        std::cout << "[i] --logfps only affects video capture; ignored under "
-            "--audioonly." << std::endl;
-        logFps = false;
-    }
-    if (tiledCapture) {
-        // --tiled-capture is the default now -- accepted so it doesn't
-        // hit the "unknown flag" usage error below, but it doesn't drive
-        // any behavior of its own anymore. Worth a one-time note so
-        // passing it isn't silently confusing.
-        std::cout << "[i] --tiled-capture: this is the default now, so this flag doesn't "
-            "change anything on its own; pass it if you like for clarity. See readme.md for "
-            "what changed and why, and --raw-capture if you want the original "
-            "one-read-per-frame behavior back." << std::endl;
-        tiledCapture = false;
-    }
-    if (directTiledCapture) {
-        // --direct-tiled-capture *was* its own opt-in flag; real-world
-        // testing (readme.md's own "--direct-tiled-capture" section) found
-        // it verifies safe and connects cleanly, and -- once the SSE4.1
-        // streaming-load fast path landed -- measured roughly 10x faster
-        // than plain BScreen tiled reads with no window-drag tearing left
-        // at all, on top of already gracefully falling back to the exact
-        // same plain BScreen tiled reads whenever any of that isn't true
-        // on the machine running it. That combination (safe by
-        // construction, faster when it can be, identical to the old
-        // default when it can't) is exactly what a default should be, so
-        // this is it now -- accepted as an explicit, inert confirmation,
-        // same as --tiled-capture above, not a separate opt-in anymore.
-        std::cout << "[i] --direct-tiled-capture: this is the default now (see readme.md), "
-            "so this flag doesn't change anything on its own; pass it if you like for "
-            "clarity. --direct-raw-capture is still its own explicit opt-in, for testing." << std::endl;
-        directTiledCapture = false;
-    }
-
-    // Four *explicit* alternative video-capture engines, plus --raw-capture
-    // as a fifth fallback to the *original* default -- doesn't make sense
-    // to run more than one at once. --direct-tiled-capture isn't part of
-    // this chain at all anymore: it's the default now (falling through
-    // when none of these five are set, exactly like plain tiled reads
-    // always have -- see g_directTiledCapture's own comment below and the
-    // main loop), not a competing opt-in, so there's nothing left to
-    // resolve a conflict against. Newest wins when explicitly combined:
-    // --direct-raw-capture over --hybrid-capture over
-    // --experimental-screen-capture over --screen-capture-rcserver-method
-    // over --raw-capture, on the theory that whichever was added most
-    // recently is also whichever the user most likely meant to actually
-    // test. Just a sane tie-break for an unlikely combination, not a
-    // statement that one is strictly better than the others in general.
-    // (--direct-raw-capture has its own dedicated branch in the main loop,
-    // mirroring --raw-capture's own single-read shape -- see its own
-    // comment above for why.)
-    if (hybridCapture && experimentalScreenCapture) {
-        std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
-            "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
-        experimentalScreenCapture = false;
-    }
-    if (hybridCapture && screenCaptureRcserverMethod) {
-        std::cout << "[i] --hybrid-capture and --screen-capture-rcserver-method are "
-            "alternative capture engines; can't use both at once. Keeping "
-            "--hybrid-capture." << std::endl;
-        screenCaptureRcserverMethod = false;
-    }
-    if (hybridCapture && rawCapture) {
-        std::cout << "[i] --hybrid-capture and --raw-capture are alternative capture "
-            "engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
-        rawCapture = false;
-    }
-    if (experimentalScreenCapture && screenCaptureRcserverMethod) {
-        std::cout << "[i] --experimental-screen-capture and --screen-capture-rcserver-method "
-            "are alternative capture engines; can't use both at once. Keeping "
-            "--experimental-screen-capture." << std::endl;
-        screenCaptureRcserverMethod = false;
-    }
-    if (experimentalScreenCapture && rawCapture) {
-        std::cout << "[i] --experimental-screen-capture and --raw-capture are alternative "
-            "capture engines; can't use both at once. Keeping "
-            "--experimental-screen-capture." << std::endl;
-        rawCapture = false;
-    }
-    if (screenCaptureRcserverMethod && rawCapture) {
-        std::cout << "[i] --screen-capture-rcserver-method and --raw-capture are alternative "
-            "capture engines; can't use both at once. Keeping "
-            "--screen-capture-rcserver-method." << std::endl;
-        rawCapture = false;
-    }
-    // --direct-tiled-capture no longer competes here at all -- it's the
-    // default now (see its own no-op block above), not a separate opt-in,
-    // so there's nothing left to resolve a conflict against.
-    // --direct-raw-capture is still a real, explicit opt-in for testing,
-    // same tie-break convention as the others above: wins over any of them
-    // if combined.
-    if (directRawCapture && hybridCapture) {
-        std::cout << "[i] --direct-raw-capture and --hybrid-capture are alternative capture "
-            "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
-        hybridCapture = false;
-    }
-    if (directRawCapture && experimentalScreenCapture) {
-        std::cout << "[i] --direct-raw-capture and --experimental-screen-capture are "
-            "alternative capture engines; can't use both at once. Keeping "
-            "--direct-raw-capture." << std::endl;
-        experimentalScreenCapture = false;
-    }
-    if (directRawCapture && screenCaptureRcserverMethod) {
-        std::cout << "[i] --direct-raw-capture and --screen-capture-rcserver-method are "
-            "alternative capture engines; can't use both at once. Keeping "
-            "--direct-raw-capture." << std::endl;
-        screenCaptureRcserverMethod = false;
-    }
-    if (directRawCapture && rawCapture) {
-        std::cout << "[i] --direct-raw-capture and --raw-capture are alternative capture "
-            "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
-        rawCapture = false;
-    }
-
-    // Read by the main capture loop (section 7) -- window-aware capture,
-    // see the section comment above EnumerateVisibleWindows() for the
-    // full design and its known trade-offs.
-    g_experimentalScreenCapture = experimentalScreenCapture;
-    if (g_experimentalScreenCapture) {
-        std::cout << "[i] --experimental-screen-capture: reusing a cached background between "
-            "frames and only freshly capturing window (and cursor) regions -- an alternative "
-            "to the default tiled capture, unaffected without this flag (see readme.md)." << std::endl;
-    }
-
-    // Read by the main capture loop (section 7) -- blind uniform-tile
-    // capture, see g_screenCaptureRcserverMethod's own comment above for
-    // the full design and how it differs from --experimental-screen-capture.
-    g_screenCaptureRcserverMethod = screenCaptureRcserverMethod;
-    if (g_screenCaptureRcserverMethod) {
-        std::cout << "[i] --screen-capture-rcserver-method: round-robin tile capture with "
-            "byte-level change detection (RemoteControl RCServer's own technique) -- an "
-            "alternative to the default tiled capture, unaffected without this flag (see "
-            "readme.md)." << std::endl;
-    }
-
-    // Read by the main capture loop (section 7) -- window-aware capture
-    // with rcserver-sized reads, see g_hybridCapture's own comment above
-    // for the full design and the hypothesis it's testing.
-    g_hybridCapture = hybridCapture;
-    if (g_hybridCapture) {
-        std::cout << "[i] --hybrid-capture: window-aware capture (like "
-            "--experimental-screen-capture) but reading each window through small, "
-            "fixed-size tiles (like the default tiled capture) instead of one call per "
-            "window -- an unconfirmed experiment, the default is unaffected without this "
-            "flag (see readme.md)." << std::endl;
-    }
-
-    // Read by the main capture loop (section 7) -- the original
-    // one-read-per-frame default, see g_rawCapture's own comment above
-    // for the full design and why it's still here.
-    g_rawCapture = rawCapture;
-    if (g_rawCapture) {
-        std::cout << "[i] --raw-capture: one plain full-screen read per frame, no tiling -- "
-            "the original default, kept available now that tiled reads are the default "
-            "instead (see readme.md)." << std::endl;
-    }
-
-    // Read by the main capture loop (section 7) -- --raw-capture's own
-    // single whole-screen read per frame, through the same verified-safe
-    // BDirectWindow pointer when SetupDirectCapture() (called below) finds
-    // one. See g_directRawCapture's own comment above for why this is
-    // worth trying separately from --direct-tiled-capture.
-    g_directRawCapture = directRawCapture;
-    if (g_directRawCapture) {
-        std::cout << "[i] --direct-raw-capture: one whole-screen read per frame (like "
-            "--raw-capture), through a BDirectWindow's raw framebuffer pointer when "
-            "verified safe on this video driver, falling back to plain --raw-capture "
-            "behavior otherwise (see readme.md)." << std::endl;
-    }
-
-    // Read by the main capture loop (section 7) -- the default tile grid,
-    // through a verified-safe BDirectWindow pointer instead of BScreen
-    // when SetupDirectCapture() (called below, once haikuApp exists) finds
-    // one. This is now what "no capture flag at all" means -- true
-    // whenever none of the five explicit alternative engines above were
-    // chosen, exactly the same condition that already decides whether the
-    // main loop falls through to the tiled default path. Real-world
-    // testing (readme.md's own "--direct-tiled-capture" section) found it
-    // verifies safe, connects cleanly, and -- with the SSE4.1 streaming-
-    // load fast path -- measured roughly 10x faster than plain BScreen
-    // tiled reads with no window-drag tearing left, while gracefully
-    // falling back to the exact same plain BScreen tiled reads whenever
-    // any of that isn't true on the machine running it -- safe by
-    // construction, faster when it can be, identical to the old default
-    // when it can't.
-    g_directTiledCapture = !hybridCapture && !experimentalScreenCapture
-        && !screenCaptureRcserverMethod && !rawCapture && !directRawCapture;
-
-    if (logFps) {
-        std::cout << "[i] --logfps: printing actual capture rate once per second (frames "
-            "written vs. this profile's target fps, plus how many of those frames took "
-            "longer than the target frame interval), a per-frame capture-vs-encode+write "
-            "time split, and a final summary at shutdown -- useful for telling a genuinely "
-            "slow capture/encode/disk-write pace apart from normal playback smoothness." << std::endl;
-    }
-
-    // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
-    // SetupDesktopAudioTap and SetupAllAudioTaps -- must be set before any
-    // of those run, which the audio-tap setup below (section 5a) does.
-    //
-    // Auto-detected first: if the currently active audio driver has its
-    // own settings file with a genuinely active play buffer frame count
-    // set (see DetectRealtimeAudioSettings above), that's taken as
-    // authoritative evidence real-time buffers are already in play, and
-    // hrecord matches that exact frame count -- no flag needed. --realtime
-    // remains as a manual fallback for a driver this app doesn't have
-    // cataloged yet (see readme.md), forcing the same behavior on with a
-    // generic 128-frame guess instead of a confirmed number.
-    int32 detectedFrames = 0;
-    if (DetectRealtimeAudioSettings(&detectedFrames)) {
-        g_realtimeAudio = true;
-        g_realtimeBufferFrames = detectedFrames;
-        std::cout << "[i] Real-time audio settings detected (" << detectedFrames
-            << "-frame play buffers) -- using tighter audio buffers automatically. See "
-            "readme.md for how this was detected." << std::endl;
-    } else if (realtimeAudio) {
-        g_realtimeAudio = true;
-        g_realtimeBufferFrames = 128;
-        std::cout << "[i] --realtime: forcing tighter audio buffers (128-frame hint) -- no "
-            "auto-detected real-time driver setting was found for the active audio driver "
-            "(see readme.md)." << std::endl;
-    }
-
-    const VideoProfile& profile = kVideoProfiles[profileIndex];
-
-    // ========================================================================
-    // FIXED SIGNAL CONTROLLER: Uses absolute kernel execution paths
-    // ========================================================================
-    if (stopRequested) {
-        int32 cookie = 0;
-        team_info info;
-        pid_t myPid = getpid();
-        bool found = false;
-
-        // Determine our own absolute binary path layout dynamically from the OS kernel
-        std::string myPath = "";
-        team_info myInfo;
-        if (get_team_info(myPid, &myInfo) == B_OK) {
-            myPath = myInfo.args;
-            // Trim trailing parameters if present to isolate the raw path token
-            size_t spacePos = myPath.find(' ');
-            if (spacePos != std::string::npos) {
-                myPath = myPath.substr(0, spacePos);
-            }
-        }
-
-        while (get_next_team_info(&cookie, &info) == B_OK) {
-            if (info.team == myPid) continue;
-
-            std::string targetArgs = info.args;
-            size_t spacePos = targetArgs.find(' ');
-            std::string targetBinary = (spacePos != std::string::npos) ? targetArgs.substr(0, spacePos) : targetArgs;
-
-            // Absolute verification: Only signal if the binary images match exactly
-            // and the target process does NOT contain our transient shutdown command flag.
-            if (targetBinary == myPath || (targetBinary.find("hrecord") != std::string::npos && targetBinary != "stop")) {
-                if (targetArgs.find("stop") == std::string::npos && targetArgs.find("--reap") == std::string::npos) {
-                    kill(info.team, SIGINT); // Fire clean Ctrl+C directly into the recorder
-                    found = true;
-                }
-            }
-        }
-        if (found) {
-            std::cout << "[+] Sent stop signal to recording instance." << std::endl;
-            return 0;
-        } else {
-            std::cerr << "[-] Error: No active hrecord recording session found." << std::endl;
-            return -1;
-        }
-    }
-    // ========================================================================
-
-    // 1. Keep FFmpeg's per-frame chatter quiet, but let real errors through --
-    // codecs like libvorbis log a specific reason via av_log before handing
-    // back a bare AVERROR, and AV_LOG_QUIET was swallowing that detail.
-    av_log_set_level(AV_LOG_ERROR);
-
-    // 2. Register terminal Ctrl+C intercept hook
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
-
-    // 3. Initialize Haiku Application Context
-    BApplication haikuApp("application/x-vnd.hrecord");
-
-    if (g_control && !stopRequested)
-        std::thread(ControlLoop).detach();
-
-    if (listAudioInputs) {
-        BMediaRoster* roster = BMediaRoster::Roster();
-        if (!roster) {
-            std::cerr << "[-] Error: Could not reach the media_server." << std::endl;
-            return -1;
-        }
-        ListAudioInputs(roster);
-        return 0;
-    }
+static int RunRecording(const RecordingSetup& setup) {
+    bool audioOnly = setup.audioOnly;
+    bool allAudio = setup.allAudio;
+    const VideoProfile& profile = *setup.profile;
+    bool logFps = setup.logFps;
+    g_wantStream = setup.wantStream;
+    StreamSettings streamSettings = setup.stream;
 
     // 4. Query Desktop Size (skipped entirely in --audioonly mode)
     BScreen screen(B_MAIN_SCREEN_ID);
@@ -3965,16 +4462,27 @@ int main(int argc, char* argv[]) {
     // back down immediately so no hijacked app is ever left mid-rewire.
     BMediaRoster* mediaRoster = BMediaRoster::Roster();
     AudioTapHandles audioTap;
-    AllAudioHandles allAudioTap;
+    AllAudioHandles& allAudioTap = g_allAudioTap;
     std::thread mixEncoderThread;
     bool audioConnected = false;
+    // an early return below must not leave the encode thread joinable (that ends the program)
+    struct JoinMixEncoder {
+        std::thread& thread;
+        ~JoinMixEncoder() {
+            if (thread.joinable()) {
+                g_running = false;
+                thread.join();
+            }
+        }
+    } joinMixEncoder{mixEncoderThread};
 
     if (mediaRoster == nullptr) {
         std::cerr << "[!] Warning: Could not reach the media_server; recording without audio."
             << std::endl;
     } else if (allAudio) {
-        media_raw_audio_format negotiated;
-        if (SetupAllAudioTaps(mediaRoster, &allAudioTap, &negotiated)) {
+        // (in --standby the sources are tapped already, and stay tapped)
+        media_raw_audio_format negotiated = g_standbyNegotiated;
+        if (g_standbySession || SetupAllAudioTaps(mediaRoster, &allAudioTap, &negotiated, false)) {
             if (SetupAudioEncoder(fmtCtx, negotiated, &g_audioEnc)) {
                 audioConnected = true;
                 // Two seconds, matching the per-tap mix ring sizing
@@ -3983,12 +4491,15 @@ int main(int argc, char* argv[]) {
                 size_t queueCapacity =
                     (size_t)(kMixBusChannels * sizeof(float) * negotiated.frame_rate * 2.0);
                 g_mixEncodeQueue.Init(queueCapacity);
+                if (g_standbySession)
+                    g_running = true; // from here on the mix callback writes into the queue
                 mixEncoderThread = std::thread(MixEncodeWorkerLoop, &g_mixEncodeQueue,
                     &g_audioEnc, negotiated);
             } else {
                 std::cerr << "[-] Error: Audio sources tapped, but the Vorbis encoder failed to "
                     "start; recording without audio." << std::endl;
-                TeardownAllAudioTaps(mediaRoster, &allAudioTap);
+                if (!g_standbySession)
+                    TeardownAllAudioTaps(mediaRoster, &allAudioTap);
             }
         } else {
             std::cerr << "[!] Warning: Could not set up desktop-audio capture; recording without "
@@ -4179,10 +4690,14 @@ int main(int argc, char* argv[]) {
     AVPacket* pkt = av_packet_alloc();
 
     {
-        thread_id updateCheckThread = spawn_thread(BackgroundUpdateChecker,
-            "hrecord_update_checker", B_LOW_PRIORITY, nullptr);
-        if (updateCheckThread >= 0)
-            resume_thread(updateCheckThread);
+        static bool updateCheckStarted = false;
+        if (!updateCheckStarted) {
+            updateCheckStarted = true;
+            thread_id updateCheckThread = spawn_thread(BackgroundUpdateChecker,
+                "hrecord_update_checker", B_LOW_PRIORITY, nullptr);
+            if (updateCheckThread >= 0)
+                resume_thread(updateCheckThread);
+        }
     }
 
 
@@ -4662,7 +5177,10 @@ int main(int argc, char* argv[]) {
         // BufferReceived()/MixedPlaybackCallback call can race the final
         // flush below.
         if (allAudio) {
-            TeardownAllAudioTaps(mediaRoster, &allAudioTap);
+            if (!g_standbySession)
+                TeardownAllAudioTaps(mediaRoster, &allAudioTap);
+            // (in --standby the sources stay tapped: the recording stopped, g_running is false, so the mix callback no
+            // longer writes into the queue)
             // No more writes into g_mixEncodeQueue past this point (the
             // BSoundPlayer that fed it is already stopped) -- join so the
             // worker's final catch-up pass has definitely happened before
@@ -4723,6 +5241,530 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[+] Output written to '" << output_filename << "' successfully!" << std::endl;
 
-    curl_global_cleanup();
     return 0;
+}
+
+// --standby: connect to every audio source and keep them connected; record when asked (see ControlLoop's "record").
+static int RunStandby() {
+    BMediaRoster* mediaRoster = BMediaRoster::Roster();
+    if (mediaRoster == nullptr) {
+        std::cerr << "[-] Error: Could not reach the media_server." << std::endl;
+        return -1;
+    }
+    g_standbySession = true;
+    g_running = false;
+    HubRecoverDefault(mediaRoster);
+    if (!SetupAllAudioTaps(mediaRoster, &g_allAudioTap, &g_standbyNegotiated, true)) {
+        std::cerr << "[-] Error: Could not connect to the audio sources." << std::endl;
+        return -1;
+    }
+    std::cout << "[+] Standby: every audio source is connected; recording starts on request." << std::endl;
+
+    while (!g_quit) {
+        RecordingSetup request;
+        bool requested = false;
+        {
+            std::lock_guard<std::mutex> lock(g_recordRequestMutex);
+            if (g_recordRequested) {
+                request = g_pendingSetup;
+                g_recordRequested = false;
+                requested = true;
+            }
+        }
+        if (!requested) {
+            snooze(50000);
+            continue;
+        }
+        RunRecording(request); // sets g_running itself, once the mix queue is ready
+        g_running = false;
+        std::cout << "[+] Recording ended; the audio sources are still connected." << std::endl;
+    }
+
+    // the end: every source goes back on the Mixer
+    TeardownAllAudioTaps(mediaRoster, &g_allAudioTap);
+    std::cout << "[+] Standby ended: the audio sources are back on the Mixer." << std::endl;
+    return 0;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc >= 2 && strcmp(argv[1], "--reap") == 0)
+        return RunInputReaper(argc, argv);
+
+    // For the mixer window: one line saying whether real-time audio is set on the active driver.
+    //   "realtime on <frames>"   tuned      "realtime off known"   a known driver, not tuned
+    //   "realtime off unknown"   no driver this app has a profile for (--realtime can still force it)
+    // Is the H.264 add-on for streaming installed? "stream on <version>" or "stream off".
+    if (argc >= 2 && strcmp(argv[1], "--detect-stream") == 0) {
+        std::string path, version;
+        if (StreamAddonAvailable(&path, &version))
+            std::cout << "stream on " << (version.empty() ? "?" : version) << std::endl;
+        else
+            std::cout << "stream off" << std::endl;
+        return 0;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "--detect-realtime") == 0) {
+        int32 frames = 0;
+        if (DetectRealtimeAudioSettings(&frames))
+            std::cout << "realtime on " << frames << std::endl;
+        else
+            std::cout << "realtime off " << (g_knownRealtimeDriver ? "known" : "unknown") << std::endl;
+        return 0;
+    }
+
+    // libcurl's global init is not thread-safe against other concurrently
+    // running threads, so do it explicitly up front (before any background
+    // thread might trigger an implicit lazy global init and race it).
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    // ========================================================================
+    // Argument parsing: "start" (default) / "stop", plus an optional
+    // --audioonly flag that restricts recording to desktop audio only.
+    // ========================================================================
+    bool audioOnly = false;
+    bool allAudio = false;
+    bool realtimeAudio = false;
+    bool experimentalScreenCapture = false;
+    bool screenCaptureRcserverMethod = false;
+    bool hybridCapture = false;
+    bool tiledCapture = false; // now the default; accepted as an inert, explicit confirmation
+    bool directTiledCapture = false;
+    bool directRawCapture = false;
+    bool rawCapture = false;
+    bool stopRequested = false;
+    bool listAudioInputs = false;
+    bool logFps = false;
+    StreamSettings streamSettings; // --stream <url> and --stream-* : see hrecord_stream.h
+    int profileIndex = 1; // default: medium
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "stop") == 0) {
+            stopRequested = true;
+        } else if (strcmp(argv[i], "start") == 0) {
+            // default behavior, nothing to flag
+        } else if (strcmp(argv[i], "--audioonly") == 0 || strcmp(argv[i], "--audoonly") == 0) {
+            audioOnly = true;
+        } else if (strcmp(argv[i], "--allaudio") == 0) {
+            allAudio = true;
+        } else if (strcmp(argv[i], "--realtime") == 0) {
+            realtimeAudio = true;
+        } else if (strcmp(argv[i], "--experimental-screen-capture") == 0) {
+            experimentalScreenCapture = true;
+        } else if (strcmp(argv[i], "--screen-capture-rcserver-method") == 0) {
+            screenCaptureRcserverMethod = true;
+        } else if (strcmp(argv[i], "--hybrid-capture") == 0) {
+            hybridCapture = true;
+        } else if (strcmp(argv[i], "--tiled-capture") == 0) {
+            tiledCapture = true;
+        } else if (strcmp(argv[i], "--direct-tiled-capture") == 0) {
+            directTiledCapture = true;
+        } else if (strcmp(argv[i], "--direct-raw-capture") == 0) {
+            directRawCapture = true;
+        } else if (strcmp(argv[i], "--raw-capture") == 0) {
+            rawCapture = true;
+        } else if (strcmp(argv[i], "--list-audio-inputs") == 0) {
+            listAudioInputs = true;
+        } else if (strcmp(argv[i], "--logfps") == 0) {
+            logFps = true;
+        } else if (strcmp(argv[i], "--meter") == 0) {
+            g_meter = true;
+        } else if (strcmp(argv[i], "--meter-ms") == 0 && i + 1 < argc) {
+            g_meterMs = std::max(20, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--control") == 0) {
+            g_control = true;
+        } else if (strcmp(argv[i], "--standby") == 0) {
+            g_standby = true;
+        } else if (strcmp(argv[i], "--stream") == 0 && i + 1 < argc) {
+            streamSettings.url = argv[++i];
+            g_wantStream = true;
+        } else if (strcmp(argv[i], "--stream-env") == 0) {
+            // the address (with the stream key in it) comes from the environment variable HRECORD_STREAM_URL, so that
+            // it is not in the command line, where any program can read it
+            const char* fromEnv = getenv("HRECORD_STREAM_URL");
+            if (fromEnv != nullptr && fromEnv[0] != '\0') {
+                streamSettings.url = fromEnv;
+                g_wantStream = true;
+            } else {
+                std::cerr << "[-] Error: --stream-env: HRECORD_STREAM_URL is not set." << std::endl;
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--stream-bitrate") == 0 && i + 1 < argc) {
+            streamSettings.videoKbps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--stream-audio-bitrate") == 0 && i + 1 < argc) {
+            streamSettings.audioKbps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--stream-preset") == 0 && i + 1 < argc) {
+            streamSettings.preset = argv[++i];
+        } else if (strcmp(argv[i], "--stream-keyint") == 0 && i + 1 < argc) {
+            streamSettings.keyintSeconds = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-limiter") == 0) {
+            g_limiterOn = false;
+        } else if (strcmp(argv[i], "--ceiling") == 0 && i + 1 < argc) {
+            g_ceilingDb = (float)atof(argv[++i]);
+            if (g_ceilingDb > 0.0f) g_ceilingDb = 0.0f;
+        } else if (strcmp(argv[i], "--mix-gain") == 0 && i + 1 < argc) {
+            g_mixGainDb = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--source-gain") == 0 && i + 1 < argc) {
+            // "<n>=<dB>": the n-th source (as numbered when it is tapped), 1 first
+            int n = 0;
+            float db = 0.0f;
+            if (sscanf(argv[++i], "%d=%f", &n, &db) == 2 && n >= 1 && n <= kMeterMaxSources)
+                g_sourceGainDb[n - 1] = db;
+            else {
+                std::cout << "--source-gain takes <n>=<dB>, for example 2=-6" << std::endl;
+                return 0;
+            }
+        } else if (strcmp(argv[i], "--low") == 0) {
+            profileIndex = 0;
+        } else if (strcmp(argv[i], "--medium") == 0) {
+            profileIndex = 1;
+        } else if (strcmp(argv[i], "--high") == 0) {
+            profileIndex = 2;
+        } else {
+            std::cout << "Usage: hrecord [start|stop] [--low|--medium|--high] [--audioonly] "
+                "[--allaudio] [--realtime] [--experimental-screen-capture] "
+                "[--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] "
+                "[--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] "
+                "[--list-audio-inputs] [--logfps] [--meter] [--no-limiter] [--ceiling <dB>] "
+                "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control] "
+                "[--standby] [--stream <rtmp[s]://... | rtsp://...> | --stream-env] [--stream-bitrate <kbps>] [--stream-audio-bitrate <kbps>] "
+                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--detect-realtime] [--detect-stream]" << std::endl;
+            return 0;
+        }
+    }
+
+    if (experimentalScreenCapture && audioOnly) {
+        std::cout << "[i] --experimental-screen-capture only affects video capture; ignored "
+            "under --audioonly." << std::endl;
+        experimentalScreenCapture = false;
+    }
+    if (screenCaptureRcserverMethod && audioOnly) {
+        std::cout << "[i] --screen-capture-rcserver-method only affects video capture; ignored "
+            "under --audioonly." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
+    if (hybridCapture && audioOnly) {
+        std::cout << "[i] --hybrid-capture only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        hybridCapture = false;
+    }
+    if (rawCapture && audioOnly) {
+        std::cout << "[i] --raw-capture only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        rawCapture = false;
+    }
+    if (directRawCapture && audioOnly) {
+        std::cout << "[i] --direct-raw-capture only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        directRawCapture = false;
+    }
+    if (logFps && audioOnly) {
+        std::cout << "[i] --logfps only affects video capture; ignored under "
+            "--audioonly." << std::endl;
+        logFps = false;
+    }
+    if (tiledCapture) {
+        // --tiled-capture is the default now -- accepted so it doesn't
+        // hit the "unknown flag" usage error below, but it doesn't drive
+        // any behavior of its own anymore. Worth a one-time note so
+        // passing it isn't silently confusing.
+        std::cout << "[i] --tiled-capture: this is the default now, so this flag doesn't "
+            "change anything on its own; pass it if you like for clarity. See readme.md for "
+            "what changed and why, and --raw-capture if you want the original "
+            "one-read-per-frame behavior back." << std::endl;
+        tiledCapture = false;
+    }
+    if (directTiledCapture) {
+        // --direct-tiled-capture *was* its own opt-in flag; real-world
+        // testing (readme.md's own "--direct-tiled-capture" section) found
+        // it verifies safe and connects cleanly, and -- once the SSE4.1
+        // streaming-load fast path landed -- measured roughly 10x faster
+        // than plain BScreen tiled reads with no window-drag tearing left
+        // at all, on top of already gracefully falling back to the exact
+        // same plain BScreen tiled reads whenever any of that isn't true
+        // on the machine running it. That combination (safe by
+        // construction, faster when it can be, identical to the old
+        // default when it can't) is exactly what a default should be, so
+        // this is it now -- accepted as an explicit, inert confirmation,
+        // same as --tiled-capture above, not a separate opt-in anymore.
+        std::cout << "[i] --direct-tiled-capture: this is the default now (see readme.md), "
+            "so this flag doesn't change anything on its own; pass it if you like for "
+            "clarity. --direct-raw-capture is still its own explicit opt-in, for testing." << std::endl;
+        directTiledCapture = false;
+    }
+
+    // Four *explicit* alternative video-capture engines, plus --raw-capture
+    // as a fifth fallback to the *original* default -- doesn't make sense
+    // to run more than one at once. --direct-tiled-capture isn't part of
+    // this chain at all anymore: it's the default now (falling through
+    // when none of these five are set, exactly like plain tiled reads
+    // always have -- see g_directTiledCapture's own comment below and the
+    // main loop), not a competing opt-in, so there's nothing left to
+    // resolve a conflict against. Newest wins when explicitly combined:
+    // --direct-raw-capture over --hybrid-capture over
+    // --experimental-screen-capture over --screen-capture-rcserver-method
+    // over --raw-capture, on the theory that whichever was added most
+    // recently is also whichever the user most likely meant to actually
+    // test. Just a sane tie-break for an unlikely combination, not a
+    // statement that one is strictly better than the others in general.
+    // (--direct-raw-capture has its own dedicated branch in the main loop,
+    // mirroring --raw-capture's own single-read shape -- see its own
+    // comment above for why.)
+    if (hybridCapture && experimentalScreenCapture) {
+        std::cout << "[i] --hybrid-capture and --experimental-screen-capture are alternative "
+            "capture engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
+        experimentalScreenCapture = false;
+    }
+    if (hybridCapture && screenCaptureRcserverMethod) {
+        std::cout << "[i] --hybrid-capture and --screen-capture-rcserver-method are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--hybrid-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
+    if (hybridCapture && rawCapture) {
+        std::cout << "[i] --hybrid-capture and --raw-capture are alternative capture "
+            "engines; can't use both at once. Keeping --hybrid-capture." << std::endl;
+        rawCapture = false;
+    }
+    if (experimentalScreenCapture && screenCaptureRcserverMethod) {
+        std::cout << "[i] --experimental-screen-capture and --screen-capture-rcserver-method "
+            "are alternative capture engines; can't use both at once. Keeping "
+            "--experimental-screen-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
+    if (experimentalScreenCapture && rawCapture) {
+        std::cout << "[i] --experimental-screen-capture and --raw-capture are alternative "
+            "capture engines; can't use both at once. Keeping "
+            "--experimental-screen-capture." << std::endl;
+        rawCapture = false;
+    }
+    if (screenCaptureRcserverMethod && rawCapture) {
+        std::cout << "[i] --screen-capture-rcserver-method and --raw-capture are alternative "
+            "capture engines; can't use both at once. Keeping "
+            "--screen-capture-rcserver-method." << std::endl;
+        rawCapture = false;
+    }
+    // --direct-tiled-capture no longer competes here at all -- it's the
+    // default now (see its own no-op block above), not a separate opt-in,
+    // so there's nothing left to resolve a conflict against.
+    // --direct-raw-capture is still a real, explicit opt-in for testing,
+    // same tie-break convention as the others above: wins over any of them
+    // if combined.
+    if (directRawCapture && hybridCapture) {
+        std::cout << "[i] --direct-raw-capture and --hybrid-capture are alternative capture "
+            "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
+        hybridCapture = false;
+    }
+    if (directRawCapture && experimentalScreenCapture) {
+        std::cout << "[i] --direct-raw-capture and --experimental-screen-capture are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--direct-raw-capture." << std::endl;
+        experimentalScreenCapture = false;
+    }
+    if (directRawCapture && screenCaptureRcserverMethod) {
+        std::cout << "[i] --direct-raw-capture and --screen-capture-rcserver-method are "
+            "alternative capture engines; can't use both at once. Keeping "
+            "--direct-raw-capture." << std::endl;
+        screenCaptureRcserverMethod = false;
+    }
+    if (directRawCapture && rawCapture) {
+        std::cout << "[i] --direct-raw-capture and --raw-capture are alternative capture "
+            "engines; can't use both at once. Keeping --direct-raw-capture." << std::endl;
+        rawCapture = false;
+    }
+
+    // Read by the main capture loop (section 7) -- window-aware capture,
+    // see the section comment above EnumerateVisibleWindows() for the
+    // full design and its known trade-offs.
+    g_experimentalScreenCapture = experimentalScreenCapture;
+    if (g_experimentalScreenCapture) {
+        std::cout << "[i] --experimental-screen-capture: reusing a cached background between "
+            "frames and only freshly capturing window (and cursor) regions -- an alternative "
+            "to the default tiled capture, unaffected without this flag (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- blind uniform-tile
+    // capture, see g_screenCaptureRcserverMethod's own comment above for
+    // the full design and how it differs from --experimental-screen-capture.
+    g_screenCaptureRcserverMethod = screenCaptureRcserverMethod;
+    if (g_screenCaptureRcserverMethod) {
+        std::cout << "[i] --screen-capture-rcserver-method: round-robin tile capture with "
+            "byte-level change detection (RemoteControl RCServer's own technique) -- an "
+            "alternative to the default tiled capture, unaffected without this flag (see "
+            "readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- window-aware capture
+    // with rcserver-sized reads, see g_hybridCapture's own comment above
+    // for the full design and the hypothesis it's testing.
+    g_hybridCapture = hybridCapture;
+    if (g_hybridCapture) {
+        std::cout << "[i] --hybrid-capture: window-aware capture (like "
+            "--experimental-screen-capture) but reading each window through small, "
+            "fixed-size tiles (like the default tiled capture) instead of one call per "
+            "window -- an unconfirmed experiment, the default is unaffected without this "
+            "flag (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- the original
+    // one-read-per-frame default, see g_rawCapture's own comment above
+    // for the full design and why it's still here.
+    g_rawCapture = rawCapture;
+    if (g_rawCapture) {
+        std::cout << "[i] --raw-capture: one plain full-screen read per frame, no tiling -- "
+            "the original default, kept available now that tiled reads are the default "
+            "instead (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- --raw-capture's own
+    // single whole-screen read per frame, through the same verified-safe
+    // BDirectWindow pointer when SetupDirectCapture() (called below) finds
+    // one. See g_directRawCapture's own comment above for why this is
+    // worth trying separately from --direct-tiled-capture.
+    g_directRawCapture = directRawCapture;
+    if (g_directRawCapture) {
+        std::cout << "[i] --direct-raw-capture: one whole-screen read per frame (like "
+            "--raw-capture), through a BDirectWindow's raw framebuffer pointer when "
+            "verified safe on this video driver, falling back to plain --raw-capture "
+            "behavior otherwise (see readme.md)." << std::endl;
+    }
+
+    // Read by the main capture loop (section 7) -- the default tile grid,
+    // through a verified-safe BDirectWindow pointer instead of BScreen
+    // when SetupDirectCapture() (called below, once haikuApp exists) finds
+    // one. This is now what "no capture flag at all" means -- true
+    // whenever none of the five explicit alternative engines above were
+    // chosen, exactly the same condition that already decides whether the
+    // main loop falls through to the tiled default path. Real-world
+    // testing (readme.md's own "--direct-tiled-capture" section) found it
+    // verifies safe, connects cleanly, and -- with the SSE4.1 streaming-
+    // load fast path -- measured roughly 10x faster than plain BScreen
+    // tiled reads with no window-drag tearing left, while gracefully
+    // falling back to the exact same plain BScreen tiled reads whenever
+    // any of that isn't true on the machine running it -- safe by
+    // construction, faster when it can be, identical to the old default
+    // when it can't.
+    g_directTiledCapture = !hybridCapture && !experimentalScreenCapture
+        && !screenCaptureRcserverMethod && !rawCapture && !directRawCapture;
+
+    if (logFps) {
+        std::cout << "[i] --logfps: printing actual capture rate once per second (frames "
+            "written vs. this profile's target fps, plus how many of those frames took "
+            "longer than the target frame interval), a per-frame capture-vs-encode+write "
+            "time split, and a final summary at shutdown -- useful for telling a genuinely "
+            "slow capture/encode/disk-write pace apart from normal playback smoothness." << std::endl;
+    }
+
+    // Read by MixBusFormat()/PaceToRealTime()/the ring-sizing code in
+    // SetupDesktopAudioTap and SetupAllAudioTaps -- must be set before any
+    // of those run, which the audio-tap setup below (section 5a) does.
+    //
+    // Auto-detected first: if the currently active audio driver has its
+    // own settings file with a genuinely active play buffer frame count
+    // set (see DetectRealtimeAudioSettings above), that's taken as
+    // authoritative evidence real-time buffers are already in play, and
+    // hrecord matches that exact frame count -- no flag needed. --realtime
+    // remains as a manual fallback for a driver this app doesn't have
+    // cataloged yet (see readme.md), forcing the same behavior on with a
+    // generic 128-frame guess instead of a confirmed number.
+    int32 detectedFrames = 0;
+    if (DetectRealtimeAudioSettings(&detectedFrames)) {
+        g_realtimeAudio = true;
+        g_realtimeBufferFrames = detectedFrames;
+        std::cout << "[i] Real-time audio settings detected (" << detectedFrames
+            << "-frame play buffers) -- using tighter audio buffers automatically. See "
+            "readme.md for how this was detected." << std::endl;
+    } else if (realtimeAudio) {
+        g_realtimeAudio = true;
+        g_realtimeBufferFrames = 128;
+        std::cout << "[i] --realtime: forcing tighter audio buffers (128-frame hint) -- no "
+            "auto-detected real-time driver setting was found for the active audio driver "
+            "(see readme.md)." << std::endl;
+    }
+
+    const VideoProfile& profile = kVideoProfiles[profileIndex];
+
+    // ========================================================================
+    // FIXED SIGNAL CONTROLLER: Uses absolute kernel execution paths
+    // ========================================================================
+    if (stopRequested) {
+        int32 cookie = 0;
+        team_info info;
+        pid_t myPid = getpid();
+        bool found = false;
+
+        // Determine our own absolute binary path layout dynamically from the OS kernel
+        std::string myPath = "";
+        team_info myInfo;
+        if (get_team_info(myPid, &myInfo) == B_OK) {
+            myPath = myInfo.args;
+            // Trim trailing parameters if present to isolate the raw path token
+            size_t spacePos = myPath.find(' ');
+            if (spacePos != std::string::npos) {
+                myPath = myPath.substr(0, spacePos);
+            }
+        }
+
+        while (get_next_team_info(&cookie, &info) == B_OK) {
+            if (info.team == myPid) continue;
+
+            std::string targetArgs = info.args;
+            size_t spacePos = targetArgs.find(' ');
+            std::string targetBinary = (spacePos != std::string::npos) ? targetArgs.substr(0, spacePos) : targetArgs;
+
+            // Absolute verification: Only signal if the binary images match exactly
+            // and the target process does NOT contain our transient shutdown command flag.
+            if (targetBinary == myPath || (targetBinary.find("hrecord") != std::string::npos && targetBinary != "stop")) {
+                if (targetArgs.find("stop") == std::string::npos && targetArgs.find("--reap") == std::string::npos) {
+                    kill(info.team, SIGINT); // Fire clean Ctrl+C directly into the recorder
+                    found = true;
+                }
+            }
+        }
+        if (found) {
+            std::cout << "[+] Sent stop signal to recording instance." << std::endl;
+            return 0;
+        } else {
+            std::cerr << "[-] Error: No active hrecord recording session found." << std::endl;
+            return -1;
+        }
+    }
+    // ========================================================================
+
+    // 1. Keep FFmpeg's per-frame chatter quiet, but let real errors through --
+    // codecs like libvorbis log a specific reason via av_log before handing
+    // back a bare AVERROR, and AV_LOG_QUIET was swallowing that detail.
+    av_log_set_level(AV_LOG_ERROR);
+
+    // 2. Register terminal Ctrl+C intercept hook
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+
+    // 3. Initialize Haiku Application Context
+    BApplication haikuApp("application/x-vnd.hrecord");
+
+    if (g_control && !stopRequested)
+        std::thread(ControlLoop).detach();
+
+    if (listAudioInputs) {
+        BMediaRoster* roster = BMediaRoster::Roster();
+        if (!roster) {
+            std::cerr << "[-] Error: Could not reach the media_server." << std::endl;
+            return -1;
+        }
+        ListAudioInputs(roster);
+        return 0;
+    }
+
+    RecordingSetup setup;
+    setup.audioOnly = audioOnly;
+    setup.allAudio = allAudio;
+    setup.profile = &profile;
+    setup.logFps = logFps;
+    setup.wantStream = g_wantStream;
+    setup.stream = streamSettings;
+    g_baseSetup = setup;
+
+    int result = (g_standby && allAudio) ? RunStandby() : RunRecording(setup);
+    curl_global_cleanup();
+    return result;
 }

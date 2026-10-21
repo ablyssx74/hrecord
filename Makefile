@@ -66,7 +66,7 @@ LIBS = $(LIB_PATH) $(EXTRA_LIBS) $(HAIKU_LIBS)
 
 # The mixer window: runs hrecord as its engine
 gui: hrecord_gui.cpp hrecord_mixer.rdef VERSION
-	$(CXX) -std=c++17 -O2 -Wall $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lroot -lnetwork
+	$(CXX) -std=c++17 -O2 -Wall $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lmedia -lroot -lnetwork
 	sed -e 's/@V_MAJOR@/$(V_MAJOR)/' -e 's/@V_MINOR@/$(V_MINOR)/' -e 's/@V_MIDDLE@/$(V_MIDDLE)/' -e 's/@VERSION@/$(VERSION)/' hrecord_mixer.rdef > hrecord_mixer.version.rdef
 	rc -o hrecord_mixer.rsrc hrecord_mixer.version.rdef
 	xres -o hrecord_mixer hrecord_mixer.rsrc

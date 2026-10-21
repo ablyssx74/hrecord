@@ -18,6 +18,10 @@
 #include <MenuField.h>
 #include <File.h>
 #include <MenuItem.h>
+#include <ListView.h>
+#include <MediaDefs.h>
+#include <MediaNode.h>
+#include <MediaRoster.h>
 #include <Message.h>
 #include <Url.h>
 #include <MessageRunner.h>
@@ -29,6 +33,8 @@
 #include <ScrollView.h>
 #include <Spinner.h>
 #include <Slider.h>
+#include <StringItem.h>
+#include <TabView.h>
 #include <StringView.h>
 #include <TextControl.h>
 #include <TextView.h>
@@ -46,6 +52,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -70,7 +78,12 @@ enum {
 	kMsgStreamConfigure	= 'scf!',
 	kMsgStreamSaved		= 'ssv!',
 	kMsgStreamService	= 'ssc!',
-	kMsgStreamSave		= 'sav!'
+	kMsgStreamSave		= 'sav!',
+	kMsgStartEngine		= 'eng!',
+	kMsgShowLog			= 'slg!',
+	kMsgShowNodes		= 'snd!',
+	kMsgTestClick		= 'tcl!',
+	kMsgTestAction		= 'tac!'
 };
 
 static const float kFaderMin = -60.0f, kFaderMax = 12.0f;		// dB, on a fader
@@ -641,6 +654,9 @@ struct StreamConfig {
 	int			audioKbps = 128;
 	int			preset = 2;				// veryfast
 	int			keyintSeconds = 2;
+	bool		showLog = true;			// the log under the window is shown
+	bool		hubOn = false;			// hrecord shares the audio input with programs (its input hub)
+	std::map<std::string, int>	hubModes;	// by program name: what it gets from the hub, 0 both channels, 1 left, 2 right
 
 	std::string BaseAddress() const
 	{
@@ -694,6 +710,18 @@ struct StreamConfig {
 		const char* text;
 		bool flag;
 		if (message.FindBool("stream", &flag) == B_OK) enabled = flag;
+		if (message.FindBool("showlog", &flag) == B_OK) showLog = flag;
+		if (message.FindBool("hubon", &flag) == B_OK) hubOn = flag;
+		for (int32 i = 0;; i++) {
+			char* name = NULL;
+			type_code type;
+			int32 count;
+			if (message.GetInfo(B_INT32_TYPE, i, &name, &type, &count) != B_OK)
+				break;
+			int32 mode;
+			if (strncmp(name, "hubmode:", 8) == 0 && message.FindInt32(name, &mode) == B_OK)
+				hubModes[name + 8] = (int)mode;
+		}
 		if (message.FindInt32("service", &number) == B_OK && number >= 0 && number < kStreamServiceCount) service = number;
 		// (an older file has one key and one address, for the service that was chosen then)
 		if (message.FindString("server", &text) == B_OK) servers[service] = text;
@@ -715,6 +743,10 @@ struct StreamConfig {
 	{
 		BMessage message;
 		message.AddBool("stream", enabled);
+		message.AddBool("showlog", showLog);
+		message.AddBool("hubon", hubOn);
+		for (std::map<std::string, int>::const_iterator it = hubModes.begin(); it != hubModes.end(); ++it)
+			message.AddInt32((std::string("hubmode:") + it->first).c_str(), it->second);
 		message.AddInt32("service", service);
 		for (int i = 0; i < kStreamServiceCount; i++) {
 			char name[16];
@@ -779,7 +811,9 @@ public:
 
 		BStringView* note1 = new BStringView("note1", "The size and frame rate follow the Screen quality menu (Low: 1280 wide, 15 fps;");
 		BStringView* note2 = new BStringView("note2", "Medium: 1600, 24 fps; High: the whole screen, 30 fps). Faster encoder speeds use less CPU.");
-		BStringView* note3 = new BStringView("note3", "The stream key is kept in your settings folder, readable by your account only.");
+		BString storedIn("Configuration settings stored in ");
+		storedIn << StreamConfig::FilePath().c_str();
+		BStringView* note3 = new BStringView("note3", storedIn.String());
 
 		BButton* save = new BButton("save", "Save", new BMessage(kMsgStreamSave));
 		save->MakeDefault(true);
@@ -905,6 +939,889 @@ private:
 
 
 // ---------------------------------------------------------------------------------------------------------------
+// The Nodes tab: the programs and devices that make sound, hrecord, the Mixer and the sound hardware as boxes, and the
+// connections between them as lines (what Cortex shows). A box can be selected for what can be done with it.
+// ---------------------------------------------------------------------------------------------------------------
+
+static const int32 kHrecordKey = -100;			// hrecord's taps and its playback, together
+static const int32 kSinkOffset = 1000000;		// the output half of a device that is also an input (the sound hardware)
+
+struct GraphNode {
+	int32			key = 0;
+	media_node_id	id = -1;					// the Media Kit node (-1 for hrecord)
+	std::string		name;
+	uint64			kind = 0;
+	bool			hrecord = false;
+	bool			mixer = false;
+	bool			sink = false;
+	bool			device = false;				// a source that is hardware: the microphone, the line in
+	bool			app = false;				// a program that makes sound
+	int				level = 0;
+	BRect			frame;
+};
+
+struct FreeOutput {
+	int32			key = 0;
+	media_output	output;
+};
+
+struct GraphEdge {
+	int32			from = 0;
+	int32			to = 0;
+	media_output	output;
+	media_input		input;
+	bool			throughHrecord = false;		// a program that hrecord has tapped
+};
+
+enum {
+	kMsgNodeCommand		= 'ncm!',		// a command for hrecord, from the Nodes tab
+	kMsgNodeRefresh		= 'nrf!',
+	kMsgNodeRoute		= 'nrt!',
+	kMsgNodeTakeOff		= 'nto!',
+	kMsgNodePutBack		= 'npb!',
+	kMsgNodeDisconnect	= 'ndc!',
+	kMsgNodeReconnect	= 'nrc!',
+	kMsgNodeSelectEdge	= 'nse!',
+	kMsgHubToggle		= 'hbt!',
+	kMsgHubMode			= 'hbm!'
+};
+
+class NodesTab;
+
+class GraphCanvas : public BView {
+public:
+	GraphCanvas(NodesTab* tab);
+	void Draw(BRect updateRect);
+	void MouseDown(BPoint where);
+private:
+	NodesTab*	fTab;
+};
+
+
+class NodesTab : public BView {
+public:
+	NodesTab(BMessenger window, StreamConfig* config)
+		:
+		BView("Nodes", 0),
+		fWindow(window),
+		fConfig(config),
+		fHubActive(false),
+		fSelected(0),
+		fSelectedEdge(-1),
+		fEngineReady(false),
+		fRunner(NULL)
+	{
+		SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+		fCanvas = new GraphCanvas(this);
+		fCanvas->SetExplicitMinSize(BSize(400, 200));
+		fCanvas->SetExplicitPreferredSize(BSize(900, 280));
+
+		fTitle = new BStringView("title", "Select a box to see what can be done with it.");
+		BMessage* routeMessage = new BMessage(kMsgNodeRoute);
+		fStereo = new BCheckBox("stereo", "Stereo", new BMessage(*routeMessage));
+		fLeft = new BCheckBox("left", "Left", new BMessage(*routeMessage));
+		fRight = new BCheckBox("right", "Right", new BMessage(*routeMessage));
+		delete routeMessage;
+		fMixLabel = new BStringView("mixlabel", "In the mix as:");
+		fTakeOff = new BButton("takeoff", "Take off the mix", new BMessage(kMsgNodeTakeOff));
+		fPutBack = new BButton("putback", "Put on the mix again", new BMessage(kMsgNodePutBack));
+		fConnections = new BListView("connections");
+		fConnections->SetSelectionMessage(new BMessage(kMsgNodeSelectEdge));
+		BScrollView* connectionsScroll = new BScrollView("connectionsscroll", fConnections, 0, false, true);
+		connectionsScroll->SetExplicitMinSize(BSize(200, 70));
+		fDisconnect = new BButton("disconnect", "Disconnect", new BMessage(kMsgNodeDisconnect));
+		fReconnectMenu = new BPopUpMenu("reconnect");
+		fReconnectField = new BMenuField("reconnectfield", "Connect it to:", fReconnectMenu);
+		fReconnect = new BButton("reconnect", "Connect", new BMessage(kMsgNodeReconnect));
+		fNote = new BStringView("note", "");
+		fHubShare = new BCheckBox("hubshare", "Share this input with programs (hrecord's input hub)", new BMessage(kMsgHubToggle));
+		fHubMenu = new BPopUpMenu("hubmode");
+		const char* hubChoices[] = { "Stereo (both channels)", "Left channel", "Right channel" };
+		for (int i = 0; i < 3; i++)
+			fHubMenu->AddItem(new BMenuItem(hubChoices[i], new BMessage(kMsgHubMode)));
+		fHubMenu->ItemAt(0)->SetMarked(true);
+		fHubField = new BMenuField("hubfield", "Input it gets from hrecord:", fHubMenu);
+
+		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_SMALL_SPACING)
+			.SetInsets(8, 8, 8, 8)
+			.Add(fCanvas, 3.0f)
+			.Add(fTitle)
+			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
+				.Add(fHubShare)
+				.Add(fHubField)
+				.AddGlue()
+			.End()
+			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
+				.Add(fMixLabel)
+				.Add(fStereo)
+				.Add(fLeft)
+				.Add(fRight)
+				.Add(fTakeOff)
+				.Add(fPutBack)
+				.AddGlue()
+			.End()
+			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
+				.Add(connectionsScroll, 2.0f)
+				.AddGroup(B_VERTICAL, B_USE_SMALL_SPACING)
+					.Add(fDisconnect)
+					.Add(fReconnectField)
+					.Add(fReconnect)
+					.AddGlue()
+				.End()
+			.End()
+			.Add(fNote);
+		UpdatePanel();
+	}
+
+	void AttachedToWindow()
+	{
+		BView::AttachedToWindow();
+		fStereo->SetTarget(this);
+		fLeft->SetTarget(this);
+		fRight->SetTarget(this);
+		fTakeOff->SetTarget(this);
+		fPutBack->SetTarget(this);
+		fConnections->SetTarget(this);
+		fDisconnect->SetTarget(this);
+		fReconnect->SetTarget(this);
+		fHubShare->SetTarget(this);
+		fHubMenu->SetTargetForItems(this);
+		Rebuild();
+		BMessage tick(kMsgNodeRefresh);
+		fRunner = new BMessageRunner(this, &tick, 1000000);
+	}
+
+	void DetachedFromWindow()
+	{
+		delete fRunner;
+		fRunner = NULL;
+	}
+
+	// Is hrecord up (and so able to take sources into the mix, or off it)?
+	void SetEngineReady(bool ready)
+	{
+		fEngineReady = ready;
+		if (ready && fConfig->hubOn)
+			Send("hub 1\n");
+		if (!ready) {
+			fModes.clear();
+			fDetached.clear();
+			fHubSent.clear();
+		}
+		UpdatePanel();
+	}
+
+	const std::vector<GraphNode>& Nodes() const { return fNodes; }
+	const std::vector<GraphEdge>& Edges() const { return fEdges; }
+	int32 Selected() const { return fSelected; }
+	int Mode(media_node_id id) const
+	{
+		std::map<media_node_id, int>::const_iterator found = fModes.find(id);
+		return found != fModes.end() ? found->second : 0;
+	}
+
+	// For testing from the command line: the same as clicking the box with this name (and its L or R port).
+	void ClickByName(const char* name, int port)
+	{
+		for (size_t i = 0; i < fNodes.size(); i++) {
+			if (fNodes[i].name == name && !fNodes[i].sink) {
+				Clicked(fNodes[i].key, port);
+				return;
+			}
+		}
+	}
+
+	// A click on a box (or on the L or R port of an input device): what it does.
+	void Clicked(int32 key, int port)
+	{
+		fSelected = key;
+		fSelectedEdge = -1;
+		const GraphNode* node = Find(key);
+		if (node != NULL && node->device && !node->sink && port != 0 && fEngineReady) {
+			// the L or R port of an input device: record that channel of it, or stop
+			int mask = Mode(node->id) ^ (port == 1 ? 2 : 4);
+			ApplyRoute(*node, mask);
+		}
+		UpdatePanel();
+		fCanvas->Invalidate();
+	}
+
+	void MessageReceived(BMessage* message)
+	{
+		switch (message->what) {
+			case kMsgNodeRefresh:
+				if (IsHidden())
+					break;
+				Rebuild();
+				break;
+			case kMsgNodeRoute:
+			{
+				const GraphNode* node = Find(fSelected);
+				if (node != NULL) {
+					int mask = (fStereo->Value() == B_CONTROL_ON ? 1 : 0) | (fLeft->Value() == B_CONTROL_ON ? 2 : 0)
+						| (fRight->Value() == B_CONTROL_ON ? 4 : 0);
+					if (mask == 0 && !node->device) {
+						// a program with nothing ticked would leave the mix: that is what the button is for, not an unticked box
+						fNote->SetText("A program in the mix needs one of these ticked. Use \"Take off the mix\" to remove it.");
+						UpdatePanel();
+						break;
+					}
+					ApplyRoute(*node, mask);
+				}
+				break;
+			}
+			case kMsgNodeTakeOff:
+			{
+				const GraphNode* node = Find(fSelected);
+				if (node != NULL)
+					ApplyRoute(*node, 0);
+				break;
+			}
+			case kMsgNodePutBack:
+			{
+				const GraphNode* node = Find(fSelected);
+				if (node != NULL) {
+					Send("attach %d\n", (int)node->id);
+					fDetached.erase(node->id);
+					fModes[node->id] = 1;
+				}
+				break;
+			}
+			case kMsgHubToggle:
+			{
+				const bool on = fHubShare->Value() == B_CONTROL_ON;
+				fConfig->hubOn = on;
+				fConfig->Save();
+				if (fEngineReady)
+					Send("hub %d\n", on ? 1 : 0);
+				break;
+			}
+			case kMsgHubMode:
+			{
+				const GraphNode* node = Find(fSelected);
+				BMenuItem* marked = fHubMenu->FindMarked();
+				if (node != NULL && marked != NULL && fEngineReady) {
+					const int mode = fHubMenu->IndexOf(marked);
+					if (fHubSent.find(node->id) != fHubSent.end()) {
+						Send("hubmap %d %d\n", (int)node->id, mode);
+						fHubSent[node->id] = mode;
+					}
+					fConfig->hubModes[node->name] = mode;
+					fConfig->Save();
+				}
+				break;
+			}
+			case kMsgTestAction:
+			{
+				// for testing from the command line: what a click on a button (or on a row of the list) would do
+				const char* what = "";
+				message->FindString("what", &what);
+				if (strncmp(what, "edge", 4) == 0) {
+					fSelectedEdge = atoi(what + 4);
+					fConnections->Select(fSelectedEdge);
+					UpdatePanel();
+				} else if (strcmp(what, "takeoff") == 0)
+					MessageReceived(new BMessage(kMsgNodeTakeOff));
+				else if (strcmp(what, "putback") == 0)
+					MessageReceived(new BMessage(kMsgNodePutBack));
+				else if (strcmp(what, "disconnect") == 0)
+					DisconnectSelected();
+				else if (strcmp(what, "reconnect") == 0)
+					ReconnectSelected();
+				break;
+			}
+			case kMsgNodeSelectEdge:
+				fSelectedEdge = fConnections->CurrentSelection();
+				UpdatePanel();
+				break;
+			case kMsgNodeDisconnect:
+				DisconnectSelected();
+				break;
+			case kMsgNodeReconnect:
+				ReconnectSelected();
+				break;
+			default:
+				BView::MessageReceived(message);
+		}
+	}
+
+	// Looks at the Media Kit: which nodes there are, and what is connected to what.
+	void Rebuild()
+	{
+		BMediaRoster* roster = BMediaRoster::Roster();
+		if (roster == NULL)
+			return;
+		live_node_info infos[96];
+		int32 count = 96;
+		if (roster->GetLiveNodes(infos, &count) != B_OK)
+			return;
+
+		std::vector<GraphNode> nodes;
+		std::vector<GraphEdge> edges;
+		std::vector<FreeOutput> freeOutputs;
+		std::set<media_node_id> hrecordIds;
+		bool anyHrecord = false;
+		bool hubActive = false;
+		for (int32 i = 0; i < count; i++) {
+			if (strncmp(infos[i].name, "hrecord ", 8) == 0) {
+				hrecordIds.insert(infos[i].node.node);
+				anyHrecord = true;
+			}
+			if (strcmp(infos[i].name, "hrecord Input") == 0)
+				hubActive = true;
+		}
+		if (anyHrecord) {
+			GraphNode node;
+			node.key = kHrecordKey;
+			node.name = "hrecord";
+			node.hrecord = true;
+			nodes.push_back(node);
+		}
+		for (int32 i = 0; i < count; i++) {
+			const media_node& media = infos[i].node;
+			if (hrecordIds.count(media.node) != 0 || (media.kind & (B_BUFFER_PRODUCER | B_BUFFER_CONSUMER)) == 0)
+				continue;
+			const bool producer = (media.kind & B_BUFFER_PRODUCER) != 0;
+			const bool consumer = (media.kind & B_BUFFER_CONSUMER) != 0;
+			const bool physicalIn = (media.kind & B_PHYSICAL_INPUT) != 0;
+			const bool physicalOut = (media.kind & B_PHYSICAL_OUTPUT) != 0;
+			const bool mixer = (media.kind & B_SYSTEM_MIXER) != 0;
+			if (physicalIn) {
+				GraphNode node;
+				node.key = media.node;
+				node.id = media.node;
+				node.name = infos[i].name;
+				node.kind = media.kind;
+				node.device = true;
+				nodes.push_back(node);
+			}
+			if (physicalOut) {
+				GraphNode node;
+				node.key = media.node + kSinkOffset;
+				node.id = media.node;
+				node.name = infos[i].name;
+				node.kind = media.kind;
+				node.sink = true;
+				node.device = true;
+				nodes.push_back(node);
+			} else if (!physicalIn) {
+				GraphNode node;
+				node.key = media.node;
+				node.id = media.node;
+				node.name = infos[i].name;
+				node.kind = media.kind;
+				node.mixer = mixer;
+				node.app = producer && !consumer && !mixer;
+				nodes.push_back(node);
+			}
+			if (!producer)
+				continue;
+			media_output outputs[16];
+			int32 outputCount = 0;
+			if (strncmp(infos[i].name, "hrecord ", 8) != 0 && !mixer) {
+				int32 freeCount = 0;
+				if (roster->GetFreeOutputsFor(media, outputs, 16, &freeCount, B_MEDIA_RAW_AUDIO) == B_OK) {
+					for (int32 j = 0; j < freeCount; j++) {
+						FreeOutput freeOutput;
+						freeOutput.key = physicalOut && !physicalIn ? media.node + kSinkOffset : (int32)media.node;
+						freeOutput.output = outputs[j];
+						freeOutputs.push_back(freeOutput);
+					}
+				}
+			}
+			if (roster->GetConnectedOutputsFor(media, outputs, 16, &outputCount) != B_OK)
+				continue;
+			const bool fromHrecord = strncmp(infos[i].name, "hrecord ", 8) == 0;
+			for (int32 j = 0; j < outputCount; j++) {
+				media_node_id destination = roster->NodeIDFor(outputs[j].destination.port);
+				if (destination < 0)
+					continue;
+				GraphEdge edge;
+				edge.output = outputs[j];
+				edge.from = fromHrecord ? kHrecordKey : (int32)media.node;
+				edge.to = hrecordIds.count(destination) != 0 ? kHrecordKey : (int32)destination;
+				edge.throughHrecord = edge.to == kHrecordKey;
+				edges.push_back(edge);
+			}
+		}
+		// (the producers named "hrecord ..." are skipped above as boxes, but their connections are edges: redo them)
+		for (int32 i = 0; i < count; i++) {
+			if (strncmp(infos[i].name, "hrecord ", 8) != 0 || (infos[i].node.kind & B_BUFFER_PRODUCER) == 0)
+				continue;
+			media_output outputs[16];
+			int32 outputCount = 0;
+			if (roster->GetConnectedOutputsFor(infos[i].node, outputs, 16, &outputCount) != B_OK)
+				continue;
+			for (int32 j = 0; j < outputCount; j++) {
+				media_node_id destination = roster->NodeIDFor(outputs[j].destination.port);
+				if (destination < 0 || hrecordIds.count(destination) != 0)
+					continue;
+				GraphEdge edge;
+				edge.output = outputs[j];
+				edge.from = kHrecordKey;
+				edge.to = (int32)destination;
+				edges.push_back(edge);
+			}
+		}
+		// the output of the Mixer goes to the output half of the hardware
+		for (size_t e = 0; e < edges.size(); e++) {
+			for (size_t n = 0; n < nodes.size(); n++) {
+				if (nodes[n].sink && nodes[n].id == edges[e].to && edges[e].to < kSinkOffset)
+					edges[e].to = nodes[n].key;
+			}
+		}
+		fHubActive = hubActive;
+		Layout(nodes, edges);
+		// nothing to redraw (and the selection of a connection to keep) while it all is as it was
+		std::string signature;
+		for (size_t i = 0; i < nodes.size(); i++)
+			signature += nodes[i].name + "#" + std::to_string(nodes[i].key) + ";";
+		for (size_t i = 0; i < edges.size(); i++)
+			signature += std::to_string(edges[i].from) + ">" + std::to_string(edges[i].to) + ":" + std::to_string(edges[i].output.destination.id) + ";";
+		for (size_t i = 0; i < freeOutputs.size(); i++)
+			signature += "free" + std::to_string(freeOutputs[i].key) + ";";
+		if (signature == fSignature)
+			return;
+		fSignature = signature;
+		fSelectedEdge = -1;
+		fNodes = nodes;
+		fEdges = edges;
+		fFree = freeOutputs;
+		// programs that are fed by the input hub get the channel they were given the last time (by name)
+		for (size_t e = 0; e < fEdges.size(); e++) {
+			if (!IsHubEdge(fEdges[e]))
+				continue;
+			const GraphNode* node = Find(fEdges[e].to);
+			if (node == NULL || !fEngineReady || fHubSent.find(node->id) != fHubSent.end())
+				continue;
+			std::map<std::string, int>::const_iterator saved = fConfig->hubModes.find(node->name);
+			const int mode = saved != fConfig->hubModes.end() ? saved->second : 0;
+			if (mode != 0)
+				Send("hubmap %d %d\n", (int)node->id, mode);
+			fHubSent[node->id] = mode;
+		}
+		// programs that hrecord has tapped are in the mix as a stereo signal until told otherwise
+		for (size_t e = 0; e < fEdges.size(); e++) {
+			if (fEdges[e].throughHrecord && fEdges[e].from != kHrecordKey) {
+				const GraphNode* node = Find(fEdges[e].from);
+				if (node != NULL && node->app && fModes.find(node->id) == fModes.end())
+					fModes[node->id] = 1;
+			}
+		}
+		if (Find(fSelected) == NULL)
+			fSelected = 0;
+		UpdatePanel();
+		fCanvas->Invalidate();
+	}
+
+private:
+	const GraphNode* Find(int32 key) const
+	{
+		for (size_t i = 0; i < fNodes.size(); i++) {
+			if (fNodes[i].key == key)
+				return &fNodes[i];
+		}
+		return NULL;
+	}
+
+	void Send(const char* format, ...)
+	{
+		char text[160];
+		va_list list;
+		va_start(list, format);
+		vsnprintf(text, sizeof(text), format, list);
+		va_end(list);
+		BMessage message(kMsgNodeCommand);
+		message.AddString("text", text);
+		fWindow.SendMessage(&message);
+	}
+
+	// Columns by how far a box is from a source; the boxes of a column one under the other.
+	static void Layout(std::vector<GraphNode>& nodes, const std::vector<GraphEdge>& edges)
+	{
+		for (size_t i = 0; i < nodes.size(); i++)
+			nodes[i].level = 0;
+		for (size_t pass = 0; pass < nodes.size(); pass++) {
+			bool changed = false;
+			for (size_t e = 0; e < edges.size(); e++) {
+				int from = -1, to = -1;
+				for (size_t n = 0; n < nodes.size(); n++) {
+					if (nodes[n].key == edges[e].from) from = (int)n;
+					if (nodes[n].key == edges[e].to) to = (int)n;
+				}
+				if (from >= 0 && to >= 0 && nodes[to].level <= nodes[from].level && nodes[to].level < 6) {
+					nodes[to].level = nodes[from].level + 1;
+					changed = true;
+				}
+			}
+			if (!changed)
+				break;
+		}
+		std::map<int, int> rows;
+		const float width = 160, height = 46, gapX = 70, gapY = 14;
+		for (size_t i = 0; i < nodes.size(); i++) {
+			const int row = rows[nodes[i].level]++;
+			const float x = 16 + nodes[i].level * (width + gapX);
+			const float y = 14 + row * (height + gapY);
+			nodes[i].frame = BRect(x, y, x + width, y + height);
+		}
+	}
+
+	void ApplyRoute(const GraphNode& node, int mask)
+	{
+		if (!fEngineReady || node.id < 0)
+			return;
+		if (node.device) {
+			Send("hwin %d 0 %d %d %d\n", (int)node.id, (mask & 1) ? 1 : 0, (mask & 2) ? 1 : 0, (mask & 4) ? 1 : 0);
+		} else if (mask == 0) {
+			Send("detach %d\n", (int)node.id);
+			fDetached.insert(node.id);
+		} else {
+			Send("route %d %d %d %d\n", (int)node.id, (mask & 1) ? 1 : 0, (mask & 2) ? 1 : 0, (mask & 4) ? 1 : 0);
+		}
+		fModes[node.id] = mask;
+		UpdatePanel();
+	}
+
+	// What the box under the list is about: the controls for the selected box.
+	void UpdatePanel()
+	{
+		const GraphNode* node = Find(fSelected);
+		fConnections->SetSelectionMessage(NULL);		// (it is the list being rebuilt, not a click)
+		fConnections->MakeEmpty();
+		fRows.clear();
+		fReconnectMenu->RemoveItems(0, fReconnectMenu->CountItems(), true);
+		fNote->SetText(fEngineReady ? "" : "hrecord is not connected to the sources now: the mix cannot be changed here.");
+		bool route = false, takeOff = false, putBack = false, hubShare = false, hubInput = false;
+		if (node == NULL) {
+			fTitle->SetText("Select a box to see what can be done with it.");
+		} else {
+			BString title(node->name.c_str());
+			if (node->hrecord) title << " (hrecord's mix: the sources it has taken in, and its playback to the Mixer)";
+			else if (node->mixer) title << " (the System Mixer)";
+			else if (node->sink) title << " (output)";
+			else if (node->device) title << " (input: the L and R boxes on its right side switch a channel into the mix)";
+			else if (node->app) title << " (program)";
+			fTitle->SetText(title.String());
+			const bool tapped = IsTapped(node->key);
+			if (node->device && !node->sink) {
+				route = true;
+			} else if (node->app) {
+				if (tapped) {
+					route = true;
+					takeOff = true;
+				} else if (fDetached.count(node->id) != 0)
+					putBack = true;
+			}
+			if (node->device && !node->sink)
+				hubShare = true;
+			for (size_t e = 0; e < fEdges.size(); e++) {
+				if (IsHubEdge(fEdges[e]) && fEdges[e].to == node->key)
+					hubInput = true;
+			}
+			{
+				std::map<std::string, int>::const_iterator saved = fConfig->hubModes.find(node->name);
+				fHubMenu->ItemAt(saved != fConfig->hubModes.end() ? saved->second : 0)->SetMarked(true);
+			}
+			const int mask = Mode(node->id);
+			fStereo->SetValue((mask & 1) ? B_CONTROL_ON : B_CONTROL_OFF);
+			fLeft->SetValue((mask & 2) ? B_CONTROL_ON : B_CONTROL_OFF);
+			fRight->SetValue((mask & 4) ? B_CONTROL_ON : B_CONTROL_OFF);
+			for (size_t e = 0; e < fEdges.size(); e++) {
+				if (fEdges[e].from != node->key && fEdges[e].to != node->key)
+					continue;
+				const GraphNode* other = Find(fEdges[e].from == node->key ? fEdges[e].to : fEdges[e].from);
+				BString text(fEdges[e].from == node->key ? "to " : "from ");
+				text << (other != NULL ? other->name.c_str() : "?");
+				if (fEdges[e].output.format.type == B_MEDIA_RAW_AUDIO) {
+					text << "  (" << (int)fEdges[e].output.format.u.raw_audio.channel_count << " ch, "
+						<< (int)fEdges[e].output.format.u.raw_audio.frame_rate << " Hz)";
+				}
+				fConnections->AddItem(new BStringItem(text.String()));
+				fRows.push_back(std::make_pair(false, (int)e));
+			}
+			for (size_t f = 0; f < fFree.size(); f++) {
+				if (fFree[f].key != node->key)
+					continue;
+				fConnections->AddItem(new BStringItem("output: not connected"));
+				fRows.push_back(std::make_pair(true, (int)f));
+			}
+			// where the selected connection can go instead: a node with a free input
+			if (fSelectedEdge >= 0 && fSelectedEdge < (int)fRows.size()) {
+				fConnections->Select(fSelectedEdge);
+				FillReconnectMenu();
+			}
+		}
+		fConnections->SetSelectionMessage(new BMessage(kMsgNodeSelectEdge));
+		if (route) fMixLabel->Show(); else fMixLabel->Hide();
+		fHubShare->SetEnabled(fEngineReady);
+		fHubShare->SetValue(fHubActive ? B_CONTROL_ON : B_CONTROL_OFF);
+		fHubField->SetEnabled(fEngineReady && fHubActive && node != NULL && node->app);
+		fStereo->SetEnabled(route && fEngineReady);
+		fLeft->SetEnabled(route && fEngineReady);
+		fRight->SetEnabled(route && fEngineReady);
+		fTakeOff->SetEnabled(takeOff && fEngineReady);
+		fPutBack->SetEnabled(putBack && fEngineReady);
+		const bool haveEdge = fSelectedEdge >= 0 && fSelectedEdge < (int)fRows.size();
+		bool edgeOfHrecord = false, isFree = false;
+		if (haveEdge) {
+			isFree = fRows[fSelectedEdge].first;
+			if (!isFree)
+				edgeOfHrecord = fEdges[fRows[fSelectedEdge].second].from == kHrecordKey;
+		}
+		fDisconnect->SetEnabled(haveEdge && !edgeOfHrecord && !isFree);
+		fReconnectField->SetEnabled(haveEdge && !edgeOfHrecord && fReconnectMenu->CountItems() > 0);
+		fReconnect->SetEnabled(haveEdge && !edgeOfHrecord && fReconnectMenu->CountItems() > 0);
+	}
+
+	static bool IsHubEdge(const GraphEdge& edge)
+	{
+		return edge.from == kHrecordKey && strncmp(edge.output.name, "input", 5) == 0;
+	}
+
+	bool IsTapped(int32 key) const
+	{
+		for (size_t e = 0; e < fEdges.size(); e++) {
+			if (fEdges[e].from == key && fEdges[e].to == kHrecordKey)
+				return true;
+		}
+		return false;
+	}
+
+	void FillReconnectMenu()
+	{
+		BMediaRoster* roster = BMediaRoster::Roster();
+		if (roster == NULL)
+			return;
+		live_node_info infos[96];
+		int32 count = 96;
+		if (roster->GetLiveNodes(infos, &count, NULL, NULL, NULL, B_BUFFER_CONSUMER) != B_OK)
+			return;
+		for (int32 i = 0; i < count; i++) {
+			if (strncmp(infos[i].name, "hrecord ", 8) == 0)
+				continue;
+			media_input inputs[8];
+			int32 inputCount = 0;
+			if (roster->GetFreeInputsFor(infos[i].node, inputs, 8, &inputCount, B_MEDIA_RAW_AUDIO) != B_OK || inputCount < 1)
+				continue;
+			BMessage* message = new BMessage('rcn!');
+			message->AddInt32("node", infos[i].node.node);
+			BMenuItem* item = new BMenuItem(infos[i].name, message);
+			fReconnectMenu->AddItem(item);
+		}
+		fReconnectMenu->SetTargetForItems(this);
+		if (fReconnectMenu->CountItems() > 0)
+			fReconnectMenu->ItemAt(0)->SetMarked(true);
+	}
+
+	void DisconnectSelected()
+	{
+		if (fSelectedEdge < 0 || fSelectedEdge >= (int)fRows.size() || fRows[fSelectedEdge].first)
+			return;
+		const GraphEdge edge = fEdges[fRows[fSelectedEdge].second];
+		BMediaRoster* roster = BMediaRoster::Roster();
+		if (roster == NULL)
+			return;
+		const media_node_id destination = roster->NodeIDFor(edge.output.destination.port);
+		status_t error = roster->Disconnect(edge.output.node.node, edge.output.source, destination, edge.output.destination);
+		fNote->SetText(error == B_OK ? "Disconnected. Its output is in the list: connect it to another node there."
+			: "That connection could not be disconnected.");
+		fSignature = "";
+		Rebuild();
+	}
+
+	// Connects the selected output (a connection is disconnected first) to the node chosen in the menu.
+	void ReconnectSelected()
+	{
+		if (fSelectedEdge < 0 || fSelectedEdge >= (int)fRows.size())
+			return;
+		BMenuItem* marked = fReconnectMenu->FindMarked();
+		if (marked == NULL || marked->Message() == NULL)
+			return;
+		int32 target = 0;
+		if (marked->Message()->FindInt32("node", &target) != B_OK)
+			return;
+		const bool wasFree = fRows[fSelectedEdge].first;
+		media_output output = wasFree ? fFree[fRows[fSelectedEdge].second].output : fEdges[fRows[fSelectedEdge].second].output;
+		BMediaRoster* roster = BMediaRoster::Roster();
+		if (roster == NULL)
+			return;
+		media_node targetNode;
+		if (roster->GetNodeFor(target, &targetNode) != B_OK)
+			return;
+		media_input inputs[8];
+		int32 inputCount = 0;
+		if (roster->GetFreeInputsFor(targetNode, inputs, 8, &inputCount, B_MEDIA_RAW_AUDIO) != B_OK || inputCount < 1) {
+			roster->ReleaseNode(targetNode);
+			fNote->SetText("That node has no free input.");
+			return;
+		}
+		const media_destination oldDestination = output.destination;
+		media_output oldOutput = output;
+		if (!wasFree) {
+			const media_node_id oldNode = roster->NodeIDFor(output.destination.port);
+			roster->Disconnect(output.node.node, output.source, oldNode, output.destination);
+			snooze(100000);
+		}
+		media_format format = output.format;
+		media_output newOutput;
+		media_input newInput;
+		status_t error = roster->Connect(output.source, inputs[0].destination, &format, &newOutput, &newInput);
+		if (error != B_OK && !wasFree) {
+			// back where it was
+			format = oldOutput.format;
+			roster->Connect(oldOutput.source, oldDestination, &format, &newOutput, &newInput);
+			fNote->SetText("It could not be connected there; it is back where it was.");
+		} else if (error != B_OK)
+			fNote->SetText("It could not be connected there.");
+		else
+			fNote->SetText("Connected.");
+		roster->ReleaseNode(targetNode);
+		fSignature = "";
+		Rebuild();
+	}
+
+	BMessenger			fWindow;
+	StreamConfig*		fConfig;
+	bool				fHubActive;
+	std::map<media_node_id, int>	fHubSent;	// what each program was told to get from the hub
+	BCheckBox*			fHubShare;
+	BPopUpMenu*			fHubMenu;
+	BMenuField*			fHubField;
+	GraphCanvas*		fCanvas;
+	std::vector<GraphNode>	fNodes;
+	std::vector<GraphEdge>	fEdges;
+	std::vector<FreeOutput>	fFree;			// outputs of producers that are not connected to anything
+	std::vector<std::pair<bool, int> >	fRows;	// the rows of the list: (free output?, its index in fEdges or fFree)
+	std::string			fSignature;
+	std::map<media_node_id, int>	fModes;		// what is asked of the mix for a source: 1 stereo, 2 left, 4 right
+	std::set<media_node_id>	fDetached;
+	int32				fSelected;
+	int					fSelectedEdge;
+	bool				fEngineReady;
+	BMessageRunner*		fRunner;
+	BStringView*		fTitle;
+	BStringView*		fMixLabel;
+	BCheckBox*			fStereo;
+	BCheckBox*			fLeft;
+	BCheckBox*			fRight;
+	BButton*			fTakeOff;
+	BButton*			fPutBack;
+	BListView*			fConnections;
+	BButton*			fDisconnect;
+	BPopUpMenu*			fReconnectMenu;
+	BMenuField*			fReconnectField;
+	BButton*			fReconnect;
+	BStringView*		fNote;
+};
+
+
+GraphCanvas::GraphCanvas(NodesTab* tab)
+	:
+	BView("graph", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE),
+	fTab(tab)
+{
+	SetViewColor(B_TRANSPARENT_COLOR);
+}
+
+
+void
+GraphCanvas::Draw(BRect)
+{
+	const rgb_color panel = ui_color(B_PANEL_BACKGROUND_COLOR);
+	SetHighColor(tint_color(panel, B_LIGHTEN_1_TINT));
+	FillRect(Bounds());
+	SetHighColor(tint_color(panel, B_DARKEN_2_TINT));
+	StrokeRect(Bounds());
+
+	const std::vector<GraphNode>& nodes = fTab->Nodes();
+	const std::vector<GraphEdge>& edges = fTab->Edges();
+	SetPenSize(2.0f);
+	for (size_t e = 0; e < edges.size(); e++) {
+		const GraphNode* from = NULL;
+		const GraphNode* to = NULL;
+		for (size_t n = 0; n < nodes.size(); n++) {
+			if (nodes[n].key == edges[e].from) from = &nodes[n];
+			if (nodes[n].key == edges[e].to) to = &nodes[n];
+		}
+		if (from == NULL || to == NULL)
+			continue;
+		const bool viaHrecord = edges[e].throughHrecord || edges[e].from == kHrecordKey;
+		SetHighColor(viaHrecord ? make_color(60, 160, 80) : make_color(90, 90, 110));
+		BPoint start(from->frame.right, (from->frame.top + from->frame.bottom) / 2);
+		BPoint end(to->frame.left, (to->frame.top + to->frame.bottom) / 2);
+		StrokeLine(start, end);
+		FillEllipse(start, 3, 3);
+		FillEllipse(end, 3, 3);
+	}
+	SetPenSize(1.0f);
+
+	font_height fh;
+	be_plain_font->GetHeight(&fh);
+	for (size_t n = 0; n < nodes.size(); n++) {
+		const GraphNode& node = nodes[n];
+		rgb_color fill = make_color(225, 225, 235);
+		if (node.hrecord) fill = make_color(190, 230, 195);
+		else if (node.mixer) fill = make_color(245, 215, 170);
+		else if (node.sink) fill = make_color(215, 215, 215);
+		else if (node.device) fill = make_color(225, 205, 240);
+		else if (node.app) fill = make_color(200, 220, 245);
+		SetHighColor(fill);
+		FillRoundRect(node.frame, 6, 6);
+		SetHighColor(node.key == fTab->Selected() ? make_color(220, 60, 50) : make_color(70, 70, 90));
+		SetPenSize(node.key == fTab->Selected() ? 3.0f : 1.0f);
+		StrokeRoundRect(node.frame, 6, 6);
+		SetPenSize(1.0f);
+		SetHighColor(0, 0, 0);
+		BString label(node.name.c_str());
+		TruncateString(&label, B_TRUNCATE_END, node.frame.Width() - 12 - (node.device && !node.sink ? 22 : 0));
+		DrawString(label.String(), BPoint(node.frame.left + 6, node.frame.top + fh.ascent + 5));
+		if (node.device && !node.sink) {
+			// its left and right channel, as ports on its right side: filled when that channel is in the mix
+			const int mask = fTab->Mode(node.id);
+			for (int side = 0; side < 2; side++) {
+				BRect port(node.frame.right - 20, node.frame.top + 4 + side * 18, node.frame.right - 4, node.frame.top + 18 + side * 18);
+				SetHighColor(((side == 0 && (mask & 2)) || (side == 1 && (mask & 4))) ? make_color(60, 160, 80) : make_color(250, 250, 250));
+				FillRect(port);
+				SetHighColor(70, 70, 90);
+				StrokeRect(port);
+				SetHighColor(0, 0, 0);
+				DrawString(side == 0 ? "L" : "R", BPoint(port.left + 4, port.bottom - 3));
+			}
+		}
+		if (node.hrecord || node.app) {
+			SetHighColor(90, 90, 110);
+			const char* sub = node.hrecord ? "the mix" : "program";
+			DrawString(sub, BPoint(node.frame.left + 6, node.frame.bottom - 6));
+		}
+	}
+	if (nodes.empty()) {
+		SetHighColor(0, 0, 0);
+		DrawString("No nodes to show.", BPoint(16, 24));
+	}
+}
+
+
+void
+GraphCanvas::MouseDown(BPoint where)
+{
+	const std::vector<GraphNode>& nodes = fTab->Nodes();
+	for (size_t n = 0; n < nodes.size(); n++) {
+		if (!nodes[n].frame.Contains(where))
+			continue;
+		int port = 0;
+		if (nodes[n].device && !nodes[n].sink && where.x >= nodes[n].frame.right - 22) {
+			const float mid = nodes[n].frame.top + 4 + 15;
+			port = where.y < mid ? 1 : 2;
+		}
+		fTab->Clicked(nodes[n].key, port);
+		return;
+	}
+	fTab->Clicked(0, 0);
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
 // The window
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -930,7 +1847,7 @@ public:
 		fQualityMenu->AddItem(new BMenuItem("Low", NULL));
 		fQualityMenu->AddItem(new BMenuItem("Medium", NULL));
 		fQualityMenu->AddItem(new BMenuItem("High", NULL));
-		fQualityMenu->ItemAt(1)->SetMarked(true);
+		fQualityMenu->ItemAt(2)->SetMarked(true);		// High: the default
 		fQuality = new BMenuField("quality", "Screen quality:", fQualityMenu);
 		fTime = new BStringView("time", "00:00");
 		BFont big;
@@ -942,7 +1859,7 @@ public:
 		fStripsGroup->SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
 		BGroupLayout* stripsLayout = new BGroupLayout(B_HORIZONTAL, 6);
 		fStripsGroup->SetLayout(stripsLayout);
-		fHint = new BStringView("hint", "Start playing sound in the programs to record, then press Record. Each one gets a strip; programs that start later join by themselves.");
+		fHint = new BStringView("hint", "Every program that plays sound is connected automatically and gets a strip here, as soon as it starts. Press Record to record.");
 		stripsLayout->AddView(fHint);
 		stripsLayout->AddItem(BSpaceLayoutItem::CreateGlue());
 
@@ -994,11 +1911,15 @@ public:
 		fLog = new BTextView("log");
 		fLog->MakeEditable(false);
 		fLog->SetWordWrap(true);
+		fShowLog = new BCheckBox("showlog", "Show log", new BMessage(kMsgShowLog));
+		fShowLog->SetValue(fStreamConfig.showLog ? B_CONTROL_ON : B_CONTROL_OFF);
 		BScrollView* logScroll = new BScrollView("logscroll", fLog, 0, false, true);
+		fLogScroll = logScroll;
 		logScroll->SetExplicitMinSize(BSize(200, 70));
 		logScroll->SetExplicitPreferredSize(BSize(400, 90));
 
-		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
+		BView* mainTab = new BView("Main", 0);
+		BLayoutBuilder::Group<>(mainTab, B_VERTICAL, B_USE_DEFAULT_SPACING)
 			.SetInsets(B_USE_WINDOW_INSETS)
 			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
 				.Add(fRecord)
@@ -1017,24 +1938,43 @@ public:
 				.Add(fStripsGroup, 3.0f)
 				.Add(master, 1.0f)
 			.End()
-			.Add(fStatus)
+			.AddGroup(B_HORIZONTAL)
+				.Add(fStatus)
+				.AddGlue()
+				.Add(fShowLog)
+			.End()
 			.Add(logScroll);
+
+		// two tabs: the mixer, and the nodes that make sound and how they are connected
+		fNodes = new NodesTab(BMessenger(this), &fStreamConfig);
+		fTabs = new BTabView("tabs", B_WIDTH_FROM_LABEL);
+		fTabs->AddTab(mainTab);
+		fTabs->AddTab(fNodes);
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+			.SetInsets(0, 0, 0, 0)
+			.Add(fTabs);
 
 		RefreshRealtime();
 		RefreshStream();
+		if (!fStreamConfig.showLog)
+			fLogScroll->Hide();
+		PostMessage(kMsgStartEngine);
 	}
 
 	bool QuitRequested()
 	{
-		if (fEngine.Running()) {
+		if (fRecording) {
 			BAlert* alert = new BAlert("quit", "A recording is running. Stop it and quit?", "Cancel", "Stop and quit", NULL,
 				B_WIDTH_AS_USUAL, B_WARNING_ALERT);
 			alert->SetShortcut(0, B_ESCAPE);
 			if (alert->Go() != 1)
 				return false;
+		}
+		if (fEngine.Running()) {
+			// hrecord ends the recording (if there is one) and puts every program back on the Mixer, which takes a moment
+			fQuitting = true;
 			fEngine.Stop();
-			// give hrecord the time to finish its file
-			for (int i = 0; i < 100 && !fEngine.HasEnded(); i++)
+			for (int i = 0; i < 200 && !fEngine.HasEnded(); i++)
 				snooze(100000);
 			fEngine.KillNow();
 		}
@@ -1045,6 +1985,56 @@ public:
 	void MessageReceived(BMessage* message)
 	{
 		switch (message->what) {
+			case kMsgShowLog:
+			{
+				// the window gives back or takes the room the log has
+				const bool show = fShowLog->Value() == B_CONTROL_ON;
+				fStreamConfig.showLog = show;
+				fStreamConfig.Save();
+				if (show != !fLogScroll->IsHidden()) {
+					if (show) {
+						fLogScroll->Show();
+						ResizeBy(0, fLogHeight);
+					} else {
+						fLogHeight = fLogScroll->Frame().Height() + 10;
+						fLogScroll->Hide();
+						ResizeBy(0, -fLogHeight);
+					}
+				}
+				break;
+			}
+			case kMsgShowNodes:
+				fTabs->Select(1);
+				break;
+			case kMsgTestAction:
+			{
+				const char* what = "";
+				message->FindString("what", &what);
+				if (strcmp(what, "main") == 0)
+					fTabs->Select(0);
+				else
+					fNodes->MessageReceived(message);
+				break;
+			}
+			case kMsgTestClick:
+			{
+				const char* name;
+				int32 port = 0;
+				message->FindInt32("port", &port);
+				if (message->FindString("name", &name) == B_OK)
+					fNodes->ClickByName(name, (int)port);
+				break;
+			}
+			case kMsgNodeCommand:
+			{
+				const char* text;
+				if (message->FindString("text", &text) == B_OK)
+					SendCommand("%s", text);
+				break;
+			}
+			case kMsgStartEngine:
+				StartEngine();
+				break;
 			case kMsgRecord:
 				StartRecording();
 				break;
@@ -1244,11 +2234,49 @@ private:
 		fScreen->SetEnabled(idle && !streaming);
 	}
 
-	void StartRecording()
+	// hrecord runs as long as this window is open: it connects to every audio source at once, so that the levels show and a
+	// recording starts at once, and it puts the programs back on the Mixer when it ends.
+	void StartEngine()
 	{
 		if (fEngine.Running())
 			return;
 		RefreshRealtime();
+		RefreshStream();
+		std::vector<std::string> arguments;
+		arguments.push_back("start");
+		arguments.push_back("--allaudio");
+		arguments.push_back("--standby");
+		arguments.push_back("--meter");
+		arguments.push_back("--meter-ms");
+		arguments.push_back("70");
+		arguments.push_back("--control");
+		if (fRealtime->IsEnabled() && fRealtime->Value() == B_CONTROL_ON)
+			arguments.push_back("--realtime");
+		std::string error;
+		if (!fEngine.Start(arguments, BMessenger(this), error)) {
+			SetStatus(error.c_str());
+			return;
+		}
+		fEngineReady = false;
+		SetStatus("Connecting to the audio sources...");
+		// what is set in the window goes to hrecord as soon as it runs
+		SendCommand("mixgain %.1f\n", fMixGain->Db());
+		SendCommand("ceiling %.1f\n", fCeiling->Db());
+		SendCommand("release %d\n", (int)fRelease->Value());
+		SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
+	}
+
+	void StartRecording()
+	{
+		if (fRecording)
+			return;
+		if (!fEngine.Running() || !fEngineReady) {
+			// hrecord is not up (yet): start it, and the recording starts as soon as it is
+			fRecordAfterReady = true;
+			StartEngine();
+			return;
+		}
+		fRecordAfterReady = false;
 		RefreshStream();
 		const bool streaming = fStream->IsEnabled() && fStream->Value() == B_CONTROL_ON;
 		if (streaming) {
@@ -1258,51 +2286,14 @@ private:
 				(new StreamSettingsWindow(BMessenger(this), fStreamConfig))->Show();
 				return;
 			}
-		}
-		ClearStrips();
-		std::vector<std::string> arguments;
-		arguments.push_back("start");
-		if (fScreen->Value() != B_CONTROL_ON && !streaming)
-			arguments.push_back("--audioonly");
-		arguments.push_back("--allaudio");
-		arguments.push_back("--meter");
-		arguments.push_back("--meter-ms");
-		arguments.push_back("70");
-		arguments.push_back("--control");
-		if (fRealtime->IsEnabled() && fRealtime->Value() == B_CONTROL_ON)
-			arguments.push_back("--realtime");
-		if (streaming) {
-			// the address holds the stream key, so it goes to hrecord in its environment, not on the command line
-			arguments.push_back("--stream-env");
-			arguments.push_back("--stream-bitrate");
-			arguments.push_back(std::to_string(fStreamConfig.videoKbps));
-			arguments.push_back("--stream-audio-bitrate");
-			arguments.push_back(std::to_string(fStreamConfig.audioKbps));
-			arguments.push_back("--stream-preset");
-			arguments.push_back(kStreamPresets[fStreamConfig.preset]);
-			arguments.push_back("--stream-keyint");
-			arguments.push_back(std::to_string(fStreamConfig.keyintSeconds));
-		}
-		if (fScreen->Value() == B_CONTROL_ON || streaming) {
-			BMenuItem* marked = fQualityMenu->FindMarked();
-			int32 index = marked != NULL ? fQualityMenu->IndexOf(marked) : 1;
-			arguments.push_back(index == 0 ? "--low" : (index == 2 ? "--high" : "--medium"));
-		}
-		// what is set in the window now goes to the engine as soon as it runs
-		fPendingMixGain = fMixGain->Db();
-		fPendingCeiling = fCeiling->Db();
-		fPendingRelease = (int)fRelease->Value();
-		fPendingLimiter = fLimiter->Value() == B_CONTROL_ON;
+			SendCommand("stream %d %d %s %d %s\n", fStreamConfig.videoKbps, fStreamConfig.audioKbps,
+				kStreamPresets[fStreamConfig.preset], fStreamConfig.keyintSeconds, fStreamConfig.Url().c_str());
+		} else
+			SendCommand("nostream\n");
+		BMenuItem* marked = fQualityMenu->FindMarked();
+		const int quality = marked != NULL ? fQualityMenu->IndexOf(marked) : 2;
+		SendCommand("record %d %d\n", (fScreen->Value() == B_CONTROL_ON || streaming) ? 1 : 0, (int)quality);
 
-		std::string error;
-		if (streaming)
-			setenv("HRECORD_STREAM_URL", fStreamConfig.Url().c_str(), 1);
-		const bool started = fEngine.Start(arguments, BMessenger(this), error);
-		unsetenv("HRECORD_STREAM_URL");
-		if (!started) {
-			SetStatus(error.c_str());
-			return;
-		}
 		fStreamingNow = false;
 		fRecording = true;
 		fStopping = false;
@@ -1317,55 +2308,80 @@ private:
 		fRealtime->SetEnabled(false);
 		fStream->SetEnabled(false);
 		fStreamSettings->SetEnabled(false);
-		SetStatus("Starting hrecord...");
+		fQuality->SetEnabled(false);
+		SetStatus("Starting the recording...");
 		fOutputFile = "";
+		fLastError = "";
 		Log("-- recording started --");
-		SendCommand("mixgain %.1f\n", fPendingMixGain);
-		SendCommand("ceiling %.1f\n", fPendingCeiling);
-		SendCommand("release %d\n", fPendingRelease);
-		SendCommand("limiter %d\n", fPendingLimiter ? 1 : 0);
 	}
 
 	void StopRecording()
 	{
-		if (!fEngine.Running() || fStopping)
+		if (!fRecording || fStopping)
 			return;
 		fStopping = true;
 		fStop->SetEnabled(false);
 		SetStatus("Stopping: finishing the file...");
-		fEngine.Stop();
+		SendCommand("stoprecord\n");
 	}
 
-	void EngineExited()
+	// The recording is over (hrecord goes on, connected to the sources).
+	void RecordingEnded()
 	{
-		fEngine.Finished();
 		fRecording = false;
 		fStopping = false;
+		fStreamingNow = false;
 		delete fTick;
 		fTick = NULL;
 		fRecord->SetEnabled(true);
 		fStop->SetEnabled(false);
+		fQuality->SetEnabled(true);
 		RefreshRealtime();
 		RefreshStream();
-		for (size_t i = 0; i < fStrips.size(); i++)
-			fStrips[i]->SetLevels(kMeterMin, kMeterMin);
-		fPreMeter->SetLevels(kMeterMin, kMeterMin);
-		fPostMeter->SetLevels(kMeterMin, kMeterMin);
-		fReduction->SetLevel(0.0f);
 		if (fOutputFile.length() > 0) {
 			BString text("Saved: ");
 			text << fOutputFile.c_str();
 			SetStatus(text.String());
+		} else if (fLastError.length() > 0) {
+			// it ended without a file: say why (a stream that could not be reached, for one), not only "Stopped."
+			SetStatus(fLastError.c_str());
+			BString text("The recording could not start:\n\n");
+			text << fLastError.c_str();
+			(new BAlert("error", text.String(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT))->Go(NULL);
 		} else
 			SetStatus("Stopped.");
 		Log("-- recording ended --");
 	}
 
+	// hrecord itself has ended: at the end of this window, or unexpectedly.
+	void EngineExited()
+	{
+		fEngine.Finished();
+		fEngineReady = false;
+		fNodes->SetEngineReady(false);
+		const bool wasRecording = fRecording;
+		if (fRecording)
+			RecordingEnded();
+		ClearStrips();
+		fPreMeter->SetLevels(kMeterMin, kMeterMin);
+		fPostMeter->SetLevels(kMeterMin, kMeterMin);
+		fReduction->SetLevel(0.0f);
+		fRecord->SetEnabled(true);
+		fStop->SetEnabled(false);
+		RefreshRealtime();
+		RefreshStream();
+		if (!fQuitting) {
+			SetStatus(wasRecording ? "hrecord stopped unexpectedly; the recording was ended."
+				: "hrecord stopped. Press Record to connect again.");
+			Log("-- hrecord ended --");
+		}
+	}
+
 	// One line of what hrecord printed.
 	void HandleLine(const char* line)
 	{
-		if (strncmp(line, "[meter] #", 9) == 0) {
-			UpdateMeters(line);
+		if (strncmp(line, "[meter]", 7) == 0 && strstr(line, "Summary") == NULL && strstr(line, "| mix before") != NULL) {
+			UpdateMeters(line);		// (the line has no "#n" at all when no source is connected)
 			return;
 		}
 		int number = 0;
@@ -1393,13 +2409,33 @@ private:
 		}
 		if (strstr(line, "[+] Streaming to ") != NULL)
 			fStreamingNow = true;
-		if (strstr(line, "[+] Tapped ") != NULL && strstr(line, "currently-playing") != NULL)
+		if (strstr(line, "[+] Standby:") != NULL) {
+			fEngineReady = true;
+			fNodes->SetEngineReady(true);
+			SetStatus("Ready: every audio source is connected.");
+			if (fRecordAfterReady) {
+				Log(line);
+				StartRecording();
+				return;
+			}
+		}
+		if (strstr(line, "Recording Started!") != NULL) {
+			fSeconds = 0;
+			ShowTime();
 			SetStatus(fStreamingNow ? "Live: streaming and recording." : "Recording.");
+		}
+		if (strstr(line, "[+] Recording ended") != NULL) {
+			Log(line);
+			RecordingEnded();
+			return;
+		}
 		if (strstr(line, "[meter]") != NULL || strstr(line, "    ") == line)
 			; // the summary lines go to the log too
 		Log(line);
-		if (strncmp(line, "[-] Error", 9) == 0)
+		if (strncmp(line, "[-] Error", 9) == 0) {
+			fLastError = line + 4;		// without the "[-] "
 			SetStatus(line);
+		}
 	}
 
 	// "[meter] #1 -0.9 -3.0 #2 -3.2 -3.2 | mix before 3.5 3.1 after -1.0 -1.0 dBFS | limiter -4.5 dB"
@@ -1441,12 +2477,24 @@ private:
 				return;
 		}
 		BGroupLayout* layout = (BGroupLayout*)fStripsGroup->GetLayout();
-		if (!fHint->IsHidden())
-			fHint->Hide();
+		ShowHint(false);
 		SourceStrip* strip = new SourceStrip(index, name);
 		// before the glue at the end
 		layout->AddView(layout->CountItems() - 1, strip);
 		fStrips.push_back(strip);
+	}
+
+	// The text in the strips' place while there is no strip. (Hide and Show count, and IsHidden() is true as well while the whole
+	// tab is out of sight, so what is shown is kept here.)
+	void ShowHint(bool show)
+	{
+		if (show == fHintVisible)
+			return;
+		fHintVisible = show;
+		if (show)
+			fHint->Show();
+		else
+			fHint->Hide();
 	}
 
 	void RemoveStrip(int index)
@@ -1459,10 +2507,9 @@ private:
 			fStrips.erase(fStrips.begin() + i);
 			break;
 		}
-		if (fStrips.empty() && fRecording) {
+		if (fStrips.empty() && fEngineReady) {
 			fHint->SetText("No source is playing now. A program that starts playing joins the recording by itself.");
-			if (fHint->IsHidden())
-				fHint->Show();
+			ShowHint(true);
 		}
 	}
 
@@ -1473,9 +2520,8 @@ private:
 			delete fStrips[i];
 		}
 		fStrips.clear();
-		fHint->SetText("Start playing sound in the programs to record, then press Record. Each one gets a strip; programs that start later join by themselves.");
-		if (fHint->IsHidden())
-			fHint->Show();
+		fHint->SetText("Every program that plays sound is connected automatically and gets a strip here, as soon as it starts. Press Record to record.");
+		ShowHint(true);
 	}
 
 	void ShowTime()
@@ -1497,6 +2543,16 @@ private:
 
 	Engine				fEngine;
 	bool				fRecording;
+	bool				fHintVisible = true;
+	BTabView*			fTabs;
+	NodesTab*			fNodes;
+	BCheckBox*			fShowLog;
+	BScrollView*		fLogScroll;
+	float				fLogHeight = 100;
+	bool				fEngineReady = false;		// hrecord is connected to the sources
+	bool				fRecordAfterReady = false;	// Record was pressed before it was
+	bool				fQuitting = false;
+	std::string			fLastError;				// the last error hrecord reported since the recording began
 	bool				fStopping;
 	int					fSeconds;
 	BMessageRunner*		fTick;
@@ -1527,15 +2583,12 @@ private:
 	BStringView*		fStatus;
 	BTextView*			fLog;
 	std::string			fOutputFile;
-	float				fPendingMixGain, fPendingCeiling;
-	int					fPendingRelease;
-	bool				fPendingLimiter;
 };
 
 
 class MixerApp : public BApplication {
 public:
-	MixerApp() : BApplication(kAppSignature), fAutoRecord(false), fShowStream(false), fToggleStream(false) {}
+	MixerApp() : BApplication(kAppSignature), fAutoRecord(false), fShowStream(false), fToggleStream(false), fShowNodes(false) {}
 
 	// "hrecord_mixer --record" starts recording as soon as the window is open.
 	void ArgvReceived(int32 argc, char** argv)
@@ -1547,6 +2600,12 @@ public:
 				fShowStream = true;
 			else if (strcmp(argv[i], "--stream-toggle") == 0)
 				fToggleStream = true;
+			else if (strcmp(argv[i], "--nodes") == 0)
+				fShowNodes = true;
+			else if (strcmp(argv[i], "--click") == 0 && i + 1 < argc)
+				fClicks.push_back(argv[++i]);
+			else if (strcmp(argv[i], "--do") == 0 && i + 1 < argc)
+				fClicks.push_back(std::string("do:") + argv[++i]);
 		}
 	}
 
@@ -1560,12 +2619,29 @@ public:
 			window->PostMessage(kMsgStreamConfigure);
 		if (fToggleStream)
 			window->PostMessage(kMsgStreamToggle);
+		if (fShowNodes)
+			window->PostMessage(kMsgShowNodes);
+		// (for testing: "--click Name:port" clicks a box of the Nodes tab, a little later each)
+		for (size_t i = 0; i < fClicks.size(); i++) {
+			BMessage click(kMsgTestClick);
+			if (fClicks[i].compare(0, 3, "do:") == 0) {
+				click.what = kMsgTestAction;
+				click.AddString("what", fClicks[i].c_str() + 3);
+			} else {
+				const size_t colon = fClicks[i].rfind(':');
+				click.AddString("name", fClicks[i].substr(0, colon).c_str());
+				click.AddInt32("port", colon == std::string::npos ? 0 : atoi(fClicks[i].substr(colon + 1).c_str()));
+			}
+			new BMessageRunner(BMessenger(window), &click, 1000000 + (bigtime_t)i * 1500000, 1);
+		}
 	}
 
 private:
 	bool	fAutoRecord;
 	bool	fShowStream;
 	bool	fToggleStream;
+	bool	fShowNodes;
+	std::vector<std::string>	fClicks;
 };
 
 
