@@ -587,6 +587,15 @@ std::atomic<const uint8_t*> g_directDesktopOrigin(nullptr);
 std::atomic<uint32_t> g_directBytesPerRow(0);
 std::atomic<int> g_directBytesPerPixel(0);
 
+// The direct pointer is only read while the geometry it goes with cannot change under the reader: the capture loop counts itself in
+// g_directReaders around each read, and DirectConnected() (which app_server calls again whenever the buffer or the screen mode
+// changes) first switches the pointer off and waits for the readers to leave before it publishes anything. g_directGeneration is
+// raised by every such call; the capture loop notes the one it has checked the screen size against (g_captureGeneration), and a
+// read is only made while the two agree, so a buffer that changed in the middle of a frame is never read with the old size.
+std::atomic<uint32_t> g_directGeneration(0);
+std::atomic<int> g_directReaders(0);
+uint32_t g_captureGeneration = 0;     // written and read by the capture loop only
+
 // --direct-raw-capture: --raw-capture's own one-read-per-frame shape (no
 // tiling), through the same verified-safe direct pointer
 // --direct-tiled-capture uses. Real --logfps numbers on real hardware
@@ -628,8 +637,14 @@ bool g_directRawCapture = false;
 // BScreen-based tile read instead of one direct-pointer read" -- a
 // visible but brief slowdown during the switch, never a crash.
 static void UpdateDirectCaptureGeometry(const direct_buffer_info& info, int mode) {
+    // Whatever this call brings, the old geometry is no longer to be trusted: switch it off and wait until a read that is in
+    // progress has finished (app_server expects the old buffer to be left alone by the time this returns).
+    g_directCaptureVerified.store(false);
+    for (int waited = 0; g_directReaders.load() > 0 && waited < 20000; waited++)
+        snooze(50);
+    g_directGeneration.fetch_add(1);
+
     if (mode == B_DIRECT_STOP) {
-        g_directCaptureVerified.store(false, std::memory_order_relaxed);
         return;
     }
 
@@ -1118,7 +1133,9 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     // any time, including mid-frame -- see g_directCaptureVerified's own
     // comment for the real crash, after a workspace switch, that not
     // having this cost the project).
-    if (g_directCaptureVerified.load(std::memory_order_acquire)) {
+    // (the read is announced first and the flags looked at after: DirectConnected() clears the flag and then waits for readers)
+    g_directReaders.fetch_add(1);
+    if (g_directCaptureVerified.load() && g_directGeneration.load() == g_captureGeneration) {
         // --direct-tiled-capture/--direct-raw-capture, verified safe by
         // SetupDirectCapture(): a raw read straight from the framebuffer
         // pointer, no app_server IPC call at all. srcX/srcY are multiplied
@@ -1133,15 +1150,19 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
         const uint8_t* origin = g_directDesktopOrigin.load(std::memory_order_relaxed);
         uint32_t bytesPerRow = g_directBytesPerRow.load(std::memory_order_relaxed);
         int bytesPerPixel = g_directBytesPerPixel.load(std::memory_order_relaxed);
-        const uint8_t* srcRow = origin
-            + (size_t)srcY * bytesPerRow + (size_t)srcX * bytesPerPixel;
-        for (int row = srcY; row < srcBottom; row++) {
-            FastFramebufferCopy(dstRow, srcRow, rowBytes);
-            srcRow += bytesPerRow;
-            dstRow += dstStride;
+        if (bytesPerPixel > 0 && (uint64_t)nativeWidth * bytesPerPixel <= bytesPerRow) {
+            const uint8_t* srcRow = origin
+                + (size_t)srcY * bytesPerRow + (size_t)srcX * bytesPerPixel;
+            for (int row = srcY; row < srcBottom; row++) {
+                FastFramebufferCopy(dstRow, srcRow, rowBytes);
+                srcRow += bytesPerRow;
+                dstRow += dstStride;
+            }
+            g_directReaders.fetch_sub(1);
+            return;
         }
-        return;
     }
+    g_directReaders.fetch_sub(1);
 
     BRect captureRect(srcX, srcY, srcRight - 1, srcBottom - 1);
     BBitmap* regionBitmap = nullptr;
@@ -1151,8 +1172,15 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     uint8_t* srcRow = (uint8_t*)regionBitmap->Bits();
     int srcStride = (int)regionBitmap->BytesPerRow();
 
-    for (int row = srcY; row < srcBottom; row++) {
-        memcpy(dstRow, srcRow, rowBytes);
+    // The part of the rectangle that is on the screen: when the desktop has just got smaller (the resolution was changed while
+    // recording) app_server hands back less than was asked for, and copying the whole rectangle would read past the bitmap.
+    int gotWidth = (int)regionBitmap->Bounds().IntegerWidth() + 1;
+    int gotHeight = (int)regionBitmap->Bounds().IntegerHeight() + 1;
+    int copyBytes = std::min(rowBytes, gotWidth * 4);
+    int copyBottom = std::min(srcBottom, srcY + gotHeight);
+
+    for (int row = srcY; row < copyBottom; row++) {
+        memcpy(dstRow, srcRow, copyBytes);
         srcRow += srcStride;
         dstRow += dstStride;
     }
@@ -1276,6 +1304,9 @@ static bool RefreshScreenTileIfChanged(BRect tileRectNative, BScreen& screen,
         return false;
 
     int rowBytes = (srcRight - srcX) * 4; // BGRA/RGB32 -- 4 bytes per pixel
+    // (less comes back when the desktop has got smaller since the capture began)
+    rowBytes = std::min(rowBytes, ((int)tileBitmap->Bounds().IntegerWidth() + 1) * 4);
+    srcBottom = std::min(srcBottom, srcY + (int)tileBitmap->Bounds().IntegerHeight() + 1);
     int newStride = (int)tileBitmap->BytesPerRow();
     int cachedStride = (int)screenBitmap->BytesPerRow();
     uint8_t* cachedBase = (uint8_t*)screenBitmap->Bits()
@@ -4711,6 +4742,13 @@ static int RunRecording(const RecordingSetup& setup) {
     } else {
         int frameDelay = 1000000 / profile.fps; // microseconds per frame at this profile's fps
 
+        // The size of the video is fixed when the recording begins. If the desktop changes its resolution meanwhile, the capture
+        // bitmap is made again for the new size and the picture is scaled to fit inside the video (with black bars where the
+        // proportions differ): dst* is where in the video frame the screen goes (all of it, until the size changes).
+        int dstW = outWidth, dstH = outHeight;
+        uint8_t* dstData[4] = { encodingFrame->data[0], encodingFrame->data[1], encodingFrame->data[2], encodingFrame->data[3] };
+        bigtime_t lastResolutionCheck = system_time();
+
         // --logfps diagnostics: how many frames actually got written each
         // wall-clock second, versus this profile's own target, plus how many
         // of those took longer than frameDelay to produce (i.e. genuinely
@@ -4748,6 +4786,63 @@ static int RunRecording(const RecordingSetup& setup) {
                                         // capture-mode branch actually sends a
                                         // frame to the encoder this iteration
             bigtime_t captureElapsed = 0; // --logfps: see its declaration above the loop
+
+            // Has the desktop changed its resolution? Looked at a few times a second, and at once when app_server has told the
+            // direct window that its buffer changed (the direct pointer is not read until this has been settled).
+            uint32_t directGeneration = g_directGeneration.load();
+            bool directChanged = directGeneration != g_captureGeneration;
+            if (directChanged || loopIterationStart - lastResolutionCheck >= 200000) {
+                lastResolutionCheck = loopIterationStart;
+                BRect nowFrame = screen.Frame();
+                if (nowFrame.IsValid() && (nowFrame.IntegerWidth() != screenFrame.IntegerWidth()
+                        || nowFrame.IntegerHeight() != screenFrame.IntegerHeight())) {
+                    // The size changed without the direct window being told: its pointer is the one of the old mode.
+                    if (!directChanged)
+                        g_directCaptureVerified.store(false);
+
+                    BBitmap* newBitmap = new BBitmap(nowFrame, screen.ColorSpace());
+                    if (newBitmap->InitCheck() != B_OK) {
+                        std::cerr << "[-] The screen changed size and the capture bitmap could not be made again; "
+                            "stopping the recording." << std::endl;
+                        delete newBitmap;
+                        g_running = false;
+                        break;
+                    }
+                    delete screenBitmap;
+                    screenBitmap = newBitmap;
+                    screenFrame = nowFrame;
+                    width = screenFrame.IntegerWidth() + 1;
+                    height = screenFrame.IntegerHeight() + 1;
+
+                    // everything that remembered the old screen starts over
+                    backgroundNeedsRebuild = true;
+                    lastTrackedWindows.clear();
+                    rcserverNextTile = 0;
+                    rcserverNeedsSeed = true;
+                    rcserverFallbackFramesRemaining = 0;
+                    g_lastCursorPos = BPoint(-1, -1);
+
+                    // fit the screen into the (unchanged) size of the video, keeping its proportions
+                    double scale = std::min((double)outWidth / width, (double)outHeight / height);
+                    dstW = std::max(2, (int)(width * scale) & ~1);
+                    dstH = std::max(2, (int)(height * scale) & ~1);
+                    int dstX = ((outWidth - dstW) / 2) & ~1;
+                    int dstY = ((outHeight - dstH) / 2) & ~1;
+                    // black bars (full-range YUV: Y 0, U and V 128), then the scaled picture goes on top of them
+                    memset(encodingFrame->data[0], 0, (size_t)encodingFrame->linesize[0] * outHeight);
+                    memset(encodingFrame->data[1], 128, (size_t)encodingFrame->linesize[1] * (outHeight / 2));
+                    memset(encodingFrame->data[2], 128, (size_t)encodingFrame->linesize[2] * (outHeight / 2));
+                    dstData[0] = encodingFrame->data[0] + (size_t)dstY * encodingFrame->linesize[0] + dstX;
+                    dstData[1] = encodingFrame->data[1] + (size_t)(dstY / 2) * encodingFrame->linesize[1] + dstX / 2;
+                    dstData[2] = encodingFrame->data[2] + (size_t)(dstY / 2) * encodingFrame->linesize[2] + dstX / 2;
+                    dstData[3] = nullptr;
+
+                    std::cout << "[+] The screen is now " << width << "x" << height
+                        << "; recording continues at " << outWidth << "x" << outHeight << "." << std::endl;
+                }
+                // the direct geometry that goes with this size is the one published by the call that raised the generation
+                g_captureGeneration = directGeneration;
+            }
 
             if (g_experimentalScreenCapture || g_hybridCapture) {
                 std::vector<TrackedWindowRect> currentWindows;
@@ -4801,12 +4896,12 @@ static int RunRecording(const RecordingSetup& setup) {
                 {
                     void* pixelBuffer = screenBitmap->Bits();
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                        outWidth, outHeight, videoCodecCtx->pix_fmt,
+                        dstW, dstH, videoCodecCtx->pix_fmt,
                         profile.swsFlags, nullptr, nullptr, nullptr);
                     uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                     int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
                     sws_scale(swsCtx, srcData, srcLinesize, 0, height,
-                        encodingFrame->data, encodingFrame->linesize);
+                        dstData, encodingFrame->linesize);
                 }
 
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
@@ -4948,12 +5043,12 @@ static int RunRecording(const RecordingSetup& setup) {
                 {
                     void* pixelBuffer = screenBitmap->Bits();
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                        outWidth, outHeight, videoCodecCtx->pix_fmt,
+                        dstW, dstH, videoCodecCtx->pix_fmt,
                         profile.swsFlags, nullptr, nullptr, nullptr);
                     uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                     int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
                     sws_scale(swsCtx, srcData, srcLinesize, 0, height,
-                        encodingFrame->data, encodingFrame->linesize);
+                        dstData, encodingFrame->linesize);
                 }
 
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
@@ -4998,11 +5093,11 @@ static int RunRecording(const RecordingSetup& setup) {
                     captureElapsed = system_time() - loopIterationStart; // --logfps
 
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                        outWidth, outHeight, videoCodecCtx->pix_fmt,
+                        dstW, dstH, videoCodecCtx->pix_fmt,
                         profile.swsFlags, nullptr, nullptr, nullptr);
                     uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                     int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                    sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
+                    sws_scale(swsCtx, srcData, srcLinesize, 0, height, dstData, encodingFrame->linesize);
 
                     bigtime_t currentPresentationTime = system_time() - recordingStartTime;
                     encodingFrame->pts = currentPresentationTime;
@@ -5026,12 +5121,12 @@ static int RunRecording(const RecordingSetup& setup) {
                 captureElapsed = system_time() - loopIterationStart; // --logfps
 
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                                              outWidth, outHeight, videoCodecCtx->pix_fmt,
+                                              dstW, dstH, videoCodecCtx->pix_fmt,
                                               profile.swsFlags, nullptr, nullptr, nullptr);
 
                 uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                 int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                sws_scale(swsCtx, srcData, srcLinesize, 0, height, encodingFrame->data, encodingFrame->linesize);
+                sws_scale(swsCtx, srcData, srcLinesize, 0, height, dstData, encodingFrame->linesize);
 
                 // PTS is determined by actual elapsed real-world microseconds
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
@@ -5063,12 +5158,12 @@ static int RunRecording(const RecordingSetup& setup) {
 
                 void* pixelBuffer = screenBitmap->Bits();
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
-                    outWidth, outHeight, videoCodecCtx->pix_fmt,
+                    dstW, dstH, videoCodecCtx->pix_fmt,
                     profile.swsFlags, nullptr, nullptr, nullptr);
                 uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
                 int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
                 sws_scale(swsCtx, srcData, srcLinesize, 0, height,
-                    encodingFrame->data, encodingFrame->linesize);
+                    dstData, encodingFrame->linesize);
 
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
                 encodingFrame->pts = currentPresentationTime;
