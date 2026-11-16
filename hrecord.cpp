@@ -2796,6 +2796,22 @@ int RunInputReaper(int argc, char* argv[]) {
     media_node_id appNodeId = atoi(argv[7]);
 
     signal(SIGINT, SIG_IGN);
+    {
+        // Say in ProcessController's thread list what this process is for.
+        char appName[B_OS_NAME_LENGTH] = "";
+        team_info appInfo;
+        if (get_team_info(team, &appInfo) == B_OK) {
+            const char* base = strrchr(appInfo.args, '/');
+            strlcpy(appName, base != nullptr ? base + 1 : appInfo.args, sizeof(appName));
+            char* space = strchr(appName, ' ');
+            if (space != nullptr)
+                *space = '\0';
+        }
+        char threadName[B_OS_NAME_LENGTH];
+        snprintf(threadName, sizeof(threadName), "hrecord cleanup: waiting for %s to quit",
+            appName[0] != '\0' ? appName : "an app");
+        rename_thread(find_thread(NULL), threadName);
+    }
     BMediaRoster* roster = BMediaRoster::Roster();
     if (roster == nullptr)
         return 1;
@@ -5381,9 +5397,32 @@ static int RunStandby() {
     return 0;
 }
 
+// "hrecord --stop-reapers": ends every leftover cleanup helper (see
+// SpawnInputReaper). The Mixer entry of an app that is still running is then
+// not removed when that app quits later.
+int StopInputReapers() {
+    int stopped = 0;
+    team_id self = getpid();
+    int32 cookie = 0;
+    team_info info;
+    while (get_next_team_info(&cookie, &info) == B_OK) {
+        if (info.team == self)
+            continue;
+        const char* hit = strstr(info.args, "hrecord --reap ");
+        if (hit == nullptr)
+            continue;
+        if (kill_team(info.team) == B_OK)
+            stopped++;
+    }
+    std::cout << "[+] Stopped " << stopped << " cleanup helper" << (stopped == 1 ? "" : "s") << "." << std::endl;
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     if (argc >= 2 && strcmp(argv[1], "--reap") == 0)
         return RunInputReaper(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "--stop-reapers") == 0)
+        return StopInputReapers();
 
     // For the mixer window: one line saying whether real-time audio is set on the active driver.
     //   "realtime on <frames>"   tuned      "realtime off known"   a known driver, not tuned
@@ -5522,7 +5561,9 @@ int main(int argc, char* argv[]) {
                 "[--list-audio-inputs] [--logfps] [--meter] [--no-limiter] [--ceiling <dB>] "
                 "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control] "
                 "[--standby] [--stream <rtmp[s]://... | rtsp://...> | --stream-env] [--stream-bitrate <kbps>] [--stream-audio-bitrate <kbps>] "
-                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--detect-realtime] [--detect-stream]" << std::endl;
+                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--detect-realtime] [--detect-stream] [--stop-reapers]" << std::endl;
+            std::cout << "  --stop-reapers  ends the small \"hrecord --reap\" helpers that stay after streaming an app's audio\n"
+                "                  (each waits for that app to quit, then removes its leftover Mixer entry)." << std::endl;
             return 0;
         }
     }

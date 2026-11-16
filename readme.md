@@ -180,6 +180,10 @@ app stayed listed in Media preferences' Audio mixer. After putting an app back, 
 leaves a tiny helper (`hrecord --reap ...`) that waits for the app to quit and then removes
 the leftover input.
 
+That helper stays in ProcessController (thread name "hrecord cleanup: waiting for <app> to quit")
+until that app quits; it sleeps and uses no CPU. To end it earlier, run `hrecord --stop-reapers`
+(the app's Mixer entry is then not removed when it quits later).
+
 ## Known issue: "stale" Mixer connection
 
 Occasionally (usually after repeatedly closing and reopening whatever app
