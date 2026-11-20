@@ -172,6 +172,13 @@ it into the mix as Stereo, Left or Right (hardware inputs have L and R boxes). T
 input with programs** makes hrecord the system's audio input (the input hub), so several programs
 (for example Guitarix and rakarrack) can use one line-in, each getting Stereo, Left or Right.
 
+Ticking **Offer the mix to programs that record** (under Limiter, in the master section) adds a
+second node, **hrecord Mix**, that hands out what is heard: the mix of everything that plays, with the
+effects of a program such as rakarrack in it. A program that records can take it as an input of its own
+(Wine 11.20-69 and later list it in Windows programs such as Ardour as "What you hear (hrecord mix)").
+The mix includes the program that records, so recording while that program plays back material feeds
+it into the recording. On the control channel: `mixhub 1` (and `mixhub 0`).
+
 ## Apps that were recorded no longer linger in Media preferences
 
 An app's sound player disconnects from the Mixer input it first connected to when it quits.

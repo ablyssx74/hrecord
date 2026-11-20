@@ -2238,13 +2238,15 @@ public:
         media_node_id consumer = -1;    // the program's node, once the engine has looked it up
     };
 
-    explicit InputHubNode(const media_raw_audio_format& format)
-        : BMediaNode("hrecord Input"),
+    // physical: the hub that stands in for the sound hardware's input (it becomes the system's default input); the mix hub is not one
+    explicit InputHubNode(const media_raw_audio_format& format, const char* name = "hrecord Input", bool physical = true)
+        : BMediaNode(name),
           BBufferProducer(B_MEDIA_RAW_AUDIO),
           BMediaEventLooper(),
           fFormat(format)
     {
-        AddNodeKind(B_PHYSICAL_INPUT);
+        if (physical)
+            AddNodeKind(B_PHYSICAL_INPUT);
         SetRunMode(BMediaNode::B_RECORDING);
         std::lock_guard<std::mutex> lock(fMutex);
         AddFreeOutputLocked();
@@ -2291,6 +2293,12 @@ public:
             } else
                 o->sent++;
         }
+    }
+
+    // A buffer that is made here and now (the mix), not one that comes with a time of the hardware's.
+    void FeedNow(const void* data, size_t size) {
+        BTimeSource* timeSource = TimeSource();
+        Feed(data, size, timeSource != nullptr ? timeSource->Now() : 0);
     }
 
     // The programs that are connected now.
@@ -3120,6 +3128,10 @@ MixMeter g_mixMeter;
 // Held by MixedPlaybackCallback while it mixes and by whatever adds or removes a source (see SourceWatcherLoop).
 std::mutex g_mixMutex;
 
+// The mix hub ("hrecord Mix"): programs that record get what is heard (the mix that hrecord plays) as an input of their own.
+// Made and removed by the engine (EngineMixHub); the mixing callback feeds it.
+std::atomic<InputHubNode*> g_mixHub(nullptr);
+
 // A lookahead peak limiter on interleaved stereo float frames, linked across
 // the two channels. The audio is delayed by the lookahead; the gain that keeps
 // a peak under the ceiling is worked out from the audio that is still to come
@@ -3269,6 +3281,7 @@ void EngineHardwareInput(int nodeId, int outputIndex, bool stereo, bool left, bo
 void EngineAttach(int nodeId);
 void EngineHub(bool on);
 void EngineHubMode(int consumerNode, int mode);
+void EngineMixHub(bool on);
 
 // --control: a program that runs hrecord (the GUI) writes commands to its stdin, one per line, while it records:
 //   gain <n> <dB>     the n-th source's gain          mute <n> <0|1>     mute a source
@@ -3283,6 +3296,8 @@ void EngineHubMode(int consumerNode, int mode);
 //   hub <0|1>         share the audio input: programs connect to hrecord's input hub instead of the hardware (one program at a
 //                     time can use the hardware's input; the hub gives every program its own), each with a channel of its own
 //   hubmap <node> <0|1|2>   what the program with that node id gets from the hub: both channels, the left or the right alone
+//   mixhub <0|1>      offer the mix (what is heard) to programs that record, as an input of its own, "hrecord Mix": the effects of
+//                     a program that plays (rakarrack) are in it, as the speakers get them. Only with --allaudio
 //   detach <node>     the program with that node id is put back on the Mixer and left alone (until "attach")
 //   attach <node>     it may be tapped again
 //   record <screen 0|1> <quality 0|1|2>     --standby only: start a recording (the screen too, and its quality: low, medium, high)
@@ -3345,6 +3360,8 @@ void ControlLoop() {
                 EngineHardwareInput(node, output, stereo != 0, left != 0, right != 0);
         } else if (sscanf(line, "hubmap %d %d", &n, &v) == 2) {
             EngineHubMode(n, v < 0 ? 0 : (v > 2 ? 2 : v));
+        } else if (sscanf(line, "mixhub %d", &v) == 1) {
+            EngineMixHub(v != 0);
         } else if (sscanf(line, "hub %d", &v) == 1) {
             EngineHub(v != 0);
         } else if (sscanf(line, "detach %d", &n) == 1) {
@@ -3526,6 +3543,10 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
         AtomicMax(g_mixMeter.mixPostR, postR);
         AtomicMax(g_mixMeter.mixPostAll, post);
     }
+
+    // what is heard, for the programs that record it through the mix hub (it never waits: a buffer that is not free is skipped)
+    if (InputHubNode* mixHub = g_mixHub.load())
+        mixHub->FeedNow(buffer, size);
 
     if (g_running)
         g_mixEncodeQueue.Write(buffer, size);
@@ -4145,6 +4166,49 @@ void EngineHubMode(int consumerNode, int mode) {
     });
 }
 
+// The mix hub's node; made and removed on the engine thread.
+static InputHubNode* g_mixHubNode = nullptr;
+
+static void MixHubDisable(BMediaRoster* roster) {
+    if (g_mixHubNode == nullptr)
+        return;
+    g_mixHub.store(nullptr);
+    snooze(100000); // a callback that is feeding it
+    std::vector<InputHubNode::Connection> connected = g_mixHubNode->Snapshot();
+    for (size_t i = 0; i < connected.size(); i++) {
+        media_node_id consumer = roster->NodeIDFor(connected[i].destination.port);
+        if (consumer >= 0)
+            roster->Disconnect(g_mixHubNode->Node().node, connected[i].source, consumer, connected[i].destination);
+    }
+    roster->ReleaseNode(g_mixHubNode->Node());
+    g_mixHubNode = nullptr;
+    std::cout << "[+] Mix input off." << std::endl;
+}
+
+static void MixHubEnable(BMediaRoster* roster) {
+    if (g_mixHubNode != nullptr)
+        return;
+    InputHubNode* hub = new InputHubNode(MixBusFormat(), "hrecord Mix", false);
+    if (roster->RegisterNode(hub) != B_OK) {
+        std::cerr << "[-] Error: Could not register the mix input." << std::endl;
+        delete hub;
+        return;
+    }
+    roster->StartNode(hub->Node(), 0);
+    g_mixHubNode = hub;
+    g_mixHub.store(hub);
+    std::cout << "[+] Mix input on: programs that record can take what is heard (\"hrecord Mix\")." << std::endl;
+}
+
+void EngineMixHub(bool on) {
+    QueueEngineTask([=](BMediaRoster* roster, AllAudioHandles*) {
+        if (on)
+            MixHubEnable(roster);
+        else
+            MixHubDisable(roster);
+    });
+}
+
 // What the control channel's "route", "hwin" and "attach" ask for (they run on the watcher thread, see RunEngineTasks).
 void EngineRoute(int nodeId, bool stereo, bool left, bool right) {
     QueueEngineTask([=](BMediaRoster* roster, AllAudioHandles* handles) {
@@ -4331,6 +4395,7 @@ void TeardownAllAudioTaps(BMediaRoster* roster, AllAudioHandles* handles) {
     }
     // the programs that were fed by the input hub get the hardware back, and the system's default input is put back
     HubDisable(roster, handles);
+    MixHubDisable(roster);
 
     for (auto& entry : handles->taps) {
         if (!entry.hardware)

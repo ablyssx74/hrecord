@@ -74,6 +74,7 @@ enum {
 	kMsgCeiling		= 'cei!',
 	kMsgRelease		= 'rls!',
 	kMsgLimiter		= 'lim!',
+	kMsgMixHub		= 'mxh!',
 	kMsgStreamToggle	= 'stg!',
 	kMsgStreamConfigure	= 'scf!',
 	kMsgStreamSaved		= 'ssv!',
@@ -656,6 +657,7 @@ struct StreamConfig {
 	int			keyintSeconds = 2;
 	bool		showLog = true;			// the log under the window is shown
 	bool		hubOn = false;			// hrecord shares the audio input with programs (its input hub)
+	bool		mixHubOn = false;		// hrecord offers the mix (what is heard) to programs that record (its mix input)
 	std::map<std::string, int>	hubModes;	// by program name: what it gets from the hub, 0 both channels, 1 left, 2 right
 
 	std::string BaseAddress() const
@@ -712,6 +714,7 @@ struct StreamConfig {
 		if (message.FindBool("stream", &flag) == B_OK) enabled = flag;
 		if (message.FindBool("showlog", &flag) == B_OK) showLog = flag;
 		if (message.FindBool("hubon", &flag) == B_OK) hubOn = flag;
+		if (message.FindBool("mixhubon", &flag) == B_OK) mixHubOn = flag;
 		for (int32 i = 0;; i++) {
 			char* name = NULL;
 			type_code type;
@@ -745,6 +748,7 @@ struct StreamConfig {
 		message.AddBool("stream", enabled);
 		message.AddBool("showlog", showLog);
 		message.AddBool("hubon", hubOn);
+		message.AddBool("mixhubon", mixHubOn);
 		for (std::map<std::string, int>::const_iterator it = hubModes.begin(); it != hubModes.end(); ++it)
 			message.AddInt32((std::string("hubmode:") + it->first).c_str(), it->second);
 		message.AddInt32("service", service);
@@ -1870,6 +1874,10 @@ public:
 		fPostMeter = new StereoMeter("post", kMeterMin, 6.0f);
 		fLimiter = new BCheckBox("limiter", "Limiter", new BMessage(kMsgLimiter));
 		fLimiter->SetValue(B_CONTROL_ON);
+		fMixHub = new BCheckBox("mixhub", "Offer the mix to programs that record", new BMessage(kMsgMixHub));
+		fMixHub->SetToolTip("Programs that record (Ardour) can take what is heard, with the effects of the programs that play (rakarrack), "
+			"as an input called \"hrecord Mix\".");
+		fMixHub->SetValue(fStreamConfig.mixHubOn ? B_CONTROL_ON : B_CONTROL_OFF);
 		fCeiling = new DbSlider("ceiling", new BMessage(kMsgCeiling), -12.0f, 0.0f, B_HORIZONTAL, -1.0f);
 		fRelease = new StepSlider("release", "Release", new BMessage(kMsgRelease), 10, 500, B_HORIZONTAL, 10);
 		fRelease->SetValue(80);
@@ -1901,6 +1909,7 @@ public:
 			.End()
 			.AddStrut(6)
 			.Add(fLimiter)
+			.Add(fMixHub)
 			.Add(ceilingTitle)
 			.Add(fCeiling)
 			.Add(fRelease)
@@ -2146,6 +2155,11 @@ public:
 				fStreamConfig.Save();
 				break;
 			}
+			case kMsgMixHub:
+				fStreamConfig.mixHubOn = fMixHub->Value() == B_CONTROL_ON;
+				fStreamConfig.Save();
+				SendCommand("mixhub %d\n", fStreamConfig.mixHubOn ? 1 : 0);
+				break;
 			case kMsgLimiter:
 				SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
 				fCeiling->SetEnabled(fLimiter->Value() == B_CONTROL_ON);
@@ -2264,6 +2278,8 @@ private:
 		SendCommand("ceiling %.1f\n", fCeiling->Db());
 		SendCommand("release %d\n", (int)fRelease->Value());
 		SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
+		if (fStreamConfig.mixHubOn)
+			SendCommand("mixhub 1\n");
 	}
 
 	void StartRecording()
@@ -2576,6 +2592,7 @@ private:
 	StereoMeter*		fPreMeter;
 	StereoMeter*		fPostMeter;
 	BCheckBox*			fLimiter;
+	BCheckBox*			fMixHub;
 	DbSlider*			fCeiling;
 	BSlider*			fRelease;
 	LevelMeter*			fReduction;
