@@ -176,8 +176,10 @@ Ticking **Offer the mix to programs that record** (under Limiter, in the master 
 second node, **hrecord Mix**, that hands out what is heard: the mix of everything that plays, with the
 effects of a program such as rakarrack in it. A program that records can take it as an input of its own
 (Wine 11.20-69 and later list it in Windows programs such as Ardour as "What you hear (hrecord mix)").
-The mix includes the program that records, so recording while that program plays back material feeds
-it into the recording. On the control channel: `mixhub 1` (and `mixhub 0`).
+A program that records the mix does not get what it plays itself (Ardour recording a second track
+does not record the first one again), unless you untick **Leave out the recording program's own
+sound**; what you hear is not changed. On the control channel: `mixhub 1` (and `mixhub 0`), and
+`mixhubself 1` to let the recording program hear its own sound in the mix (`mixhubself 0` leaves it out, the default).
 
 ## Apps that were recorded no longer linger in Media preferences
 

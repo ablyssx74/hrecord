@@ -2266,33 +2266,46 @@ public:
     void Feed(const void* data, size_t size, bigtime_t startTime) {
         if (size == 0)
             return;
-        const int sampleSize = (int)(fFormat.format & media_raw_audio_format::B_AUDIO_SIZE_MASK);
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++)
+            SendOutputLocked(fOutputs[i], data, size, startTime);
+    }
+
+    // The mix, for every program that is connected; a program whose team is one of `teams` gets that team's own mix (`mixes`, one
+    // buffer for each: the mix without what that program plays itself) instead of the whole one.
+    void FeedMix(const void* data, size_t size, const int32* teams, const float* const* mixes, int teamCount) {
+        if (size == 0)
+            return;
+        BTimeSource* timeSource = TimeSource();
+        const bigtime_t startTime = timeSource != nullptr ? timeSource->Now() : 0;
         std::lock_guard<std::mutex> lock(fMutex);
         for (size_t i = 0; i < fOutputs.size(); i++) {
-            Output* o = fOutputs[i];
-            if (o->out.destination == media_destination::null || !o->enabled || o->group == nullptr)
-                continue;
-            if (size > o->groupBufferSize) {
-                o->dropped++;
-                continue;
+            const void* use = data;
+            for (int k = 0; k < teamCount; k++) {
+                if (teams[k] > 0 && fOutputs[i]->team == teams[k])
+                    use = mixes[k];
             }
-            BBuffer* buffer = o->group->RequestBuffer(size, 0); // never waits: this runs on the hardware's own thread
-            if (buffer == nullptr) {
-                o->dropped++;
-                continue;
-            }
-            MapChannels((const uint8_t*)data, (uint8_t*)buffer->Data(), size, sampleSize, (int)fFormat.channel_count, o->mode);
-            media_header* header = buffer->Header();
-            header->type = B_MEDIA_RAW_AUDIO;
-            header->size_used = size;
-            header->start_time = startTime;
-            header->time_source = fTimeSourceId;
-            if (SendBuffer(buffer, o->out.source, o->out.destination) != B_OK) {
-                buffer->Recycle();
-                o->dropped++;
-            } else
-                o->sent++;
+            SendOutputLocked(fOutputs[i], use, size, startTime);
         }
+    }
+
+    // The teams (programs) of the connected outputs, without repeats; how many were found.
+    int ConnectedTeams(int32* teams, int max) {
+        int count = 0;
+        std::lock_guard<std::mutex> lock(fMutex);
+        for (size_t i = 0; i < fOutputs.size(); i++) {
+            const Output* o = fOutputs[i];
+            if (o->out.destination == media_destination::null || o->team <= 0)
+                continue;
+            bool known = false;
+            for (int k = 0; k < count; k++) {
+                if (teams[k] == o->team)
+                    known = true;
+            }
+            if (!known && count < max)
+                teams[count++] = o->team;
+        }
+        return count;
     }
 
     // A buffer that is made here and now (the mix), not one that comes with a time of the hardware's.
@@ -2438,6 +2451,8 @@ protected:
             o->group = nullptr;
         }
         o->mode = 0;
+        port_info destinationPort;
+        o->team = get_port_info(destination.port, &destinationPort) == B_OK ? destinationPort.team : 0;
         EnsureFreeOutputLocked();
     }
 
@@ -2476,9 +2491,37 @@ private:
         size_t groupBufferSize = 0;
         int mode = 0;               // 0: both channels, 1: the left alone, 2: the right alone
         media_node_id consumer = -1;
+        int32 team = 0;             // the team (program) the output is connected to; 0 when not known
         bool enabled = true;
         uint64_t sent = 0, dropped = 0;
     };
+
+    // One buffer for one output (fMutex is held); it never waits: a buffer that is not free is skipped.
+    void SendOutputLocked(Output* o, const void* data, size_t size, bigtime_t startTime) {
+        if (o->out.destination == media_destination::null || !o->enabled || o->group == nullptr)
+            return;
+        if (size > o->groupBufferSize) {
+            o->dropped++;
+            return;
+        }
+        const int sampleSize = (int)(fFormat.format & media_raw_audio_format::B_AUDIO_SIZE_MASK);
+        BBuffer* buffer = o->group->RequestBuffer(size, 0); // never waits: this runs on the hardware's own thread
+        if (buffer == nullptr) {
+            o->dropped++;
+            return;
+        }
+        MapChannels((const uint8_t*)data, (uint8_t*)buffer->Data(), size, sampleSize, (int)fFormat.channel_count, o->mode);
+        media_header* header = buffer->Header();
+        header->type = B_MEDIA_RAW_AUDIO;
+        header->size_used = size;
+        header->start_time = startTime;
+        header->time_source = fTimeSourceId;
+        if (SendBuffer(buffer, o->out.source, o->out.destination) != B_OK) {
+            buffer->Recycle();
+            o->dropped++;
+        } else
+            o->sent++;
+    }
 
     Output* FindLocked(const media_source& source) {
         for (size_t i = 0; i < fOutputs.size(); i++) {
@@ -3132,6 +3175,11 @@ std::mutex g_mixMutex;
 // Made and removed by the engine (EngineMixHub); the mixing callback feeds it.
 std::atomic<InputHubNode*> g_mixHub(nullptr);
 
+// The team (program) each source of the mix belongs to (0: not known); the mix hub leaves out what a program plays itself when it hands the
+// mix to that program, so that a program that records does not record its own playback (Ardour: a second track over the first).
+std::atomic<int32_t> g_sourceTeam[kMeterMaxSources];
+std::atomic<bool> g_mixHubExclude(true);
+
 // A lookahead peak limiter on interleaved stereo float frames, linked across
 // the two channels. The audio is delayed by the lookahead; the gain that keeps
 // a peak under the ceiling is worked out from the audio that is still to come
@@ -3282,6 +3330,7 @@ void EngineAttach(int nodeId);
 void EngineHub(bool on);
 void EngineHubMode(int consumerNode, int mode);
 void EngineMixHub(bool on);
+extern std::atomic<bool> g_mixHubExclude;
 
 // --control: a program that runs hrecord (the GUI) writes commands to its stdin, one per line, while it records:
 //   gain <n> <dB>     the n-th source's gain          mute <n> <0|1>     mute a source
@@ -3296,6 +3345,7 @@ void EngineMixHub(bool on);
 //   hub <0|1>         share the audio input: programs connect to hrecord's input hub instead of the hardware (one program at a
 //                     time can use the hardware's input; the hub gives every program its own), each with a channel of its own
 //   hubmap <node> <0|1|2>   what the program with that node id gets from the hub: both channels, the left or the right alone
+//   mixhubself <0|1>  1: a program that records through the mix input also gets its own sound in it; 0 (the default) leaves it out
 //   mixhub <0|1>      offer the mix (what is heard) to programs that record, as an input of its own, "hrecord Mix": the effects of
 //                     a program that plays (rakarrack) are in it, as the speakers get them. Only with --allaudio
 //   detach <node>     the program with that node id is put back on the Mixer and left alone (until "attach")
@@ -3360,6 +3410,8 @@ void ControlLoop() {
                 EngineHardwareInput(node, output, stereo != 0, left != 0, right != 0);
         } else if (sscanf(line, "hubmap %d %d", &n, &v) == 2) {
             EngineHubMode(n, v < 0 ? 0 : (v > 2 ? 2 : v));
+        } else if (sscanf(line, "mixhubself %d", &v) == 1) {
+            g_mixHubExclude = (v == 0);   // 1: the program that records gets its own playback in the mix too
         } else if (sscanf(line, "mixhub %d", &v) == 1) {
             EngineMixHub(v != 0);
         } else if (sscanf(line, "hub %d", &v) == 1) {
@@ -3452,12 +3504,28 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
             activeSources++;
     }
     const float base = (activeSources > 0 ? 1.0f / sqrtf((float)activeSources) : 1.0f) * DbToLinear(g_mixGainDb);
+    // the mix hub: a program that records gets the mix without what that program plays itself (its own team's sources)
+    InputHubNode* mixHub = g_mixHub.load();
+    int32 hubTeams[4];
+    int hubTeamCount = 0;
+    static thread_local std::vector<float> hubMix[4];
+    if (mixHub != nullptr && g_mixHubExclude.load())
+        hubTeamCount = mixHub->ConnectedTeams(hubTeams, 4);
+    for (int k = 0; k < hubTeamCount; k++) {
+        if (hubMix[k].size() < sampleCount)
+            hubMix[k].resize(sampleCount);
+        std::fill(hubMix[k].begin(), hubMix[k].begin() + sampleCount, 0.0f);
+    }
+
     int index = -1;
     for (AudioRingBuffer* ring : *sources) {
         index++;
         if (ring == nullptr)
             continue;
         ring->Read(scratch.data(), size);
+        bool hubTake[4] = { true, true, true, true };
+        for (int k = 0; k < hubTeamCount; k++)
+            hubTake[k] = index >= kMeterMaxSources || g_sourceTeam[index].load() != hubTeams[k];
         float gain = base * DbToLinear(index < kMeterMaxSources ? g_sourceGainDb[index].load() : 0.0f);
         if (index < kMeterMaxSources) {
             // muted, or another source is soloed: still drained and metered, but not in the mix
@@ -3491,7 +3559,12 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
             float shown = a * (right ? meterR : meterL);
             if (right) { if (shown > peakR) peakR = shown; }
             else if (shown > peakL) peakL = shown;
-            out[i] += v * (right ? gainR : gainL);
+            const float contribution = v * (right ? gainR : gainL);
+            out[i] += contribution;
+            for (int k = 0; k < hubTeamCount; k++) {
+                if (hubTake[k])
+                    hubMix[k][i] += contribution;
+            }
         }
         if (index < kMeterMaxSources) {
             AtomicMax(g_mixMeter.srcPeak[index], peakL);
@@ -3545,8 +3618,23 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
     }
 
     // what is heard, for the programs that record it through the mix hub (it never waits: a buffer that is not free is skipped)
-    if (InputHubNode* mixHub = g_mixHub.load())
-        mixHub->FeedNow(buffer, size);
+    if (mixHub != nullptr) {
+        if (hubTeamCount > 0) {
+            // (no limiter on these mixes: a soft clip keeps them under full scale)
+            const float* mixes[4];
+            for (int k = 0; k < hubTeamCount; k++) {
+                float* m = hubMix[k].data();
+                for (size_t i = 0; i < sampleCount; i++) {
+                    const float a = fabsf(m[i]);
+                    if (a > 0.9f)
+                        m[i] = copysignf(0.9f + 0.1f * tanhf((a - 0.9f) / 0.1f), m[i]);
+                }
+                mixes[k] = m;
+            }
+            mixHub->FeedMix(buffer, size, hubTeams, mixes, hubTeamCount);
+        } else
+            mixHub->FeedNow(buffer, size);
+    }
 
     if (g_running)
         g_mixEncodeQueue.Write(buffer, size);
@@ -3651,7 +3739,7 @@ static AudioRingBuffer* NewSourceRing(const media_raw_audio_format& busFormat) {
 }
 
 // A free slot in the mix for `ring`, with the controls of the strip that will show it back at their defaults; -1 when all are taken.
-static int AllocateMixSlot(AllAudioHandles* handles, AudioRingBuffer* ring, const std::string& name) {
+static int AllocateMixSlot(AllAudioHandles* handles, AudioRingBuffer* ring, const std::string& name, int32 team = 0) {
     std::lock_guard<std::mutex> lock(g_mixMutex);
     int slot = -1;
     for (size_t i = 0; i < handles->mixSources.size(); i++) {
@@ -3678,6 +3766,7 @@ static int AllocateMixSlot(AllAudioHandles* handles, AudioRingBuffer* ring, cons
     if (g_mixMeter.count < slot + 1)
         g_mixMeter.count = slot + 1;
     handles->mixSources[slot] = ring;
+    g_sourceTeam[slot] = team;
     g_mixMeter.srcActive[slot] = true;
     return slot;
 }
@@ -3686,6 +3775,7 @@ static int AllocateMixSlot(AllAudioHandles* handles, AudioRingBuffer* ring, cons
 static void FreeMixSlot(AllAudioHandles* handles, int slot) {
     std::lock_guard<std::mutex> lock(g_mixMutex);
     handles->mixSources[slot] = nullptr;
+    g_sourceTeam[slot] = 0;
     g_mixMeter.srcActive[slot] = false;
     g_soloMask.fetch_and(~(1u << slot));
 }
@@ -3722,7 +3812,10 @@ static void ApplySlots(AllAudioHandles* handles, AllAudioTapEntry& entry, bool s
         if (have)
             continue;
         AudioRingBuffer* ring = NewSourceRing(handles->busFormat);
-        const int number = AllocateMixSlot(handles, ring, SlotName(entry, mode));
+        // the program the source belongs to: the owner of its node's port
+        port_info nodePort;
+        const int32 team = get_port_info(entry.appNode.port, &nodePort) == B_OK ? nodePort.team : 0;
+        const int number = AllocateMixSlot(handles, ring, SlotName(entry, mode), team);
         if (number < 0) {
             std::cerr << "[!] Warning: Too many audio sources (" << kMeterMaxSources << "); not adding \""
                 << SlotName(entry, mode) << "\"." << std::endl;

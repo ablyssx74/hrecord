@@ -75,6 +75,7 @@ enum {
 	kMsgRelease		= 'rls!',
 	kMsgLimiter		= 'lim!',
 	kMsgMixHub		= 'mxh!',
+	kMsgMixHubSelf	= 'mxs!',
 	kMsgStreamToggle	= 'stg!',
 	kMsgStreamConfigure	= 'scf!',
 	kMsgStreamSaved		= 'ssv!',
@@ -658,6 +659,7 @@ struct StreamConfig {
 	bool		showLog = true;			// the log under the window is shown
 	bool		hubOn = false;			// hrecord shares the audio input with programs (its input hub)
 	bool		mixHubOn = false;		// hrecord offers the mix (what is heard) to programs that record (its mix input)
+	bool		mixHubLeaveOut = true;	// ... without what the recording program plays itself
 	std::map<std::string, int>	hubModes;	// by program name: what it gets from the hub, 0 both channels, 1 left, 2 right
 
 	std::string BaseAddress() const
@@ -715,6 +717,7 @@ struct StreamConfig {
 		if (message.FindBool("showlog", &flag) == B_OK) showLog = flag;
 		if (message.FindBool("hubon", &flag) == B_OK) hubOn = flag;
 		if (message.FindBool("mixhubon", &flag) == B_OK) mixHubOn = flag;
+		if (message.FindBool("mixhubleaveout", &flag) == B_OK) mixHubLeaveOut = flag;
 		for (int32 i = 0;; i++) {
 			char* name = NULL;
 			type_code type;
@@ -749,6 +752,7 @@ struct StreamConfig {
 		message.AddBool("showlog", showLog);
 		message.AddBool("hubon", hubOn);
 		message.AddBool("mixhubon", mixHubOn);
+		message.AddBool("mixhubleaveout", mixHubLeaveOut);
 		for (std::map<std::string, int>::const_iterator it = hubModes.begin(); it != hubModes.end(); ++it)
 			message.AddInt32((std::string("hubmode:") + it->first).c_str(), it->second);
 		message.AddInt32("service", service);
@@ -1878,6 +1882,11 @@ public:
 		fMixHub->SetToolTip("Programs that record (Ardour) can take what is heard, with the effects of the programs that play (rakarrack), "
 			"as an input called \"hrecord Mix\".");
 		fMixHub->SetValue(fStreamConfig.mixHubOn ? B_CONTROL_ON : B_CONTROL_OFF);
+		fMixHubLeaveOut = new BCheckBox("mixhubleaveout", "Leave out the recording program's own sound", new BMessage(kMsgMixHubSelf));
+		fMixHubLeaveOut->SetToolTip("A program that records the mix does not get what it plays itself (Ardour recording a second track "
+			"does not record the first one again). What you hear is not changed.");
+		fMixHubLeaveOut->SetValue(fStreamConfig.mixHubLeaveOut ? B_CONTROL_ON : B_CONTROL_OFF);
+		fMixHubLeaveOut->SetEnabled(fStreamConfig.mixHubOn);
 		fCeiling = new DbSlider("ceiling", new BMessage(kMsgCeiling), -12.0f, 0.0f, B_HORIZONTAL, -1.0f);
 		fRelease = new StepSlider("release", "Release", new BMessage(kMsgRelease), 10, 500, B_HORIZONTAL, 10);
 		fRelease->SetValue(80);
@@ -1910,6 +1919,7 @@ public:
 			.AddStrut(6)
 			.Add(fLimiter)
 			.Add(fMixHub)
+			.Add(fMixHubLeaveOut)
 			.Add(ceilingTitle)
 			.Add(fCeiling)
 			.Add(fRelease)
@@ -2158,7 +2168,13 @@ public:
 			case kMsgMixHub:
 				fStreamConfig.mixHubOn = fMixHub->Value() == B_CONTROL_ON;
 				fStreamConfig.Save();
+				fMixHubLeaveOut->SetEnabled(fStreamConfig.mixHubOn);
 				SendCommand("mixhub %d\n", fStreamConfig.mixHubOn ? 1 : 0);
+				break;
+			case kMsgMixHubSelf:
+				fStreamConfig.mixHubLeaveOut = fMixHubLeaveOut->Value() == B_CONTROL_ON;
+				fStreamConfig.Save();
+				SendCommand("mixhubself %d\n", fStreamConfig.mixHubLeaveOut ? 0 : 1);
 				break;
 			case kMsgLimiter:
 				SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
@@ -2278,6 +2294,7 @@ private:
 		SendCommand("ceiling %.1f\n", fCeiling->Db());
 		SendCommand("release %d\n", (int)fRelease->Value());
 		SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
+		SendCommand("mixhubself %d\n", fStreamConfig.mixHubLeaveOut ? 0 : 1);
 		if (fStreamConfig.mixHubOn)
 			SendCommand("mixhub 1\n");
 	}
@@ -2593,6 +2610,7 @@ private:
 	StereoMeter*		fPostMeter;
 	BCheckBox*			fLimiter;
 	BCheckBox*			fMixHub;
+	BCheckBox*			fMixHubLeaveOut;
 	DbSlider*			fCeiling;
 	BSlider*			fRelease;
 	LevelMeter*			fReduction;
