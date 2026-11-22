@@ -6,6 +6,8 @@
 #include <InterfaceKit.h> // Pulls in BApplication, BScreen, BBitmap
 #include <DirectWindow.h> // BDirectWindow -- see --direct-tiled-capture/SetupDirectCapture()
 #include <WindowInfo.h> // Private Window Kit API -- see EnumerateVisibleWindows()
+#include <AppServerLink.h> // Private: the screen observer of a composited desktop (RenkuOS) -- see SetupScreenObserver()
+#include <dlfcn.h> // dlsym() -- is_composited_desktop()
 #include <StorageKit.h>
 #include <Path.h> // BPath -- DetectRealtimeAudioSettings' own settings-dir resolution
 #include <FindDirectory.h> // find_directory()/B_USER_SETTINGS_DIRECTORY, same use
@@ -754,6 +756,113 @@ DirectCaptureWindow* g_directCaptureWindow = nullptr;
 // safe, so on some driver/hardware combination it can raise SIGSEGV/SIGBUS
 // instead of just returning wrong bytes. sigsetjmp/siglongjmp turns that
 // into a clean "not safe here" instead of taking hrecord itself down.
+// --- The screen observer of a composited desktop (RenkuOS) ---
+//
+// On a desktop with a compositor, a BDirectWindow no longer gets the screen's own memory: app_server hands it its own window
+// buffer (laid out like the screen, but holding only that window's pixels), so SetupDirectCapture()'s probe finds zeros and the
+// capture falls back to BScreen reads, which are slow. RenkuOS's app_server has a way of its own to follow the screen: the
+// client makes an area (screen size, 32 bits a pixel) and asks, with a message, for the parts of the screen that changed since
+// its last read to be copied into it, straight from the compositor's drawing buffer. The first read copies the whole screen.
+// The copy holds no cursor (neither does the direct framebuffer read here: this program never recorded one).
+//
+// The area is published through the same variables a DirectConnected() event publishes (origin, bytes per row, pixel size,
+// verified), so RefreshScreenRegion()'s direct branch reads from it, as a local memcpy, with no change to the capture loops.
+// The messages are in app_server's private protocol (ServerProtocol.h of RenkuOS); the codes are repeated here because the
+// header of the system this is built on may not have them. A desktop without the observer answers the first message with an
+// error (or not at all), and nothing here is used then.
+static const int32 kScreenObserverStart = 'RSos';
+static const int32 kScreenObserverStop = 'RSoe';
+static const int32 kScreenObserverRead = 'RSor';
+static area_id g_observerArea = -1;
+static uint8* g_observerBits = nullptr;
+static int32 g_observerBytesPerRow = 0;
+std::atomic<bool> g_observerActive(false);
+
+// Copies what changed on the screen into the area. false: it did not work (the screen has another size now, or app_server
+// stopped answering): the caller falls back to BScreen reads.
+static bool ScreenObserverRead() {
+    BPrivate::AppServerLink link;
+    link.StartMessage(kScreenObserverRead);
+    link.Attach<area_id>(g_observerArea);
+    link.Attach<int32>(g_observerBytesPerRow);
+    int32 code = B_ERROR;
+    if (link.FlushWithReply(code) != B_OK || code != B_OK)
+        return false;
+    int32 width = 0, height = 0, cursorGeneration = 0, count = 0;
+    link.Read<int32>(&width);
+    link.Read<int32>(&height);
+    link.Read<int32>(&cursorGeneration);
+    link.Read<int32>(&count);
+    return width * 4 == g_observerBytesPerRow;
+}
+
+static void StopScreenObserver() {
+    if (g_observerActive.exchange(false)) {
+        g_directCaptureVerified.store(false, std::memory_order_release);
+        BPrivate::AppServerLink link;
+        link.StartMessage(kScreenObserverStop);
+        int32 code;
+        link.FlushWithReply(code);
+    }
+    if (g_observerArea >= 0) {
+        delete_area(g_observerArea);
+        g_observerArea = -1;
+        g_observerBits = nullptr;
+    }
+}
+
+// Starts following the screen when this is a composited desktop that can do it. Needs the connection to app_server (the
+// BApplication), and the size of the screen as the capture loop has it.
+static bool SetupScreenObserver(int width, int height) {
+    typedef bool (*IsCompositedFunction)();
+    IsCompositedFunction isComposited = (IsCompositedFunction)dlsym(RTLD_DEFAULT, "is_composited_desktop");
+    if (isComposited == nullptr || !isComposited())
+        return false;
+
+    g_observerBytesPerRow = width * 4;
+    size_t size = (size_t)g_observerBytesPerRow * height;
+    size = (size + B_PAGE_SIZE - 1) & ~((size_t)B_PAGE_SIZE - 1);
+    void* address = nullptr;
+    g_observerArea = create_area("hrecord screen observer", &address, B_ANY_ADDRESS, size, B_NO_LOCK,
+        B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA);
+    if (g_observerArea < 0) {
+        g_observerArea = -1;
+        return false;
+    }
+    g_observerBits = (uint8*)address;
+
+    {
+        BPrivate::AppServerLink link;
+        link.StartMessage(kScreenObserverStart);
+        int32 code = B_ERROR;
+        if (link.FlushWithReply(code) != B_OK || code != B_OK) {
+            std::cout << "[i] screen observer: app_server did not start one (" << strerror(code)
+                      << "); capturing with BScreen reads." << std::endl;
+            delete_area(g_observerArea);
+            g_observerArea = -1;
+            g_observerBits = nullptr;
+            return false;
+        }
+    }
+    g_observerActive.store(true);
+
+    // The first read copies the whole screen: if it does not come back right, the observer is not used.
+    if (!ScreenObserverRead()) {
+        std::cout << "[i] screen observer: the first read of the screen failed; capturing with BScreen reads." << std::endl;
+        StopScreenObserver();
+        return false;
+    }
+
+    g_directDesktopOrigin.store(g_observerBits, std::memory_order_relaxed);
+    g_directBytesPerRow.store((uint32_t)g_observerBytesPerRow, std::memory_order_relaxed);
+    g_directBytesPerPixel.store(4, std::memory_order_relaxed);
+    g_directCaptureHardwareSafe.store(true);
+    g_directCaptureVerified.store(true, std::memory_order_release);
+    std::cout << "[i] screen observer: following the composited screen (" << width << "x" << height
+              << "), only what changed is copied each frame; no BDirectWindow is used." << std::endl;
+    return true;
+}
+
 static sigjmp_buf g_directCaptureSegvJmpBuf;
 static volatile sig_atomic_t g_inDirectCaptureRiskyRead = 0;
 
@@ -4613,7 +4722,11 @@ static int RunRecording(const RecordingSetup& setup) {
         if (outWidth < 2) outWidth = 2;
         if (outHeight < 2) outHeight = 2;
 
-        if (g_directTiledCapture || g_directRawCapture) {
+        // A composited desktop (RenkuOS) gives a BDirectWindow no view of the screen: its own screen observer is used there.
+        bool screenObserver = false;
+        if (g_directTiledCapture || g_directRawCapture)
+            screenObserver = SetupScreenObserver(width, height);
+        if ((g_directTiledCapture || g_directRawCapture) && !screenObserver) {
             SetupDirectCapture();
         }
     }
@@ -4956,6 +5069,11 @@ static int RunRecording(const RecordingSetup& setup) {
 
         while (g_running) {
             bigtime_t loopIterationStart = system_time();
+            if (g_observerActive.load(std::memory_order_relaxed) && !ScreenObserverRead()) {
+                // (the screen has another size now, or app_server did not answer: BScreen reads from here on)
+                std::cout << "[!] screen observer: a read failed; capturing with BScreen reads from now on." << std::endl;
+                StopScreenObserver();
+            }
             bool frameWritten = false; // --logfps: set true below in whichever
                                         // capture-mode branch actually sends a
                                         // frame to the encoder this iteration
@@ -5439,6 +5557,8 @@ static int RunRecording(const RecordingSetup& setup) {
 
     // 8. Stream Finalization & Clean Up
     std::cout << "\n[+] Clean shutdown initiated. Finalizing output file container..." << std::endl;
+
+    StopScreenObserver(); // (the capture loop is over: app_server stops copying the screen into the area)
 
     if (audioConnected) {
         // Stop the tap(s)/playback and restore the app(s)' direct
