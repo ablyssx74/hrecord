@@ -35,7 +35,6 @@
 #include <PopUpMenu.h>
 #include <Roster.h>
 #include <String.h>
-#include <ScrollView.h>
 #include <Spinner.h>
 #include <Slider.h>
 #include <StringItem.h>
@@ -108,7 +107,10 @@ enum {
 	kMsgEqBand			= 'eqb!',
 	kMsgEqPreset		= 'eqp!',
 	kMsgAddonAnswer		= 'ada!',		// the answer to "download the add-on?"
-	kMsgAddonDownload	= 'adl!'		// open the download window
+	kMsgAddonDownload	= 'adl!',		// open the download window
+	kMsgMixerMenu		= 'mxmn',		// a right click in the audio mixer: "where" (on the screen)
+	kMsgMixerColumns	= 'mxco',
+	kMsgMixerRows		= 'mxro'
 };
 
 static const float kFaderMin = -60.0f, kFaderMax = 12.0f;		// dB, on a fader
@@ -224,15 +226,16 @@ private:
 // A left and a right level meter side by side.
 class StereoMeter : public BView {
 public:
-	StereoMeter(const char* name, float low, float high)
+	// vertical: the two stand side by side; otherwise they lie one over the other
+	StereoMeter(const char* name, float low, float high, bool vertical = true)
 		:
 		BView(name, 0),
-		fLeft(new LevelMeter("left", true, low, high)),
-		fRight(new LevelMeter("right", true, low, high))
+		fLeft(new LevelMeter("left", vertical, low, high)),
+		fRight(new LevelMeter("right", vertical, low, high))
 	{
 		SetViewColor(theme::kDock);
-		SetExplicitMaxSize(BSize(17, B_SIZE_UNLIMITED));
-		BLayoutBuilder::Group<>(this, B_HORIZONTAL, 1)
+		SetExplicitMaxSize(vertical ? BSize(17, B_SIZE_UNLIMITED) : BSize(B_SIZE_UNLIMITED, 21));
+		BLayoutBuilder::Group<>(this, vertical ? B_HORIZONTAL : B_VERTICAL, 1)
 			.Add(fLeft)
 			.Add(fRight);
 	}
@@ -271,30 +274,34 @@ PanText(Fader* fader, char* text, size_t size)
 }
 
 
-// One source: its name, fader, balance, mute and solo, and its level.
+// One source: its name, fader, balance, mute and solo, and its level. As a column (the strips stand side by side), or as a row
+// (they lie one over the other, as in OBS Studio).
 class SourceStrip : public BView {
 public:
-	SourceStrip(int index, const char* name)
+	SourceStrip(int index, const char* name, bool row)
 		:
 		BView("strip", B_WILL_DRAW),
-		fIndex(index)
+		fIndex(index),
+		fSourceName(name)
 	{
 		SetViewColor(theme::kDock);
 		BString title;
 		title << "#" << (index + 1) << " " << name;
-		Label* nameLabel = new Label("name", title.String(), theme::kDock, theme::kText, true, 104);
+		Label* nameLabel = row
+			? new Label("name", title.String(), theme::kDock, theme::kText, false, B_SIZE_UNLIMITED)
+			: new Label("name", title.String(), theme::kDock, theme::kText, true, 104);
 		nameLabel->SetToolTip(name);
 
 		BMessage* gain = new BMessage(kMsgGain);
 		gain->AddInt32("source", index);
-		fFader = new Fader("fader", gain, (int32)(kFaderMin * 2), (int32)(kFaderMax * 2), 0, 2, true, theme::kDock);
-		fMeter = new StereoMeter("meter", kMeterMin, 0.0f);
-		fDbText = new Label("db", "+0.0 dB", theme::kDock, theme::kDimText, true, 104);
+		fFader = new Fader("fader", gain, (int32)(kFaderMin * 2), (int32)(kFaderMax * 2), 0, 2, !row, theme::kDock);
+		fMeter = new StereoMeter("meter", kMeterMin, 0.0f, !row);
+		fDbText = row ? new Label("db", "+0.0 dB", theme::kDock, theme::kDimText, false, 64)
+			: new Label("db", "+0.0 dB", theme::kDock, theme::kDimText, true, 104);
 
 		BMessage* pan = new BMessage(kMsgPan);
 		pan->AddInt32("source", index);
 		fPan = new Fader("pan", pan, -100, 100, 0, 5, false, theme::kDock);
-		fPan->SetExplicitMaxSize(BSize(104, 16));
 		fPan->SetToolTip("Balance, left to right. A right click centers it.");
 
 		BMessage* mute = new BMessage(kMsgMute);
@@ -304,22 +311,45 @@ public:
 		solo->AddInt32("source", index);
 		fSolo = new FlatCheck("solo", "Solo", solo, theme::kDock, true, theme::kSolo);
 
-		BLayoutBuilder::Group<>(this, B_VERTICAL, 4)
-			.SetInsets(6, 4, 6, 6)
-			.Add(nameLabel)
-			.Add(fDbText)
-			.AddGroup(B_HORIZONTAL, 6)
-				.AddGlue()
+		if (row) {
+			fFader->SetExplicitMinSize(BSize(100, 16));
+			fPan->SetExplicitMinSize(BSize(60, 16));
+			fPan->SetExplicitMaxSize(BSize(70, 16));
+			fMute->SetExplicitMaxSize(BSize(fMute->MinSize().width, B_SIZE_UNSET));
+			fSolo->SetExplicitMaxSize(BSize(fSolo->MinSize().width, B_SIZE_UNSET));
+			BLayoutBuilder::Group<>(this, B_VERTICAL, 3)
+				.SetInsets(6, 4, 6, 8)
+				.AddGroup(B_HORIZONTAL, 6)
+					.Add(nameLabel)
+					.Add(fDbText)
+				.End()
 				.Add(fMeter)
-				.Add(fFader)
-				.AddGlue()
-			.End()
-			.Add(fPan)
-			.AddGroup(B_HORIZONTAL, 4)
-				.Add(fMute)
-				.Add(fSolo)
-			.End();
-		SetExplicitMaxSize(BSize(116, B_SIZE_UNLIMITED));
+				.AddGroup(B_HORIZONTAL, 8)
+					.Add(fFader, 10.0f)
+					.Add(fPan, 0.0f)
+					.Add(fMute)
+					.Add(fSolo)
+				.End();
+			SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
+		} else {
+			fPan->SetExplicitMaxSize(BSize(104, 16));
+			BLayoutBuilder::Group<>(this, B_VERTICAL, 4)
+				.SetInsets(6, 4, 6, 6)
+				.Add(nameLabel)
+				.Add(fDbText)
+				.AddGroup(B_HORIZONTAL, 6)
+					.AddGlue()
+					.Add(fMeter)
+					.Add(fFader)
+					.AddGlue()
+				.End()
+				.Add(fPan)
+				.AddGroup(B_HORIZONTAL, 4)
+					.Add(fMute)
+					.Add(fSolo)
+				.End();
+			SetExplicitMaxSize(BSize(116, B_SIZE_UNLIMITED));
+		}
 	}
 
 	void AttachedToWindow()
@@ -340,8 +370,19 @@ public:
 		fPan->SetToolTip(text);
 	}
 
+	// the settings of another strip of this source (the layout changed)
+	void TakeOver(const SourceStrip& other)
+	{
+		fFader->SetValue(other.fFader->Value());
+		fPan->SetValue(other.fPan->Value());
+		fMute->SetValue(other.fMute->Value());
+		fSolo->SetValue(other.fSolo->Value());
+		ShowGain();
+	}
+
 	void SetLevels(float left, float right) { fMeter->SetLevels(left, right); }
 	int Index() const { return fIndex; }
+	const char* SourceName() const { return fSourceName.String(); }
 	float Pan() const { return fPan->Value() / 100.0f; }
 	float Gain() const { return fFader->Value() / 2.0f; }
 	bool Muted() const { return fMute->Value() == B_CONTROL_ON; }
@@ -349,12 +390,48 @@ public:
 
 private:
 	int				fIndex;
+	BString			fSourceName;
 	Label*			fDbText;
 	Fader*			fFader;
 	Fader*			fPan;
 	StereoMeter*	fMeter;
 	FlatCheck*		fMute;
 	FlatCheck*		fSolo;
+};
+
+
+// A right click in the audio mixer (but not on a fader, which it puts back) opens the menu of its layouts.
+class MixerMenuFilter : public BMessageFilter {
+public:
+	MixerMenuFilter(BView* mixer, uint32 menuMessage)
+		:
+		BMessageFilter(B_MOUSE_DOWN), fMixer(mixer), fMenuMessage(menuMessage)
+	{
+	}
+
+	filter_result Filter(BMessage* message, BHandler** target)
+	{
+		BView* view = target != NULL ? dynamic_cast<BView*>(*target) : NULL;
+		if (view == NULL || dynamic_cast<Fader*>(view) != NULL)
+			return B_DISPATCH_MESSAGE;
+		BView* at = view;
+		while (at != NULL && at != fMixer)
+			at = at->Parent();
+		int32 buttons = 0;
+		BPoint where;
+		if (at == NULL || message->FindInt32("buttons", &buttons) != B_OK || (buttons & B_SECONDARY_MOUSE_BUTTON) == 0)
+			return B_DISPATCH_MESSAGE;
+		BMessage open(fMenuMessage);
+		if (message->FindPoint("screen_where", &where) != B_OK && message->FindPoint("be:view_where", &where) == B_OK)
+			view->ConvertToScreen(&where);
+		open.AddPoint("where", where);
+		Looper()->PostMessage(&open);
+		return B_SKIP_MESSAGE;
+	}
+
+private:
+	BView*		fMixer;
+	uint32		fMenuMessage;
 };
 
 
@@ -562,6 +639,7 @@ struct StreamConfig {
 	bool		debug = false;			// the three above can be changed; without it they are hidden, and on
 	bool		audioOnly = false;		// the source that was chosen: sound alone (or else the screen)
 	bool		preview = true;			// the preview is shown
+	bool		mixerRows = false;		// the audio mixer's sources lie one over the other, not side by side
 	bool		eqOn = false;			// the master equalizer
 	float		eqBands[kEqBands] = {};	// dB
 	std::map<std::string, int>	hubModes;	// by program name: what it gets from the hub, 0 both channels, 1 left, 2 right
@@ -633,6 +711,7 @@ struct StreamConfig {
 		}
 		if (message.FindBool("audioonly", &flag) == B_OK) audioOnly = flag;
 		if (message.FindBool("preview", &flag) == B_OK) preview = flag;
+		if (message.FindBool("mixerrows", &flag) == B_OK) mixerRows = flag;
 		if (message.FindBool("eqon", &flag) == B_OK) eqOn = flag;
 		float gain;
 		for (int i = 0; i < kEqBands; i++) {
@@ -677,6 +756,7 @@ struct StreamConfig {
 		message.AddBool("debug", debug);
 		message.AddBool("audioonly", audioOnly);
 		message.AddBool("preview", preview);
+		message.AddBool("mixerrows", mixerRows);
 		message.AddBool("eqon", eqOn);
 		for (int i = 0; i < kEqBands; i++)
 			message.AddFloat("eqband", eqBands[i]);
@@ -926,6 +1006,7 @@ class NodesTab;
 class GraphCanvas : public BView {
 public:
 	GraphCanvas(NodesTab* tab);
+	BSize MinSize();		// the room its boxes take
 	void Draw(BRect updateRect);
 	void MouseDown(BPoint where);
 private:
@@ -948,8 +1029,6 @@ public:
 	{
 		SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
 		fCanvas = new GraphCanvas(this);
-		fCanvas->SetExplicitMinSize(BSize(400, 200));
-		fCanvas->SetExplicitPreferredSize(BSize(900, 280));
 
 		fTitle = new Label("title", "Select a box to see what can be done with it.", theme::kWindow, theme::kText, false,
 			B_SIZE_UNLIMITED);
@@ -961,13 +1040,9 @@ public:
 		fMixLabel = new Label("mixlabel", "In the mix as:", theme::kWindow);
 		fTakeOff = new FlatButton("takeoff", "Take off the mix", new BMessage(kMsgNodeTakeOff), theme::kWindow);
 		fPutBack = new FlatButton("putback", "Put on the mix again", new BMessage(kMsgNodePutBack), theme::kWindow);
-		fConnections = new BListView("connections");
+		fConnections = new PaneList("connections");
 		fConnections->SetSelectionMessage(new BMessage(kMsgNodeSelectEdge));
-		fConnections->SetViewColor(theme::kInset);
-		fConnections->SetLowColor(theme::kInset);
-		BScrollView* connectionsScroll = new BScrollView("connectionsscroll", fConnections, 0, false, true, B_NO_BORDER);
-		connectionsScroll->SetViewColor(theme::kWindow);
-		connectionsScroll->SetExplicitMinSize(BSize(200, 70));
+		ScrollPane* connectionsScroll = new ScrollPane("connectionsscroll", fConnections, theme::kWindow, BSize(200, 70));
 		fDisconnect = new FlatButton("disconnect", "Disconnect", new BMessage(kMsgNodeDisconnect), theme::kWindow);
 		fReconnectMenu = new BPopUpMenu("reconnect");
 		fReconnectField = new FlatMenu("reconnectfield", "Connect it to:", fReconnectMenu, theme::kWindow);
@@ -993,7 +1068,7 @@ public:
 
 		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_SMALL_SPACING)
 			.SetInsets(8, 8, 8, 8)
-			.Add(fCanvas, 3.0f)
+			.Add(new ScrollPane("graphscroll", fCanvas, theme::kInset, BSize(400, 200)), 3.0f)
 			.Add(fTitle)
 			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
 				.Add(fHubShare)
@@ -1380,6 +1455,9 @@ public:
 		if (Find(fSelected) == NULL)
 			fSelected = 0;
 		UpdatePanel();
+		ScrollPane* canvasPane = ScrollPane::Of(fCanvas);
+		if (canvasPane != NULL)
+			canvasPane->ContentChanged();
 		fCanvas->Invalidate();
 	}
 
@@ -1523,6 +1601,9 @@ private:
 		}
 		fConnections->SetSelectionMessage(new BMessage(kMsgNodeSelectEdge));
 		if (route) fMixLabel->Show(); else fMixLabel->Hide();
+		ScrollPane* connectionsPane = ScrollPane::Of(fConnections);
+		if (connectionsPane != NULL)
+			connectionsPane->ContentChanged();
 		fHubShare->SetEnabled(fEngineReady);
 		fHubShare->SetValue(fHubActive ? B_CONTROL_ON : B_CONTROL_OFF);
 		fHubField->SetEnabled(fEngineReady && fHubActive && node != NULL && node->app);
@@ -1693,6 +1774,19 @@ GraphCanvas::GraphCanvas(NodesTab* tab)
 	fTab(tab)
 {
 	SetViewColor(B_TRANSPARENT_COLOR);
+}
+
+
+BSize
+GraphCanvas::MinSize()
+{
+	float right = 40, bottom = 40;
+	const std::vector<GraphNode>& nodes = fTab->Nodes();
+	for (size_t n = 0; n < nodes.size(); n++) {
+		right = std::max(right, nodes[n].frame.right + 16);
+		bottom = std::max(bottom, nodes[n].frame.bottom + 14);
+	}
+	return BSize(right, bottom);
 }
 
 
@@ -1993,13 +2087,9 @@ public:
 			.AddGlue();
 
 		// the sources: what the video shows
-		fSources = new BListView("sources", B_SINGLE_SELECTION_LIST);
-		fSources->SetViewColor(theme::kInset);
-		fSources->SetLowColor(theme::kInset);
+		fSources = new PaneList("sources");
 		fSources->SetSelectionMessage(new BMessage(kMsgSource));
-		fSourceScroll = new BScrollView("sourcescroll", fSources, 0, false, true, B_NO_BORDER);
-		fSourceScroll->SetViewColor(theme::kDock);
-		fSourceScroll->SetExplicitMinSize(BSize(210, 120));
+		fSourceScroll = new ScrollPane("sourcescroll", fSources, theme::kDock, BSize(210, 120));
 		Panel* sources = new Panel("sourcespanel", theme::kDock);
 		BLayoutBuilder::Group<>(sources, B_VERTICAL, 0)
 			.SetInsets(6, 6, 6, 6)
@@ -2011,7 +2101,6 @@ public:
 		fStripsGroup = new Panel("strips", theme::kDock);
 		BGroupLayout* stripsLayout = new BGroupLayout(B_HORIZONTAL, 2);
 		fStripsGroup->SetLayout(stripsLayout);
-		fStripsGroup->SetExplicitMinSize(BSize(236, B_SIZE_UNSET));
 		fHint = new Label("hint", "Nothing playing yet.", theme::kDock, theme::kDimText, true, 220);
 		stripsLayout->AddView(fHint);
 		stripsLayout->AddItem(BSpaceLayoutItem::CreateGlue());
@@ -2084,27 +2173,27 @@ public:
 		Panel* mixer = new Panel("mixer", theme::kDock);
 		BLayoutBuilder::Group<>(mixer, B_HORIZONTAL, 6)
 			.SetInsets(6, 6, 6, 6)
-			.Add(fStripsGroup, 1.0f)
+			.Add(fStripsPane = new ScrollPane("stripspane", fStripsGroup, theme::kDock, BSize(236, 150)), 1.0f)
 			.Add(master, 0.0f);
+		AddCommonFilter(new MixerMenuFilter(mixer, kMsgMixerMenu));
+		AddCommonFilter(new WheelFilter());
+		ApplyMixerLayout();
 		mixer->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
-		fStripsGroup->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
 		controls->SetExplicitMaxSize(BSize(260, B_SIZE_UNLIMITED));
 
 		fPreviewView = new PreviewView();
 		fTime = new Label("time", "REC 00:00", theme::kWindow, theme::kDimText, false, 90);
 		fSourceName = new Label("sourcename", "", theme::kWindow, theme::kDimText);
 		fStatus = new Label("status", "Ready.", theme::kWindow, theme::kText, false, B_SIZE_UNLIMITED);
-		fLog = new BTextView("log");
+		fLog = new PaneText("log");
 		fLog->MakeEditable(false);
 		fLog->SetWordWrap(true);
 		fLog->SetViewColor(theme::kInset);
 		fLog->SetLowColor(theme::kInset);
 		fLog->SetFontAndColor(be_plain_font, B_FONT_ALL, &theme::kText);
-		BScrollView* logScroll = new BScrollView("logscroll", fLog, 0, false, true, B_NO_BORDER);
+		ScrollPane* logScroll = new ScrollPane("logscroll", fLog, theme::kInset, BSize(200, 90));
 		fLogScroll = logScroll;
-		logScroll->SetViewColor(theme::kWindow);
-		logScroll->SetExplicitMinSize(BSize(200, 70));
-		logScroll->SetExplicitPreferredSize(BSize(400, 90));
+		logScroll->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, 90));
 
 		Panel* mainTab = new Panel("Main", theme::kWindow);
 		BLayoutBuilder::Group<>(mainTab, B_VERTICAL, 6)
@@ -2367,7 +2456,10 @@ public:
 			{
 				const char* what = "";
 				message->FindString("what", &what);
-				if (strcmp(what, "debug") == 0) {
+				if (strcmp(what, "showlog") == 0) {
+					fShowLog->SetValue(B_CONTROL_ON);
+					PostMessage(kMsgShowLog);
+				} else if (strcmp(what, "debug") == 0) {
 					fDebug->SetValue(fDebug->Value() == B_CONTROL_ON ? B_CONTROL_OFF : B_CONTROL_ON);
 					PostMessage(kMsgDebug);
 				} else if (strcmp(what, "main") == 0)
@@ -2568,6 +2660,30 @@ public:
 				SendEq();
 				break;
 			}
+			case kMsgMixerMenu:
+			{
+				BPoint where;
+				if (message->FindPoint("where", &where) != B_OK)
+					break;
+				BPopUpMenu* menu = new BPopUpMenu("layout", false, false);
+				BMenuItem* columns = new BMenuItem("Sources side by side", new BMessage(kMsgMixerColumns));
+				BMenuItem* rows = new BMenuItem("Sources in rows (horizontal)", new BMessage(kMsgMixerRows));
+				(fStreamConfig.mixerRows ? rows : columns)->SetMarked(true);
+				menu->AddItem(columns);
+				menu->AddItem(rows);
+				menu->SetTargetForItems(this);
+				menu->SetAsyncAutoDestruct(true);
+				menu->Go(where, true, true, true);
+				break;
+			}
+			case kMsgMixerColumns:
+			case kMsgMixerRows:
+				if (fStreamConfig.mixerRows != (message->what == kMsgMixerRows)) {
+					fStreamConfig.mixerRows = message->what == kMsgMixerRows;
+					fStreamConfig.Save();
+					ApplyMixerLayout();
+				}
+				break;
 			case kMsgLimiter:
 				SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
 				fCeiling->SetEnabled(fLimiter->Value() == B_CONTROL_ON);
@@ -2911,10 +3027,11 @@ private:
 		}
 		BGroupLayout* layout = (BGroupLayout*)fStripsGroup->GetLayout();
 		ShowHint(false);
-		SourceStrip* strip = new SourceStrip(index, name);
+		SourceStrip* strip = new SourceStrip(index, name, fStreamConfig.mixerRows);
 		// before the glue at the end
 		layout->AddView(layout->CountItems() - 1, strip);
 		fStrips.push_back(strip);
+		fStripsPane->ContentChanged();
 	}
 
 	// The text in the strips' place while there is no strip. (Hide and Show count, and IsHidden() is true as well while the whole
@@ -2944,6 +3061,7 @@ private:
 			fHint->SetText("Nothing playing now.");
 			ShowHint(true);
 		}
+		fStripsPane->ContentChanged();
 	}
 
 	void ClearStrips()
@@ -2955,6 +3073,7 @@ private:
 		fStrips.clear();
 		fHint->SetText("Nothing playing yet.");
 		ShowHint(true);
+		fStripsPane->ContentChanged();
 	}
 
 	void ShowTime()
@@ -3035,6 +3154,27 @@ private:
 	{
 		if (fEqWindow.IsValid())
 			fEqWindow.SendMessage(B_QUIT_REQUESTED);
+	}
+
+	// The strips, made again for the layout that is chosen, with what was set on them.
+	void ApplyMixerLayout()
+	{
+		const bool rows = fStreamConfig.mixerRows;
+		BGroupLayout* layout = (BGroupLayout*)fStripsGroup->GetLayout();
+		std::vector<SourceStrip*> old;
+		old.swap(fStrips);
+		for (size_t i = 0; i < old.size(); i++)
+			old[i]->RemoveSelf();
+		layout->SetOrientation(rows ? B_VERTICAL : B_HORIZONTAL);
+		for (size_t i = 0; i < old.size(); i++) {
+			SourceStrip* strip = new SourceStrip(old[i]->Index(), old[i]->SourceName(), rows);
+			layout->AddView(layout->CountItems() - 1, strip);	// before the glue at the end
+			strip->TakeOver(*old[i]);
+			fStrips.push_back(strip);
+			delete old[i];
+		}
+		// side by side they stand as tall as they are; rows are as wide as they must be, and scroll up and down
+		fStripsPane->SetHolds(rows, !rows);
 	}
 
 	void ShowRecordButton()
@@ -3177,7 +3317,6 @@ private:
 		}
 
 		fRefreshingSources = true;
-		const BPoint scrolled = fSources->Bounds().LeftTop();
 		while (fSources->CountItems() > 0)
 			delete fSources->RemoveItem((int32)0);
 		for (size_t i = 0; i < entries.size(); i++) {
@@ -3185,7 +3324,9 @@ private:
 			fSources->AddItem(item);
 		}
 		SelectSource(fSelectedSource);
-		fSources->ScrollTo(scrolled);
+		ScrollPane* pane = ScrollPane::Of(fSources);
+		if (pane != NULL)
+			pane->ContentChanged();
 		fRefreshingSources = false;
 		if (fSourceName != NULL) {
 			ShowSourceName();
@@ -3201,7 +3342,11 @@ private:
 		BString text(line);
 		text << "\n";
 		fLog->Insert(fLog->TextLength(), text.String(), text.Length());
-		fLog->ScrollToOffset(fLog->TextLength());
+		ScrollPane* pane = ScrollPane::Of(fLog);
+		if (pane != NULL) {
+			pane->ContentChanged();
+			pane->ScrollToEnd();
+		}
 	}
 
 	Engine				fEngine;
@@ -3211,12 +3356,13 @@ private:
 	FlatButton*			fMixerButton;
 	FlatButton*			fNodesButton;
 	FlatButton*			fEqButton;
+	ScrollPane*			fStripsPane = NULL;
 	BMessenger			fEqWindow;
 	BMessenger			fAddonWindow;
 	int					fTrayTicks = 0;
 	BView*				fPageBar;
 	BListView*			fSources;
-	BScrollView*		fSourceScroll;
+	ScrollPane*			fSourceScroll;
 	int32				fSelectedSource = kSourceDesktop;
 	bool				fRefreshingSources = false;
 	bool				fSourcesEnabled = true;
@@ -3232,7 +3378,7 @@ private:
 	FlatCheck*			fDebug;
 	NodesTab*			fNodes;
 	FlatCheck*			fShowLog;
-	BScrollView*		fLogScroll;
+	BView*				fLogScroll;
 	float				fLogHeight = 100;
 	bool				fEngineReady = false;		// hrecord is connected to the sources
 	bool				fRecordAfterReady = false;	// Record was pressed before it was

@@ -169,7 +169,10 @@ The **Mixer** page has a preview of what will be recorded and three docks under 
 - **Sources**: what the video shows. **Entire desktop**, **Sound only (no screen)**, or one of the open windows.
 - **Audio Mixer**: every program that plays gets a strip with a level meter, a volume fader, left/right balance,
   mute and solo; the master section has a mix fader, a level meter (after the limiter), the limiter's on/off, ceiling and
-  release, and a gain-reduction bar. A right-click on a fader or balance slider resets it.
+  release, and a gain-reduction bar. A right-click on a fader or balance slider resets it. A right-click elsewhere in the
+  mixer chooses the layout: the sources **side by side**, or **in rows**, one over the other, as OBS Studio shows them. When
+  they do not fit, the mixer scrolls (its rounded scroll bar, or the mouse wheel anywhere but on a fader).
+  The list of sources, the log, and the boxes and the connection list of the Nodes page scroll the same way.
 - **Controls**: Start/Stop Recording, Stream live and its settings, the screen quality, and boxes for the preview, the
   log and the advanced options.
 

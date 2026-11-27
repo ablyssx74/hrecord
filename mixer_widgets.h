@@ -10,7 +10,9 @@
 #include <ListItem.h>
 #include <ListView.h>
 #include <MenuItem.h>
+#include <MessageFilter.h>
 #include <PopUpMenu.h>
+#include <TextView.h>
 #include <String.h>
 #include <View.h>
 #include <Window.h>
@@ -565,6 +567,297 @@ private:
 	bool		fVertical;
 	rgb_color	fBackground;
 	bool		fDragging;
+};
+
+
+// A box that shows a view larger than itself, with a rounded scroll bar (a pill, as in Cricket) along its bottom and its right
+// side, each there only when there is something to scroll that way. The view inside lays itself out; it gets the room there is,
+// or what it needs at least when that is more.
+class ScrollPane : public BView {
+public:
+	// holdsWidth, holdsHeight: the pane asks for the content's own width or height (that way never scrolls while the window has
+	// the room for it); otherwise it asks only for `least`.
+	ScrollPane(const char* name, BView* content, rgb_color background, BSize least)
+		:
+		BView(name, B_WILL_DRAW | B_FRAME_EVENTS | B_FULL_UPDATE_ON_RESIZE),
+		fContent(content), fBackground(background), fLeast(least), fHoldWidth(false), fHoldHeight(false)
+	{
+		SetViewColor(background);
+		fViewport = new BView("viewport", 0);
+		fViewport->SetViewColor(background);
+		fViewport->AddChild(fContent);
+		AddChild(fViewport);
+	}
+
+	void SetHolds(bool width, bool height)
+	{
+		fHoldWidth = width;
+		fHoldHeight = height;
+		fAt = BPoint(0, 0);
+		ContentChanged();
+	}
+
+	// Something was added to the view inside, or taken out of it.
+	void ContentChanged()
+	{
+		InvalidateLayout();
+		Arrange();
+	}
+
+	BSize MinSize()
+	{
+		const BSize content = fContent->MinSize();
+		// (with room for the other way's bar, which would otherwise make this way scroll too)
+		return BSize(fHoldWidth ? std::max(fLeast.width, content.width + kBar) : fLeast.width,
+			fHoldHeight ? std::max(fLeast.height, content.height + kBar) : fLeast.height);
+	}
+
+	BSize PreferredSize() { return MinSize(); }
+	BSize MaxSize() { return BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED); }
+
+	void AttachedToWindow()
+	{
+		BView::AttachedToWindow();
+		Arrange();
+	}
+
+	void FrameResized(float, float) { Arrange(); }
+	void DoLayout() { Arrange(); }
+
+	// The pane that a view is the content of, or NULL.
+	static ScrollPane* Of(BView* content)
+	{
+		return content != NULL && content->Parent() != NULL ? dynamic_cast<ScrollPane*>(content->Parent()->Parent()) : NULL;
+	}
+
+	void ScrollToEnd() { MoveTo_(BPoint(fAt.x, fSize.height)); }
+
+	// The wheel: up and down, or along the one way there is to go.
+	bool Wheel(BMessage* message)
+	{
+		float deltaX = 0.0f, deltaY = 0.0f;
+		message->FindFloat("be:wheel_delta_x", &deltaX);
+		message->FindFloat("be:wheel_delta_y", &deltaY);
+		if (!fAcross && !fDown)
+			return false;
+		if (!fDown && deltaX == 0.0f)
+			deltaX = deltaY;
+		MoveTo_(BPoint(fAt.x + (fAcross ? deltaX * 40 : 0), fAt.y + (fDown ? deltaY * 40 : 0)));
+		return true;
+	}
+
+	void Draw(BRect)
+	{
+		if (fAcross)
+			DrawThumb(Thumb(false), fDragging == 1);
+		if (fDown)
+			DrawThumb(Thumb(true), fDragging == 2);
+	}
+
+	void MouseDown(BPoint where)
+	{
+		int32 buttons = 0;
+		if (Window() != NULL && Window()->CurrentMessage() != NULL)
+			Window()->CurrentMessage()->FindInt32("buttons", &buttons);
+		if ((buttons & B_PRIMARY_MOUSE_BUTTON) == 0)
+			return;
+		for (int way = 1; way <= 2; way++) {
+			const bool down = way == 2;
+			if (down ? !fDown : !fAcross)
+				continue;
+			if (down ? where.x < fRoom.width : where.y < fRoom.height)
+				continue;
+			const BRect thumb = Thumb(down);
+			const float at = down ? where.y : where.x;
+			const float from = down ? thumb.top : thumb.left, to = down ? thumb.bottom : thumb.right;
+			if (at >= from && at <= to) {
+				fDragging = way;
+				fGrab = at - from;
+				SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
+				Invalidate();
+			} else {
+				// beside the pill: a page that way
+				const float page = (at < from ? -0.8f : 0.8f) * (down ? fRoom.height : fRoom.width);
+				MoveTo_(down ? BPoint(fAt.x, fAt.y + page) : BPoint(fAt.x + page, fAt.y));
+			}
+		}
+	}
+
+	void MouseMoved(BPoint where, uint32, const BMessage*)
+	{
+		if (fDragging == 0)
+			return;
+		const bool down = fDragging == 2;
+		const BRect thumb = Thumb(down);
+		const float room = down ? fRoom.height : fRoom.width;
+		const float content = down ? fSize.height : fSize.width;
+		const float travel = room - (down ? thumb.Height() : thumb.Width());
+		if (travel <= 0)
+			return;
+		const float at = ((down ? where.y : where.x) - fGrab) / travel * (content - room);
+		MoveTo_(down ? BPoint(fAt.x, at) : BPoint(at, fAt.y));
+	}
+
+	void MouseUp(BPoint)
+	{
+		if (fDragging != 0) {
+			fDragging = 0;
+			Invalidate();
+		}
+	}
+
+private:
+	static const int kBar = 10;
+
+	void Arrange()
+	{
+		const float width = Bounds().Width() + 1, height = Bounds().Height() + 1;
+		if (width <= 1 || height <= 1)
+			return;
+		// (twice: text that is wrapped needs a height that depends on the width it is given)
+		for (int pass = 0; pass < 2; pass++) {
+			const BSize least = fContent->MinSize();
+			const float needWidth = least.width + 1, needHeight = least.height + 1;
+			// a bar takes room, which can make the other one needed
+			fAcross = needWidth > width;
+			fDown = needHeight > height - (fAcross ? kBar : 0);
+			if (fDown && !fAcross)
+				fAcross = needWidth > width - kBar;
+			fRoom = BSize(width - (fDown ? kBar : 0), height - (fAcross ? kBar : 0));
+			fSize = BSize(std::max(needWidth, fRoom.width), std::max(needHeight, fRoom.height));
+			fViewport->MoveTo(0, 0);
+			fViewport->ResizeTo(fRoom.width - 1, fRoom.height - 1);
+			fContent->ResizeTo(fSize.width - 1, fSize.height - 1);
+		}
+		MoveTo_(fAt);
+	}
+
+	void MoveTo_(BPoint at)
+	{
+		fAt.x = floorf(std::max(0.0f, std::min(at.x, fSize.width - fRoom.width)));
+		fAt.y = floorf(std::max(0.0f, std::min(at.y, fSize.height - fRoom.height)));
+		fContent->MoveTo(-fAt.x, -fAt.y);
+		Invalidate();
+	}
+
+	BRect Thumb(bool down) const
+	{
+		const float room = down ? fRoom.height : fRoom.width;
+		const float content = down ? fSize.height : fSize.width;
+		const float length = std::max(24.0f, floorf(room * room / std::max(content, 1.0f)));
+		const float travel = room - length;
+		const float from = content > room ? floorf((down ? fAt.y : fAt.x) / (content - room) * travel) : 0;
+		if (down)
+			return BRect(fRoom.width + 2, from, fRoom.width + kBar - 2, from + length - 1);
+		return BRect(from, fRoom.height + 2, from + length - 1, fRoom.height + kBar - 2);
+	}
+
+	void DrawThumb(BRect thumb, bool held)
+	{
+		SetHighColor(held ? theme::kDimText : theme::kButtonHover);
+		const float radius = std::min(thumb.Width(), thumb.Height()) / 2;
+		FillRoundRect(thumb, radius, radius);
+	}
+
+	BView*		fContent;
+	BView*		fViewport;
+	rgb_color	fBackground;
+	BSize		fLeast;
+	bool		fHoldWidth, fHoldHeight;
+	bool		fAcross = false, fDown = false;
+	BSize		fRoom, fSize;
+	BPoint		fAt;
+	int			fDragging = 0;		// 1: the bar along the bottom, 2: the one at the side
+	float		fGrab = 0;
+};
+
+
+// The mouse wheel scrolls the pane under the pointer, except over a fader, which it moves.
+class WheelFilter : public BMessageFilter {
+public:
+	WheelFilter()
+		:
+		BMessageFilter(B_MOUSE_WHEEL_CHANGED)
+	{
+	}
+
+	filter_result Filter(BMessage* message, BHandler** target)
+	{
+		BView* view = target != NULL ? dynamic_cast<BView*>(*target) : NULL;
+		if (view == NULL || dynamic_cast<Fader*>(view) != NULL)
+			return B_DISPATCH_MESSAGE;
+		for (; view != NULL; view = view->Parent()) {
+			ScrollPane* pane = dynamic_cast<ScrollPane*>(view);
+			if (pane != NULL && pane->Wheel(message))
+				return B_SKIP_MESSAGE;
+		}
+		return B_DISPATCH_MESSAGE;
+	}
+};
+
+
+// A list inside a ScrollPane: it is as tall as its lines, and the pane does the scrolling.
+class PaneList : public BListView {
+public:
+	PaneList(const char* name)
+		:
+		BListView(name, B_SINGLE_SELECTION_LIST)
+	{
+		SetViewColor(theme::kInset);
+		SetLowColor(theme::kInset);
+	}
+
+	BSize MinSize()
+	{
+		BFont font;
+		GetFont(&font);
+		// (every line is a SourceItem, one line of text high)
+		return BSize(40, CountItems() * (LineHeight(&font) + 9));
+	}
+
+	// the lines are cut to the list's width: all of them are drawn anew when it changes
+	void FrameResized(float width, float height)
+	{
+		BListView::FrameResized(width, height);
+		Invalidate();
+	}
+
+	// (it never scrolls itself)
+	void ScrollTo(BPoint) { BListView::ScrollTo(B_ORIGIN); }
+};
+
+
+// The log inside a ScrollPane: it is as tall as its text.
+class PaneText : public BTextView {
+public:
+	PaneText(const char* name)
+		:
+		BTextView(name), fWidth(0)
+	{
+	}
+
+	BSize MinSize()
+	{
+		const int32 lines = CountLines();
+		return BSize(120, lines > 0 ? TextHeight(0, lines - 1) + 6 : 20);
+	}
+
+	void FrameResized(float width, float height)
+	{
+		BTextView::FrameResized(width, height);
+		if (width != fWidth) {
+			// the text is wrapped anew, so its height may be another
+			fWidth = width;
+			ScrollPane* pane = ScrollPane::Of(this);
+			if (pane != NULL)
+				pane->ContentChanged();
+		}
+	}
+
+	void ScrollTo(BPoint) { BTextView::ScrollTo(B_ORIGIN); }
+
+private:
+	float	fWidth;
 };
 
 
