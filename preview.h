@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 
+#include "cursor_overlay.h"
 #include "window_capture.h"
 
 
@@ -99,6 +100,7 @@ public:
 	std::atomic<int32>	source { kSourceDesktop };
 	std::atomic<bool>	enabled { true };
 	std::atomic<bool>	recording { false };
+	std::atomic<bool>	cursor { true };	// the mouse pointer is part of the picture
 	std::atomic<bool>	visible { true };
 	std::atomic<int32>	width { 640 };		// the room there is for the picture
 	std::atomic<int32>	height { 360 };
@@ -167,6 +169,18 @@ private:
 		return bitmap;
 	}
 
+	// The mouse pointer in a picture that shows "area" of the screen, where it is part of what a recording shows.
+	BBitmap* _AddCursor(BBitmap* bitmap, BRect area)
+	{
+		if (bitmap != NULL && cursor) {
+			const int32 w = bitmap->Bounds().IntegerWidth() + 1;
+			CursorOverlay overlay;
+			overlay.Draw((uint8*)bitmap->Bits(), bitmap->BytesPerRow(), w, bitmap->Bounds().IntegerHeight() + 1,
+				area.left, area.top, (float)w / (area.IntegerWidth() + 1));
+		}
+		return bitmap;
+	}
+
 	void _Send(BBitmap* bitmap, const char* note)
 	{
 		BMessage message(kMsgPreview);
@@ -184,6 +198,7 @@ private:
 	{
 		WindowPicture window;
 		ScreenFollower follower;
+		PictureOrigin origin;
 		while (!fQuit) {
 			const int32 shown = source.load();
 			if (!enabled || !visible || shown == kSourceAudioOnly || pending) {
@@ -198,6 +213,8 @@ private:
 			const bool composited = IsCompositedDesktop();
 			bigtime_t rest = recording ? 200000 : 100000;
 			BRect part = frame;
+			client_window_info windowInfo = {};
+			bool haveInfo = false;
 
 			if (shown >= 0) {
 				follower.Stop();
@@ -210,6 +227,8 @@ private:
 				const bool hidden = info->is_mini || info->show_hide_level > 0
 					|| (info->workspaces & (1u << current_workspace())) == 0;
 				part = WindowOuterRect(*info) & frame;
+				windowInfo = *info;
+				haveInfo = true;
 				free(info);
 				if (hidden) {
 					const char* note = "The window is minimized or on another workspace. A recording keeps its last picture.";
@@ -221,8 +240,17 @@ private:
 					_Wait(1000000, shown);
 					continue;
 				}
-				if (window.Available() && window.Read(shown, width.load(), height.load()) == B_OK) {
-					_Send(_Shrink(window.Bits(), window.BytesPerRow(), window.Width(), window.Height()), "");
+				// (with the pointer the picture is read in its own size, which placing the pointer in it needs)
+				const bool pointer = cursor;
+				if (window.Available() && window.Read(shown, pointer ? screenWidth + 128 : width.load(),
+						pointer ? screenHeight + 128 : height.load()) == B_OK) {
+					BBitmap* picture = _Shrink(window.Bits(), window.BytesPerRow(), window.Width(), window.Height());
+					if (pointer && haveInfo) {
+						const BPoint at = origin.Get(windowInfo, window.Bits(), window.BytesPerRow(), window.Width(),
+							window.Height());
+						_AddCursor(picture, BRect(at.x, at.y, at.x + window.Width() - 1, at.y + window.Height() - 1));
+					}
+					_Send(picture, "");
 					_Wait(rest, shown);
 					continue;
 				}
@@ -234,7 +262,7 @@ private:
 			} else if (composited) {
 				const uint8* bits = follower.Read(screenWidth, screenHeight);
 				if (bits != NULL) {
-					_Send(_Shrink(bits, screenWidth * 4, screenWidth, screenHeight), "");
+					_Send(_AddCursor(_Shrink(bits, screenWidth * 4, screenWidth, screenHeight), frame), "");
 					_Wait(rest, shown);
 					continue;
 				}
@@ -251,7 +279,8 @@ private:
 				&& (whole->ColorSpace() == B_RGB32 || whole->ColorSpace() == B_RGBA32)) {
 				const int32 w = std::min(whole->Bounds().IntegerWidth() + 1, part.IntegerWidth() + 1);
 				const int32 h = std::min(whole->Bounds().IntegerHeight() + 1, part.IntegerHeight() + 1);
-				_Send(_Shrink((const uint8*)whole->Bits(), whole->BytesPerRow(), w, h),
+				_Send(_AddCursor(_Shrink((const uint8*)whole->Bits(), whole->BytesPerRow(), w, h),
+						BRect(part.left, part.top, part.left + w - 1, part.top + h - 1)),
 					shown >= 0 ? "Seen from the screen: what covers the window is recorded too." : "");
 			} else
 				_Send(NULL, "No preview of this screen.");

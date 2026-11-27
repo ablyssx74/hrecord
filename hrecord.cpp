@@ -8,6 +8,7 @@
 #include <WindowInfo.h> // Private Window Kit API -- see EnumerateVisibleWindows()
 #include <AppServerLink.h> // Private: the screen observer of a composited desktop (RenkuOS) -- see SetupScreenObserver()
 #include "window_capture.h" // reading one window (--window, "capwindow")
+#include "cursor_overlay.h" // the mouse pointer in the picture (--cursor, "cursor")
 #include "eq.h" // the master equalizer ("eq", "eqband")
 #include <dlfcn.h> // dlsym() -- is_composited_desktop()
 #include <StorageKit.h>
@@ -3236,6 +3237,7 @@ const int kMeterMaxSources = 32;
 bool g_meter = false;                           // --meter
 std::atomic<int> g_meterMs(1000);               // --meter-ms <n>: how often --meter reports
 bool g_control = false;                         // --control: commands are read from stdin
+std::atomic<bool> g_showCursor(false);        // --cursor, "cursor": the mouse pointer in the picture
 std::atomic<bool> g_limiterOn(true);            // --no-limiter turns it off
 std::atomic<float> g_ceilingDb(-1.0f);          // --ceiling <dB>
 std::atomic<float> g_releaseMs(80.0f);          // the limiter's release
@@ -3493,6 +3495,7 @@ extern std::atomic<bool> g_mixHubExclude;
 //                     a program that plays (rakarrack) are in it, as the speakers get them. Only with --allaudio
 //   detach <node>     the program with that node id is put back on the Mixer and left alone (until "attach")
 //   attach <node>     it may be tapped again
+//   cursor <0|1>      the mouse pointer in the picture (also while a recording runs); 0 (the default) leaves it out
 //   capwindow <token>   the next recording shows only the window with that app_server token (-1: the whole desktop)
 //   record <screen 0|1> <quality 0|1|2>     --standby only: start a recording (the screen too, and its quality: low, medium, high)
 //   stoprecord        --standby only: end the recording; the sources stay connected
@@ -3536,6 +3539,8 @@ void ControlLoop() {
             g_pendingSetup.stream = g_pendingStream;
             g_pendingSetup.windowToken = g_pendingWindowToken;
             g_recordRequested = true;
+        } else if (sscanf(line, "cursor %d", &v) == 1) {
+            g_showCursor = (v != 0);
         } else if (sscanf(line, "capwindow %d", &n) == 1) {
             g_pendingWindowToken = n;
         } else if (strncmp(line, "stoprecord", 10) == 0 && g_standby) {
@@ -4770,6 +4775,17 @@ public:
     int StartWidth() const { return fStartWidth; }
     int StartHeight() const { return fStartHeight; }
 
+    // Where the picture of the last Grab() lies on the screen, "scale" of its pixels to one of the screen's. false: the
+    // window is out of sight.
+    bool Place(float* _originX, float* _originY, float* _scale) const {
+        if (!fVisible)
+            return false;
+        *_originX = fOrigin.x;
+        *_originY = fOrigin.y;
+        *_scale = fScale;
+        return true;
+    }
+
     // The current picture (BGRA), or NULL when there is none.
     const uint8* Grab(BScreen& screen, BBitmap* screenBitmap, int screenWidth, int screenHeight, int* _width,
             int* _height, int* _bytesPerRow) {
@@ -4783,7 +4799,9 @@ public:
         const bool visible = !info->is_mini && info->show_hide_level <= 0
             && (info->workspaces & (1u << current_workspace())) != 0;
         const BRect outer = WindowOuterRect(*info);
+        const client_window_info window = *info;
         free(info);
+        fVisible = visible;
 
         if (fServerRead) {
             // (with no picture yet, a window that is out of sight is asked for the small one app_server keeps of it)
@@ -4794,6 +4812,15 @@ public:
                 *_width = fPicture.Width();
                 *_height = fPicture.Height();
                 *_bytesPerRow = fPicture.BytesPerRow();
+                // where that picture lies on the screen, for the mouse pointer (one that was made smaller to fit is taken
+                // to be the window with its border and tab)
+                fScale = 1;
+                if (*_width >= fMaxWidth || *_height >= fMaxHeight) {
+                    fOrigin = outer.LeftTop();
+                    fScale = std::min(1.0f, (float)*_width / (outer.IntegerWidth() + 1));
+                } else if (visible && g_showCursor && fPicture.Bits() != nullptr) {
+                    fOrigin = fPictureOrigin.Get(window, fPicture.Bits(), *_bytesPerRow, *_width, *_height);
+                }
                 return fPicture.Bits();
             }
         }
@@ -4808,6 +4835,8 @@ public:
         // (the screen may have got smaller since the rectangle was taken)
         if (!fRect.IsValid() || fRect.right >= screenWidth || fRect.bottom >= screenHeight)
             return nullptr;
+        fOrigin = fRect.LeftTop();
+        fScale = 1;
         *_width = fRect.IntegerWidth() + 1;
         *_height = fRect.IntegerHeight() + 1;
         *_bytesPerRow = screenBitmap->BytesPerRow();
@@ -4821,10 +4850,35 @@ private:
     WindowPicture fPicture;
     bool fServerRead = false;
     bool fClosed = false;
+    bool fVisible = false;
+    BPoint fOrigin;
+    float fScale = 1;
+    PictureOrigin fPictureOrigin;
     BRect fRect;
     int fStartWidth = 0, fStartHeight = 0;
     int fMaxWidth = 0, fMaxHeight = 0;
 };
+
+// sws_scale() of a captured picture, with the mouse pointer in it while that is wanted. The picture shows the screen from
+// (originX, originY) on, "scale" of its pixels to one of the screen, and is left as it was.
+static void ScaleCapture(SwsContext* context, const uint8* bits, int bytesPerRow, int width, int height, float originX,
+        float originY, float scale, uint8_t* const* dstData, const int* dstLinesize) {
+    static CursorOverlay cursor; // (only the capture loop comes here)
+    static bool told = false;
+    const bool show = g_showCursor.load(std::memory_order_relaxed);
+    // (also while it is not wanted, until it is known whether this screen's picture has it anyway)
+    if (show || !cursor.ScreenHasPointer())
+        cursor.Draw(const_cast<uint8*>(bits), bytesPerRow, width, height, originX, originY, scale, show);
+    if (!told && cursor.ScreenHasPointer()) {
+        told = true;
+        std::cout << "[i] On this video driver the mouse pointer is part of the screen's picture: it is recorded whether "
+            "it is asked for or not." << std::endl;
+    }
+    const uint8_t* srcData[] = { bits, nullptr, nullptr, nullptr };
+    int srcLinesize[] = { bytesPerRow, 0, 0, 0 };
+    sws_scale(context, srcData, srcLinesize, 0, height, dstData, dstLinesize);
+    cursor.Restore();
+}
 
 static int RunRecording(const RecordingSetup& setup) {
     bool audioOnly = setup.audioOnly;
@@ -5326,9 +5380,16 @@ static int RunRecording(const RecordingSetup& setup) {
                     swsCtx = sws_getCachedContext(swsCtx, sourceWidth, sourceHeight, AV_PIX_FMT_BGRA,
                         windowDstW, windowDstH, videoCodecCtx->pix_fmt,
                         profile.swsFlags, nullptr, nullptr, nullptr);
-                    const uint8_t* srcData[] = { source, nullptr, nullptr, nullptr };
-                    int srcLinesize[] = { sourceBytesPerRow, 0, 0, 0 };
-                    sws_scale(swsCtx, srcData, srcLinesize, 0, sourceHeight, windowDstData, encodingFrame->linesize);
+                    // (while the window is out of sight its last picture stays, without the pointer)
+                    float originX = 0, originY = 0, scale = 1;
+                    if (windowSource.Place(&originX, &originY, &scale)) {
+                        ScaleCapture(swsCtx, source, sourceBytesPerRow, sourceWidth, sourceHeight, originX, originY,
+                            scale, windowDstData, encodingFrame->linesize);
+                    } else {
+                        const uint8_t* srcData[] = { source, nullptr, nullptr, nullptr };
+                        int srcLinesize[] = { sourceBytesPerRow, 0, 0, 0 };
+                        sws_scale(swsCtx, srcData, srcLinesize, 0, sourceHeight, windowDstData, encodingFrame->linesize);
+                    }
                 }
 
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
@@ -5398,9 +5459,7 @@ static int RunRecording(const RecordingSetup& setup) {
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
                         dstW, dstH, videoCodecCtx->pix_fmt,
                         profile.swsFlags, nullptr, nullptr, nullptr);
-                    uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-                    int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                    sws_scale(swsCtx, srcData, srcLinesize, 0, height,
+                    ScaleCapture(swsCtx, (const uint8*)pixelBuffer, (int)screenBitmap->BytesPerRow(), width, height, 0, 0, 1,
                         dstData, encodingFrame->linesize);
                 }
 
@@ -5545,9 +5604,7 @@ static int RunRecording(const RecordingSetup& setup) {
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
                         dstW, dstH, videoCodecCtx->pix_fmt,
                         profile.swsFlags, nullptr, nullptr, nullptr);
-                    uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-                    int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                    sws_scale(swsCtx, srcData, srcLinesize, 0, height,
+                    ScaleCapture(swsCtx, (const uint8*)pixelBuffer, (int)screenBitmap->BytesPerRow(), width, height, 0, 0, 1,
                         dstData, encodingFrame->linesize);
                 }
 
@@ -5595,9 +5652,8 @@ static int RunRecording(const RecordingSetup& setup) {
                     swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
                         dstW, dstH, videoCodecCtx->pix_fmt,
                         profile.swsFlags, nullptr, nullptr, nullptr);
-                    uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-                    int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                    sws_scale(swsCtx, srcData, srcLinesize, 0, height, dstData, encodingFrame->linesize);
+                    ScaleCapture(swsCtx, (const uint8*)pixelBuffer, (int)screenBitmap->BytesPerRow(), width, height, 0, 0, 1,
+                        dstData, encodingFrame->linesize);
 
                     bigtime_t currentPresentationTime = system_time() - recordingStartTime;
                     encodingFrame->pts = currentPresentationTime;
@@ -5624,9 +5680,8 @@ static int RunRecording(const RecordingSetup& setup) {
                                               dstW, dstH, videoCodecCtx->pix_fmt,
                                               profile.swsFlags, nullptr, nullptr, nullptr);
 
-                uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-                int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                sws_scale(swsCtx, srcData, srcLinesize, 0, height, dstData, encodingFrame->linesize);
+                ScaleCapture(swsCtx, (const uint8*)pixelBuffer, (int)screenBitmap->BytesPerRow(), width, height, 0, 0, 1,
+                    dstData, encodingFrame->linesize);
 
                 // PTS is determined by actual elapsed real-world microseconds
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
@@ -5660,9 +5715,7 @@ static int RunRecording(const RecordingSetup& setup) {
                 swsCtx = sws_getCachedContext(swsCtx, width, height, AV_PIX_FMT_BGRA,
                     dstW, dstH, videoCodecCtx->pix_fmt,
                     profile.swsFlags, nullptr, nullptr, nullptr);
-                uint8_t* srcData[] = { (uint8_t*)pixelBuffer, nullptr, nullptr, nullptr };
-                int srcLinesize[] = { (int)screenBitmap->BytesPerRow(), 0, 0, 0 };
-                sws_scale(swsCtx, srcData, srcLinesize, 0, height,
+                ScaleCapture(swsCtx, (const uint8*)pixelBuffer, (int)screenBitmap->BytesPerRow(), width, height, 0, 0, 1,
                     dstData, encodingFrame->linesize);
 
                 bigtime_t currentPresentationTime = system_time() - recordingStartTime;
@@ -6034,6 +6087,8 @@ int main(int argc, char* argv[]) {
                 std::cout << "--source-gain takes <n>=<dB>, for example 2=-6" << std::endl;
                 return 0;
             }
+        } else if (strcmp(argv[i], "--cursor") == 0) {
+            g_showCursor = true;
         } else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
             captureWindowToken = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--low") == 0) {
@@ -6050,7 +6105,7 @@ int main(int argc, char* argv[]) {
                 "[--list-audio-inputs] [--logfps] [--meter] [--no-limiter] [--ceiling <dB>] "
                 "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control] "
                 "[--standby] [--stream <rtmp[s]://... | rtsp://...> | --stream-env] [--stream-bitrate <kbps>] [--stream-audio-bitrate <kbps>] "
-                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--window <app_server window token>] [--detect-realtime] [--detect-stream] [--stop-reapers]" << std::endl;
+                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--window <app_server window token>] [--cursor] [--detect-realtime] [--detect-stream] [--stop-reapers]" << std::endl;
             std::cout << "  --stop-reapers  ends the small \"hrecord --reap\" helpers that stay after streaming an app's audio\n"
                 "                  (each waits for that app to quit, then removes its leftover Mixer entry)." << std::endl;
             return 0;

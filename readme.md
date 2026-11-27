@@ -16,7 +16,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] [--list-audio-inputs] [--logfps] [--window <token>]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] [--list-audio-inputs] [--logfps] [--window <token>] [--cursor]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -199,9 +199,18 @@ On a composited desktop whose app_server can hand out a window's pixels (a Renku
 build), the whole window is recorded, also while other windows cover it. Everywhere else the part of the screen the window
 covers is recorded, with whatever is on top of it. The video has the size the window had when the recording began; a window
 that is resized is fitted into it. While the window is minimized or on another workspace the last picture stays, and once it
-is closed the video is black. The mouse pointer and the window's menus and pop-ups are not in the picture when it comes from
+is closed the video is black. The window's menus and pop-ups are not in the picture when it comes from
 the compositor. On the command line: `--window <app_server window token>`; on the control channel: `capwindow <token>`
 (-1: the whole desktop) before `record`.
+
+### The mouse pointer
+
+**Show cursor**, beside **Stream live**, puts the mouse pointer into recordings, streams and the preview; it can be changed
+while a recording runs. In a recording of one window the pointer is there while it is over the window's area. On the command
+line the pointer is left out unless `--cursor` is given; on the control channel: `cursor <0|1>`.
+
+Without a compositor, some video drivers (for example Intel graphics on Haiku) have the pointer in every reading of the
+screen. There it is recorded whether **Show cursor** is on or not, and the log says so.
 
 ### The preview
 

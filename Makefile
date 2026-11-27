@@ -85,7 +85,7 @@ $(TRAY_TARGET): tray.cpp tray.h hrecord_mixer.rdef
 	mimeset -f $(TRAY_TARGET)
 
 # The mixer window: runs hrecord as its engine
-gui: tray hrecord_gui.cpp window_capture.h mixer_widgets.h preview.h tray.h eq.h addon_window.h hrecord_mixer.rdef VERSION
+gui: tray hrecord_gui.cpp window_capture.h cursor_overlay.h mixer_widgets.h preview.h tray.h eq.h addon_window.h hrecord_mixer.rdef VERSION
 	$(CXX) -std=c++17 -O2 -Wall -DHRECORD_VERSION=\"v$(VERSION)\" -I./compat $(INCLUDES) \
 		-I/boot/system/develop/headers/private/shared hrecord_gui.cpp -o hrecord_mixer $(LIB_PATH) -lbe -lmedia -lroot -lnetwork \
 		-lcurl -lshared
@@ -110,7 +110,7 @@ $(GUI_RSRCS): hrecord.rdef VERSION
 	rc -o $@ hrecord.version.rdef
 
 # The version is compiled in: a new VERSION means a new build of the file that has it
-hrecord.o: VERSION window_capture.h eq.h
+hrecord.o: VERSION window_capture.h cursor_overlay.h eq.h
 
 # General object file compilation hooks
 %.o: %.cpp

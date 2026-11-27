@@ -86,6 +86,7 @@ enum {
 	kMsgMixHub		= 'mxh!',
 	kMsgMixHubSelf	= 'mxs!',
 	kMsgStreamToggle	= 'stg!',
+	kMsgCursorToggle	= 'cur!',
 	kMsgStreamConfigure	= 'scf!',
 	kMsgStreamSaved		= 'ssv!',
 	kMsgStreamService	= 'ssc!',
@@ -639,6 +640,7 @@ struct StreamConfig {
 	bool		debug = false;			// the three above can be changed; without it they are hidden, and on
 	bool		audioOnly = false;		// the source that was chosen: sound alone (or else the screen)
 	bool		preview = true;			// the preview is shown
+	bool		cursor = true;			// the mouse pointer is recorded and streamed
 	bool		mixerRows = false;		// the audio mixer's sources lie one over the other, not side by side
 	bool		eqOn = false;			// the master equalizer
 	float		eqBands[kEqBands] = {};	// dB
@@ -711,6 +713,7 @@ struct StreamConfig {
 		}
 		if (message.FindBool("audioonly", &flag) == B_OK) audioOnly = flag;
 		if (message.FindBool("preview", &flag) == B_OK) preview = flag;
+		if (message.FindBool("cursor", &flag) == B_OK) cursor = flag;
 		if (message.FindBool("mixerrows", &flag) == B_OK) mixerRows = flag;
 		if (message.FindBool("eqon", &flag) == B_OK) eqOn = flag;
 		float gain;
@@ -756,6 +759,7 @@ struct StreamConfig {
 		message.AddBool("debug", debug);
 		message.AddBool("audioonly", audioOnly);
 		message.AddBool("preview", preview);
+		message.AddBool("cursor", cursor);
 		message.AddBool("mixerrows", mixerRows);
 		message.AddBool("eqon", eqOn);
 		for (int i = 0; i < kEqBands; i++)
@@ -2057,6 +2061,10 @@ public:
 		// the controls
 		fRecord = new FlatButton("record", "Start Recording", new BMessage(kMsgRecord), theme::kDock, theme::kAccent);
 		fStream = new FlatCheck("stream", "Stream live", new BMessage(kMsgStreamToggle), theme::kDock);
+		fCursor = new FlatCheck("cursor", "Show cursor", new BMessage(kMsgCursorToggle), theme::kDock);
+		fCursor->SetValue(fStreamConfig.cursor ? B_CONTROL_ON : B_CONTROL_OFF);
+		fCursor->SetToolTip("The mouse pointer in recordings and streams. Can be changed while one runs. On some video drivers "
+			"without a compositor the pointer is part of the screen's picture and is recorded either way.");
 		fStreamSettings = new FlatButton("streamsettings", "Stream settings" B_UTF8_ELLIPSIS,
 			new BMessage(kMsgStreamConfigure), theme::kDock);
 		static const char* const kQualities[] = { "Low", "Medium", "High" };
@@ -2076,7 +2084,11 @@ public:
 		BLayoutBuilder::Group<>(controls, B_VERTICAL, 6)
 			.SetInsets(8, 8, 8, 8)
 			.Add(fRecord)
-			.Add(fStream)
+			.AddGroup(B_HORIZONTAL, 10)
+				.Add(fStream)
+				.Add(fCursor)
+				.AddGlue()
+			.End()
 			.Add(fStreamSettings)
 			.Add(new Label("qualitytitle", "Screen quality", theme::kDock, theme::kDimText))
 			.Add(fQuality)
@@ -2253,6 +2265,7 @@ public:
 
 		fPreview.source = fSelectedSource;
 		fPreview.enabled = fStreamConfig.preview;
+		fPreview.cursor = fStreamConfig.cursor;
 		fPreview.Start(BMessenger(this));
 		BMessage refresh(kMsgSourceList);
 		fSourceRunner = new BMessageRunner(this, &refresh, 1000000);
@@ -2606,6 +2619,12 @@ public:
 					SetStatus("The H.264 add-on is installed: Stream live is on. Set the server in Stream settings.");
 				}
 				break;
+			case kMsgCursorToggle:
+				fStreamConfig.cursor = fCursor->Value() == B_CONTROL_ON;
+				fStreamConfig.Save();
+				fPreview.cursor = fStreamConfig.cursor;
+				SendCommand("cursor %d\n", fStreamConfig.cursor ? 1 : 0);
+				break;
 			case kMsgStreamConfigure:
 				(new StreamSettingsWindow(BMessenger(this), fStreamConfig))->Show();
 				break;
@@ -2808,6 +2827,7 @@ private:
 		SendCommand("release %d\n", (int)fRelease->Value() * 10);
 		SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
 		SendEq();
+		SendCommand("cursor %d\n", fStreamConfig.cursor ? 1 : 0);
 		SendCommand("mixhubself %d\n", fStreamConfig.LeaveOutWanted() ? 0 : 1);
 		if (fStreamConfig.MixHubWanted())
 			SendCommand("mixhub 1\n");
@@ -3391,6 +3411,7 @@ private:
 	FlatButton*			fRecord;
 	FlatCheck*			fRealtime;
 	FlatCheck*			fStream;
+	FlatCheck*			fCursor;
 	FlatButton*			fStreamSettings;
 	StreamConfig		fStreamConfig;
 	bool				fStreamAddon = false;
