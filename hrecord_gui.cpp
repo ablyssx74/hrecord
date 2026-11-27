@@ -1,6 +1,9 @@
 /*
  * hRecord Mixer: a window for hrecord.
  *
+ * It looks and is laid out much like OBS Studio: a preview of what will be recorded on top, and docks under it for the sources
+ * (the whole desktop, one window, or sound alone), the audio mixer and the controls.
+ *
  * It starts hrecord (the program that records) as its engine, with --allaudio --meter --control, reads what hrecord prints
  * (the sources it has tapped, and a line of levels a few times a second) and writes commands to its stdin (the gain, mute and solo
  * of a source, the gain of the mix and what the limiter does) while it records. hrecord on the command line is not changed by
@@ -10,6 +13,9 @@
 #include <Alert.h>
 #include <Application.h>
 #include <Button.h>
+#include <CardLayout.h>
+#include <Deskbar.h>
+#include <Entry.h>
 #include <CheckBox.h>
 #include <Entry.h>
 #include <FindDirectory.h>
@@ -34,7 +40,6 @@
 #include <Spinner.h>
 #include <Slider.h>
 #include <StringItem.h>
-#include <TabView.h>
 #include <StringView.h>
 #include <TextControl.h>
 #include <TextView.h>
@@ -57,8 +62,13 @@
 #include <string>
 #include <vector>
 
+#include "mixer_widgets.h"
+#include "preview.h"
+#include "tray.h"
+#include "eq.h"
 
-static const char* kAppSignature = "application/x-vnd.hrecord-mixer";
+
+static const char* kAppSignature = HRECORD_MIXER_SIGNATURE;
 
 enum {
 	kMsgRecord		= 'rec!',
@@ -85,7 +95,18 @@ enum {
 	kMsgShowLog			= 'slg!',
 	kMsgShowNodes		= 'snd!',
 	kMsgTestClick		= 'tcl!',
-	kMsgTestAction		= 'tac!'
+	kMsgTestAction		= 'tac!',
+	kMsgSource			= 'src!',
+	kMsgSourceList		= 'wls!',
+	kMsgPreviewToggle	= 'pvt!',
+	kMsgDebug			= 'dbg!',
+	kMsgShowMixer		= 'smx!',
+	kMsgSourceByName	= 'sbn!',
+	kMsgEqOpen			= 'eqo!',		// the EQ button
+	kMsgEqChanged		= 'eqc!',		// the EQ window to the mixer: "on" (bool) and 15 "band" (float)
+	kMsgEqEnable		= 'eqe!',		// inside the EQ window
+	kMsgEqBand			= 'eqb!',
+	kMsgEqPreset		= 'eqp!'
 };
 
 static const float kFaderMin = -60.0f, kFaderMax = 12.0f;		// dB, on a fader
@@ -110,8 +131,9 @@ public:
 		fHoldTime(0)
 	{
 		SetViewColor(B_TRANSPARENT_COLOR);
-		SetExplicitMinSize(vertical ? BSize(7, 80) : BSize(80, 12));
-		SetExplicitPreferredSize(vertical ? BSize(8, 200) : BSize(160, 14));
+		SetExplicitMinSize(vertical ? BSize(7, 80) : BSize(80, 10));
+		SetExplicitPreferredSize(vertical ? BSize(8, 180) : BSize(120, 10));
+		SetExplicitMaxSize(vertical ? BSize(8, B_SIZE_UNLIMITED) : BSize(B_SIZE_UNLIMITED, 10));
 	}
 
 	void SetLevel(float db)
@@ -137,9 +159,9 @@ public:
 	void Draw(BRect)
 	{
 		BRect bounds = Bounds();
-		SetHighColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+		SetHighColor(theme::kInset);
 		FillRect(bounds);
-		SetHighColor(tint_color(ui_color(B_PANEL_BACKGROUND_COLOR), B_DARKEN_2_TINT));
+		SetHighColor(theme::kHeader);
 		StrokeRect(bounds);
 		bounds.InsetBy(1, 1);
 
@@ -206,7 +228,8 @@ public:
 		fLeft(new LevelMeter("left", true, low, high)),
 		fRight(new LevelMeter("right", true, low, high))
 	{
-		SetViewColor(B_TRANSPARENT_COLOR);
+		SetViewColor(theme::kDock);
+		SetExplicitMaxSize(BSize(17, B_SIZE_UNLIMITED));
 		BLayoutBuilder::Group<>(this, B_HORIZONTAL, 1)
 			.Add(fLeft)
 			.Add(fRight);
@@ -225,162 +248,28 @@ private:
 
 
 // ---------------------------------------------------------------------------------------------------------------
-// The mouse wheel moves a slider: up raises it, down lowers it, `step` units a notch. Returns whether the message was a wheel
-// turn that it handled.
-static bool
-HandleWheel(BSlider* slider, BMessage* message, int32 step)
+// A fader in dB (values are half decibels) with the text that says where it is, and a balance control.
+// ---------------------------------------------------------------------------------------------------------------
+
+static void
+FaderText(Fader* fader, char* text, size_t size)
 {
-	if (message->what != B_MOUSE_WHEEL_CHANGED)
-		return false;
-	float deltaX = 0.0f, deltaY = 0.0f;
-	message->FindFloat("be:wheel_delta_x", &deltaX);
-	message->FindFloat("be:wheel_delta_y", &deltaY);
-	const float delta = deltaY != 0.0f ? -deltaY : deltaX;		// wheel down is a positive deltaY
-	if (delta == 0.0f)
-		return true;
-	int32 notches = (int32)(fabsf(delta) + 0.5f);
-	if (notches < 1)
-		notches = 1;
-	int32 minimum, maximum;
-	slider->GetLimits(&minimum, &maximum);
-	int32 value = slider->Value() + (delta > 0.0f ? notches : -notches) * step;
-	if (value < minimum)
-		value = minimum;
-	if (value > maximum)
-		value = maximum;
-	if (value != slider->Value()) {
-		slider->SetValue(value);
-		slider->Invoke();
-	}
-	return true;
+	snprintf(text, size, "%+.1f dB", fader->Value() / 2.0f);
 }
 
 
-// A slider with the mouse wheel on it, for those that are not one of the classes below.
-class StepSlider : public BSlider {
-public:
-	StepSlider(const char* name, const char* label, BMessage* message, int32 minValue, int32 maxValue,
-		orientation direction, int32 wheelStep)
-		:
-		BSlider(name, label, message, minValue, maxValue, direction),
-		fWheelStep(wheelStep)
-	{
-	}
-
-	void MessageReceived(BMessage* message)
-	{
-		if (!HandleWheel(this, message, fWheelStep))
-			BSlider::MessageReceived(message);
-	}
-
-private:
-	int32	fWheelStep;
-};
+static void
+PanText(Fader* fader, char* text, size_t size)
+{
+	const int v = fader->Value();
+	if (v == 0)
+		snprintf(text, size, "Center");
+	else
+		snprintf(text, size, v < 0 ? "%d%% L" : "%d%% R", v < 0 ? -v : v);
+}
 
 
-// A fader in dB (steps of half a dB), shown with its value; a right click puts it back to 0 dB.
-// ---------------------------------------------------------------------------------------------------------------
-
-class DbSlider : public BSlider {
-public:
-	DbSlider(const char* name, BMessage* message, float minDb, float maxDb, orientation direction, float resetDb = 0.0f)
-		:
-		BSlider(name, NULL, message, (int32)(minDb * 2), (int32)(maxDb * 2), direction),
-		fResetDb(resetDb)
-	{
-		SetValue((int32)(resetDb * 2));
-		SetModificationMessage(new BMessage(*message));
-		BString low, high;
-		low << (int)minDb;
-		high << (int)maxDb;
-		SetLimitLabels(low.String(), high.String());
-	}
-
-	float Db() const { return Value() / 2.0f; }
-
-	void MessageReceived(BMessage* message)
-	{
-		if (!HandleWheel(this, message, 2))		// a dB a notch
-			BSlider::MessageReceived(message);
-	}
-
-	const char* UpdateText() const
-	{
-		snprintf(fText, sizeof(fText), "%+.1f dB", Db());
-		return fText;
-	}
-
-	void MouseDown(BPoint where)
-	{
-		int32 buttons = 0;
-		if (Window() != NULL && Window()->CurrentMessage() != NULL)
-			Window()->CurrentMessage()->FindInt32("buttons", &buttons);
-		if ((buttons & B_SECONDARY_MOUSE_BUTTON) != 0) {
-			SetValue((int32)(fResetDb * 2));
-			Invoke();
-			return;
-		}
-		BSlider::MouseDown(where);
-	}
-
-private:
-	float			fResetDb;
-	mutable char	fText[32];
-};
-
-
-// A balance control: -100 (left) .. +100 (right); a right click centers it.
-class PanSlider : public BSlider {
-public:
-	PanSlider(BMessage* message)
-		:
-		BSlider("pan", NULL, message, -100, 100, B_HORIZONTAL)
-	{
-		SetValue(0);
-		SetModificationMessage(new BMessage(*message));
-		SetLimitLabels("L", "R");
-	}
-
-	float Pan() const { return Value() / 100.0f; }
-
-	void MessageReceived(BMessage* message)
-	{
-		if (!HandleWheel(this, message, 5))		// 5 % a notch
-			BSlider::MessageReceived(message);
-	}
-
-	const char* UpdateText() const
-	{
-		const int v = Value();
-		if (v == 0)
-			snprintf(fText, sizeof(fText), "Center");
-		else
-			snprintf(fText, sizeof(fText), v < 0 ? "%d%% L" : "%d%% R", v < 0 ? -v : v);
-		return fText;
-	}
-
-	void MouseDown(BPoint where)
-	{
-		int32 buttons = 0;
-		if (Window() != NULL && Window()->CurrentMessage() != NULL)
-			Window()->CurrentMessage()->FindInt32("buttons", &buttons);
-		if ((buttons & B_SECONDARY_MOUSE_BUTTON) != 0) {
-			SetValue(0);
-			Invoke();
-			return;
-		}
-		BSlider::MouseDown(where);
-	}
-
-private:
-	mutable char	fText[32];
-};
-
-
-// ---------------------------------------------------------------------------------------------------------------
-// One source: its name, fader, mute and solo, and its level.
-// ---------------------------------------------------------------------------------------------------------------
-
+// One source: its name, fader, balance, mute and solo, and its level.
 class SourceStrip : public BView {
 public:
 	SourceStrip(int index, const char* name)
@@ -388,44 +277,47 @@ public:
 		BView("strip", B_WILL_DRAW),
 		fIndex(index)
 	{
-		SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+		SetViewColor(theme::kDock);
 		BString title;
-		title << "#" << (index + 1);
-		fTitle = new BStringView("title", title.String());
-		fName = new BStringView("name", name);
-		fName->SetToolTip(name);
-		fName->SetExplicitMaxSize(BSize(110, B_SIZE_UNSET));
-		fName->SetTruncation(B_TRUNCATE_END);
+		title << "#" << (index + 1) << " " << name;
+		Label* nameLabel = new Label("name", title.String(), theme::kDock, theme::kText, true, 104);
+		nameLabel->SetToolTip(name);
 
 		BMessage* gain = new BMessage(kMsgGain);
 		gain->AddInt32("source", index);
-		fFader = new DbSlider("fader", gain, kFaderMin, kFaderMax, B_VERTICAL);
-		fFader->SetExplicitMinSize(BSize(60, 160));
+		fFader = new Fader("fader", gain, (int32)(kFaderMin * 2), (int32)(kFaderMax * 2), 0, 2, true, theme::kDock);
 		fMeter = new StereoMeter("meter", kMeterMin, 0.0f);
+		fDbText = new Label("db", "+0.0 dB", theme::kDock, theme::kDimText, true, 104);
 
 		BMessage* pan = new BMessage(kMsgPan);
 		pan->AddInt32("source", index);
-		fPan = new PanSlider(pan);
-		fPan->SetExplicitMinSize(BSize(100, B_SIZE_UNSET));
+		fPan = new Fader("pan", pan, -100, 100, 0, 5, false, theme::kDock);
+		fPan->SetExplicitMaxSize(BSize(104, 16));
+		fPan->SetToolTip("Balance, left to right. A right click centers it.");
 
 		BMessage* mute = new BMessage(kMsgMute);
 		mute->AddInt32("source", index);
-		fMute = new BCheckBox("mute", "Mute", mute);
+		fMute = new FlatCheck("mute", "Mute", mute, theme::kDock, true, theme::kRecord);
 		BMessage* solo = new BMessage(kMsgSolo);
 		solo->AddInt32("source", index);
-		fSolo = new BCheckBox("solo", "Solo", solo);
+		fSolo = new FlatCheck("solo", "Solo", solo, theme::kDock, true, theme::kSolo);
 
-		BLayoutBuilder::Group<>(this, B_VERTICAL, 2)
-			.SetInsets(6, 4, 6, 4)
-			.Add(fTitle)
-			.Add(fName)
-			.AddGroup(B_HORIZONTAL, 4)
-				.Add(fFader)
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 4)
+			.SetInsets(6, 4, 6, 6)
+			.Add(nameLabel)
+			.Add(fDbText)
+			.AddGroup(B_HORIZONTAL, 6)
+				.AddGlue()
 				.Add(fMeter)
+				.Add(fFader)
+				.AddGlue()
 			.End()
 			.Add(fPan)
-			.Add(fMute)
-			.Add(fSolo);
+			.AddGroup(B_HORIZONTAL, 4)
+				.Add(fMute)
+				.Add(fSolo)
+			.End();
+		SetExplicitMaxSize(BSize(116, B_SIZE_UNLIMITED));
 	}
 
 	void AttachedToWindow()
@@ -437,22 +329,30 @@ public:
 		fSolo->SetTarget(Window());
 	}
 
+	void ShowGain()
+	{
+		char text[32];
+		FaderText(fFader, text, sizeof(text));
+		fDbText->SetText(text);
+		PanText(fPan, text, sizeof(text));
+		fPan->SetToolTip(text);
+	}
+
 	void SetLevels(float left, float right) { fMeter->SetLevels(left, right); }
 	int Index() const { return fIndex; }
-	float Pan() const { return fPan->Pan(); }
-	float Gain() const { return fFader->Db(); }
+	float Pan() const { return fPan->Value() / 100.0f; }
+	float Gain() const { return fFader->Value() / 2.0f; }
 	bool Muted() const { return fMute->Value() == B_CONTROL_ON; }
 	bool Soloed() const { return fSolo->Value() == B_CONTROL_ON; }
 
 private:
 	int				fIndex;
-	BStringView*	fTitle;
-	BStringView*	fName;
-	DbSlider*		fFader;
-	PanSlider*		fPan;
+	Label*			fDbText;
+	Fader*			fFader;
+	Fader*			fPan;
 	StereoMeter*	fMeter;
-	BCheckBox*		fMute;
-	BCheckBox*		fSolo;
+	FlatCheck*		fMute;
+	FlatCheck*		fSolo;
 };
 
 
@@ -657,10 +557,20 @@ struct StreamConfig {
 	int			preset = 2;				// veryfast
 	int			keyintSeconds = 2;
 	bool		showLog = true;			// the log under the window is shown
-	bool		hubOn = false;			// hrecord shares the audio input with programs (its input hub)
-	bool		mixHubOn = false;		// hrecord offers the mix (what is heard) to programs that record (its mix input)
+	bool		hubOn = true;			// hrecord shares the audio input with programs (its input hub)
+	bool		mixHubOn = true;		// hrecord offers the mix (what is heard) to programs that record (its mix input)
 	bool		mixHubLeaveOut = true;	// ... without what the recording program plays itself
+	bool		debug = false;			// the three above can be changed; without it they are hidden, and on
+	bool		audioOnly = false;		// the source that was chosen: sound alone (or else the screen)
+	bool		preview = true;			// the preview is shown
+	bool		eqOn = false;			// the master equalizer
+	float		eqBands[kEqBands] = {};	// dB
 	std::map<std::string, int>	hubModes;	// by program name: what it gets from the hub, 0 both channels, 1 left, 2 right
+
+	// what hrecord is told
+	bool HubWanted() const { return !debug || hubOn; }
+	bool MixHubWanted() const { return !debug || mixHubOn; }
+	bool LeaveOutWanted() const { return !debug || mixHubLeaveOut; }
 
 	std::string BaseAddress() const
 	{
@@ -715,9 +625,21 @@ struct StreamConfig {
 		bool flag;
 		if (message.FindBool("stream", &flag) == B_OK) enabled = flag;
 		if (message.FindBool("showlog", &flag) == B_OK) showLog = flag;
-		if (message.FindBool("hubon", &flag) == B_OK) hubOn = flag;
-		if (message.FindBool("mixhubon", &flag) == B_OK) mixHubOn = flag;
-		if (message.FindBool("mixhubleaveout", &flag) == B_OK) mixHubLeaveOut = flag;
+		// (a file without "debug" is from before the three were on by default: what it says about them is not kept)
+		if (message.FindBool("debug", &flag) == B_OK) {
+			debug = flag;
+			if (message.FindBool("hubon", &flag) == B_OK) hubOn = flag;
+			if (message.FindBool("mixhubon", &flag) == B_OK) mixHubOn = flag;
+			if (message.FindBool("mixhubleaveout", &flag) == B_OK) mixHubLeaveOut = flag;
+		}
+		if (message.FindBool("audioonly", &flag) == B_OK) audioOnly = flag;
+		if (message.FindBool("preview", &flag) == B_OK) preview = flag;
+		if (message.FindBool("eqon", &flag) == B_OK) eqOn = flag;
+		float gain;
+		for (int i = 0; i < kEqBands; i++) {
+			if (message.FindFloat("eqband", i, &gain) == B_OK)
+				eqBands[i] = gain;
+		}
 		for (int32 i = 0;; i++) {
 			char* name = NULL;
 			type_code type;
@@ -753,6 +675,12 @@ struct StreamConfig {
 		message.AddBool("hubon", hubOn);
 		message.AddBool("mixhubon", mixHubOn);
 		message.AddBool("mixhubleaveout", mixHubLeaveOut);
+		message.AddBool("debug", debug);
+		message.AddBool("audioonly", audioOnly);
+		message.AddBool("preview", preview);
+		message.AddBool("eqon", eqOn);
+		for (int i = 0; i < kEqBands; i++)
+			message.AddFloat("eqband", eqBands[i]);
 		for (std::map<std::string, int>::const_iterator it = hubModes.begin(); it != hubModes.end(); ++it)
 			message.AddInt32((std::string("hubmode:") + it->first).c_str(), it->second);
 		message.AddInt32("service", service);
@@ -1024,31 +952,45 @@ public:
 		fCanvas->SetExplicitMinSize(BSize(400, 200));
 		fCanvas->SetExplicitPreferredSize(BSize(900, 280));
 
-		fTitle = new BStringView("title", "Select a box to see what can be done with it.");
+		fTitle = new Label("title", "Select a box to see what can be done with it.", theme::kWindow, theme::kText, false,
+			B_SIZE_UNLIMITED);
 		BMessage* routeMessage = new BMessage(kMsgNodeRoute);
-		fStereo = new BCheckBox("stereo", "Stereo", new BMessage(*routeMessage));
-		fLeft = new BCheckBox("left", "Left", new BMessage(*routeMessage));
-		fRight = new BCheckBox("right", "Right", new BMessage(*routeMessage));
+		fStereo = new FlatCheck("stereo", "Stereo", new BMessage(*routeMessage), theme::kWindow);
+		fLeft = new FlatCheck("left", "Left", new BMessage(*routeMessage), theme::kWindow);
+		fRight = new FlatCheck("right", "Right", new BMessage(*routeMessage), theme::kWindow);
 		delete routeMessage;
-		fMixLabel = new BStringView("mixlabel", "In the mix as:");
-		fTakeOff = new BButton("takeoff", "Take off the mix", new BMessage(kMsgNodeTakeOff));
-		fPutBack = new BButton("putback", "Put on the mix again", new BMessage(kMsgNodePutBack));
+		fMixLabel = new Label("mixlabel", "In the mix as:", theme::kWindow);
+		fTakeOff = new FlatButton("takeoff", "Take off the mix", new BMessage(kMsgNodeTakeOff), theme::kWindow);
+		fPutBack = new FlatButton("putback", "Put on the mix again", new BMessage(kMsgNodePutBack), theme::kWindow);
 		fConnections = new BListView("connections");
 		fConnections->SetSelectionMessage(new BMessage(kMsgNodeSelectEdge));
-		BScrollView* connectionsScroll = new BScrollView("connectionsscroll", fConnections, 0, false, true);
+		fConnections->SetViewColor(theme::kInset);
+		fConnections->SetLowColor(theme::kInset);
+		BScrollView* connectionsScroll = new BScrollView("connectionsscroll", fConnections, 0, false, true, B_NO_BORDER);
+		connectionsScroll->SetViewColor(theme::kWindow);
 		connectionsScroll->SetExplicitMinSize(BSize(200, 70));
-		fDisconnect = new BButton("disconnect", "Disconnect", new BMessage(kMsgNodeDisconnect));
+		fDisconnect = new FlatButton("disconnect", "Disconnect", new BMessage(kMsgNodeDisconnect), theme::kWindow);
 		fReconnectMenu = new BPopUpMenu("reconnect");
-		fReconnectField = new BMenuField("reconnectfield", "Connect it to:", fReconnectMenu);
-		fReconnect = new BButton("reconnect", "Connect", new BMessage(kMsgNodeReconnect));
-		fNote = new BStringView("note", "");
-		fHubShare = new BCheckBox("hubshare", "Share this input with programs (hrecord's input hub)", new BMessage(kMsgHubToggle));
+		fReconnectField = new FlatMenu("reconnectfield", "Connect it to:", fReconnectMenu, theme::kWindow);
+		fReconnect = new FlatButton("reconnect", "Connect", new BMessage(kMsgNodeReconnect), theme::kWindow);
+		fNote = new Label("note", "", theme::kWindow, theme::kDimText, false, B_SIZE_UNLIMITED);
+		fHubShare = new FlatCheck("hubshare", "Share this input with programs (hrecord's input hub)",
+			new BMessage(kMsgHubToggle), theme::kWindow);
+		fHubShare->SetExplicitMaxSize(BSize(fHubShare->MinSize().width, B_SIZE_UNSET));
 		fHubMenu = new BPopUpMenu("hubmode");
 		const char* hubChoices[] = { "Stereo (both channels)", "Left channel", "Right channel" };
 		for (int i = 0; i < 3; i++)
 			fHubMenu->AddItem(new BMenuItem(hubChoices[i], new BMessage(kMsgHubMode)));
 		fHubMenu->ItemAt(0)->SetMarked(true);
-		fHubField = new BMenuField("hubfield", "Input it gets from hrecord:", fHubMenu);
+		fHubField = new FlatMenu("hubfield", "Input it gets from hrecord:", fHubMenu, theme::kWindow);
+		// (in a row with room to spare, these stay as wide as their text)
+		BControl* narrow[] = { fStereo, fLeft, fRight, fTakeOff, fPutBack };
+		for (int i = 0; i < 5; i++)
+			narrow[i]->SetExplicitMaxSize(BSize(narrow[i]->MinSize().width, B_SIZE_UNSET));
+		SetViewColor(theme::kWindow);
+		SetLowColor(theme::kWindow);
+		if (!fConfig->debug)
+			fHubShare->Hide();
 
 		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_SMALL_SPACING)
 			.SetInsets(8, 8, 8, 8)
@@ -1109,7 +1051,7 @@ public:
 	void SetEngineReady(bool ready)
 	{
 		fEngineReady = ready;
-		if (ready && fConfig->hubOn)
+		if (ready && fConfig->HubWanted())
 			Send("hub 1\n");
 		if (!ready) {
 			fModes.clear();
@@ -1126,6 +1068,22 @@ public:
 	{
 		std::map<media_node_id, int>::const_iterator found = fModes.find(id);
 		return found != fModes.end() ? found->second : 0;
+	}
+
+	// "Advanced Options" was ticked or unticked: the hub's box shows or goes, and hrecord is told what holds now.
+	void ApplyDebug()
+	{
+		if (fConfig->debug == fHubShare->IsHidden(fHubShare)) {
+			if (fConfig->debug)
+				fHubShare->Show();
+			else
+				fHubShare->Hide();
+		}
+		if (fEngineReady) {
+			Send("hub %d\n", fConfig->HubWanted() ? 1 : 0);
+			if (!fConfig->HubWanted())
+				fHubSent.clear();
+		}
 	}
 
 	// For testing from the command line: the same as clicking the box with this name (and its L or R port).
@@ -1204,8 +1162,12 @@ public:
 					Send("hub %d\n", on ? 1 : 0);
 				break;
 			}
+			case 'rcn!':
+				fReconnectField->Invalidate();		// another node is marked in its menu
+				break;
 			case kMsgHubMode:
 			{
+				fHubField->Invalidate();		// another item is marked in its menu
 				const GraphNode* node = Find(fSelected);
 				BMenuItem* marked = fHubMenu->FindMarked();
 				if (node != NULL && marked != NULL && fEngineReady) {
@@ -1545,13 +1507,13 @@ private:
 					text << "  (" << (int)fEdges[e].output.format.u.raw_audio.channel_count << " ch, "
 						<< (int)fEdges[e].output.format.u.raw_audio.frame_rate << " Hz)";
 				}
-				fConnections->AddItem(new BStringItem(text.String()));
+				fConnections->AddItem(new SourceItem(0, text.String()));
 				fRows.push_back(std::make_pair(false, (int)e));
 			}
 			for (size_t f = 0; f < fFree.size(); f++) {
 				if (fFree[f].key != node->key)
 					continue;
-				fConnections->AddItem(new BStringItem("output: not connected"));
+				fConnections->AddItem(new SourceItem(0, "output: not connected"));
 				fRows.push_back(std::make_pair(true, (int)f));
 			}
 			// where the selected connection can go instead: a node with a free input
@@ -1580,6 +1542,8 @@ private:
 		fDisconnect->SetEnabled(haveEdge && !edgeOfHrecord && !isFree);
 		fReconnectField->SetEnabled(haveEdge && !edgeOfHrecord && fReconnectMenu->CountItems() > 0);
 		fReconnect->SetEnabled(haveEdge && !edgeOfHrecord && fReconnectMenu->CountItems() > 0);
+		fHubField->Invalidate();		// (their menus' marked items may have changed)
+		fReconnectField->Invalidate();
 	}
 
 	static bool IsHubEdge(const GraphEdge& edge)
@@ -1693,9 +1657,9 @@ private:
 	StreamConfig*		fConfig;
 	bool				fHubActive;
 	std::map<media_node_id, int>	fHubSent;	// what each program was told to get from the hub
-	BCheckBox*			fHubShare;
+	FlatCheck*			fHubShare;
 	BPopUpMenu*			fHubMenu;
-	BMenuField*			fHubField;
+	FlatMenu*			fHubField;
 	GraphCanvas*		fCanvas;
 	std::vector<GraphNode>	fNodes;
 	std::vector<GraphEdge>	fEdges;
@@ -1708,19 +1672,19 @@ private:
 	int					fSelectedEdge;
 	bool				fEngineReady;
 	BMessageRunner*		fRunner;
-	BStringView*		fTitle;
-	BStringView*		fMixLabel;
-	BCheckBox*			fStereo;
-	BCheckBox*			fLeft;
-	BCheckBox*			fRight;
-	BButton*			fTakeOff;
-	BButton*			fPutBack;
+	Label*				fTitle;
+	Label*				fMixLabel;
+	FlatCheck*			fStereo;
+	FlatCheck*			fLeft;
+	FlatCheck*			fRight;
+	FlatButton*			fTakeOff;
+	FlatButton*			fPutBack;
 	BListView*			fConnections;
-	BButton*			fDisconnect;
+	FlatButton*			fDisconnect;
 	BPopUpMenu*			fReconnectMenu;
-	BMenuField*			fReconnectField;
-	BButton*			fReconnect;
-	BStringView*		fNote;
+	FlatMenu*			fReconnectField;
+	FlatButton*			fReconnect;
+	Label*				fNote;
 };
 
 
@@ -1736,10 +1700,9 @@ GraphCanvas::GraphCanvas(NodesTab* tab)
 void
 GraphCanvas::Draw(BRect)
 {
-	const rgb_color panel = ui_color(B_PANEL_BACKGROUND_COLOR);
-	SetHighColor(tint_color(panel, B_LIGHTEN_1_TINT));
+	SetHighColor(theme::kInset);
 	FillRect(Bounds());
-	SetHighColor(tint_color(panel, B_DARKEN_2_TINT));
+	SetHighColor(theme::kHeader);
 	StrokeRect(Bounds());
 
 	const std::vector<GraphNode>& nodes = fTab->Nodes();
@@ -1754,8 +1717,7 @@ GraphCanvas::Draw(BRect)
 		}
 		if (from == NULL || to == NULL)
 			continue;
-		const bool viaHrecord = edges[e].throughHrecord || edges[e].from == kHrecordKey;
-		SetHighColor(viaHrecord ? make_color(60, 160, 80) : make_color(90, 90, 110));
+		SetHighColor(255, 255, 255);
 		BPoint start(from->frame.right, (from->frame.top + from->frame.bottom) / 2);
 		BPoint end(to->frame.left, (to->frame.top + to->frame.bottom) / 2);
 		StrokeLine(start, end);
@@ -1776,6 +1738,7 @@ GraphCanvas::Draw(BRect)
 		else if (node.app) fill = make_color(200, 220, 245);
 		SetHighColor(fill);
 		FillRoundRect(node.frame, 6, 6);
+		SetLowColor(fill);		// what the text on it is smoothed against
 		SetHighColor(node.key == fTab->Selected() ? make_color(220, 60, 50) : make_color(70, 70, 90));
 		SetPenSize(node.key == fTab->Selected() ? 3.0f : 1.0f);
 		StrokeRoundRect(node.frame, 6, 6);
@@ -1804,7 +1767,8 @@ GraphCanvas::Draw(BRect)
 		}
 	}
 	if (nodes.empty()) {
-		SetHighColor(0, 0, 0);
+		SetHighColor(theme::kText);
+		SetLowColor(theme::kInset);
 		DrawString("No nodes to show.", BPoint(16, 24));
 	}
 }
@@ -1833,151 +1797,398 @@ GraphCanvas::MouseDown(BPoint where)
 // The window
 // ---------------------------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------------------------
+// The master equalizer's window. It tells the mixer what is set; the mixer keeps it and tells hrecord.
+// ---------------------------------------------------------------------------------------------------------------
+
+class EqWindow : public BWindow {
+public:
+	EqWindow(const BMessenger& mixer, const StreamConfig& config, BRect over)
+		:
+		BWindow(BRect(0, 0, 100, 100), "hRecord Master EQ", B_TITLED_WINDOW,
+			B_AUTO_UPDATE_SIZE_LIMITS | B_NOT_ZOOMABLE | B_NOT_RESIZABLE | B_ASYNCHRONOUS_CONTROLS),
+		fMixer(mixer)
+	{
+		Panel* background = new Panel("eq", theme::kWindow);
+		fEnable = new FlatCheck("enable", "Enable Equalizer", new BMessage(kMsgEqEnable), theme::kWindow);
+		fEnable->SetValue(config.eqOn ? B_CONTROL_ON : B_CONTROL_OFF);
+		fEnable->SetExplicitMaxSize(BSize(fEnable->MinSize().width, B_SIZE_UNSET));
+
+		fPresets = new BPopUpMenu("Custom");
+		for (int i = 0; i < kEqPresets; i++) {
+			BMessage* message = new BMessage(kMsgEqPreset);
+			message->AddInt32("preset", i);
+			fPresets->AddItem(new BMenuItem(kEqPresetNames[i], message));
+		}
+		fPresetField = new FlatMenu("preset", "Preset:", fPresets, theme::kWindow);
+
+		BGroupView* bands = new BGroupView(B_HORIZONTAL, 4);
+		bands->SetViewColor(theme::kDock);
+		bands->GroupLayout()->SetInsets(8, 8, 8, 8);
+		for (int i = 0; i < kEqBands; i++) {
+			BMessage* message = new BMessage(kMsgEqBand);
+			message->AddInt32("band", i);
+			// (half decibels)
+			fFaders[i] = new Fader("band", message, (int32)(-kEqRange * 2), (int32)(kEqRange * 2), 0, 2, true, theme::kDock);
+			fFaders[i]->SetValue((int32)lroundf(config.eqBands[i] * 2));
+			fValues[i] = new Label("value", "", theme::kDock, theme::kDimText, true, 36);
+			BGroupView* column = new BGroupView(B_VERTICAL, 4);
+			column->SetViewColor(theme::kDock);
+			BLayoutBuilder::Group<>(column, B_VERTICAL, 4)
+				.Add(fValues[i])
+				.AddGroup(B_HORIZONTAL, 0)
+					.AddGlue()
+					.Add(fFaders[i])
+					.AddGlue()
+				.End()
+				.Add(new Label("frequency", kEqFrequencyLabels[i], theme::kDock, theme::kText, true, 36));
+			bands->AddChild(column);
+		}
+
+		BLayoutBuilder::Group<>(background, B_VERTICAL, 8)
+			.SetInsets(10, 10, 10, 10)
+			.AddGroup(B_HORIZONTAL, 16)
+				.Add(fEnable)
+				.Add(fPresetField)
+				.AddGlue()
+			.End()
+			.Add(bands)
+			.Add(new Label("note", "It shapes the whole mix, ahead of the limiter. A right click on a band puts it back to 0 dB.",
+				theme::kWindow, theme::kDimText));
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+			.Add(background);
+		ShowValues();
+
+		// over the mixer's middle
+		Layout(true);
+		const BSize size = background->PreferredSize();
+		ResizeTo(size.width, size.height);
+		CenterIn(over);
+		MoveOnScreen();
+		// the controls send to this window
+		fEnable->SetTarget(this);
+		fPresets->SetTargetForItems(this);
+		for (int i = 0; i < kEqBands; i++)
+			fFaders[i]->SetTarget(this);
+	}
+
+	// (a program in the background has nowhere to bring a minimized window back from)
+	void Minimize(bool minimize)
+	{
+		if (minimize)
+			PostMessage(B_QUIT_REQUESTED);
+	}
+
+	void MessageReceived(BMessage* message)
+	{
+		switch (message->what) {
+			case kTrayShow:		// (the EQ button again)
+				Activate();
+				break;
+			case kMsgEqEnable:
+				Tell();
+				break;
+			case kMsgEqBand:
+				ShowValues();
+				Tell();
+				break;
+			case kMsgEqPreset:
+			{
+				int32 preset;
+				if (message->FindInt32("preset", &preset) != B_OK || preset < 0 || preset >= kEqPresets)
+					break;
+				for (int i = 0; i < kEqBands; i++)
+					fFaders[i]->SetValue((int32)lroundf(kEqPresetValues[preset][i] * 2));
+				fEnable->SetValue(B_CONTROL_ON);		// picking a preset means it is wanted
+				ShowValues();
+				Tell();
+				break;
+			}
+			default:
+				BWindow::MessageReceived(message);
+		}
+	}
+
+private:
+	void ShowValues()
+	{
+		for (int i = 0; i < kEqBands; i++) {
+			char text[16];
+			const float gain = fFaders[i]->Value() / 2.0f;
+			if (gain == 0)
+				snprintf(text, sizeof(text), "0");
+			else
+				snprintf(text, sizeof(text), "%+.1f", gain);
+			fValues[i]->SetText(text);
+		}
+		// the menu shows the preset the bands are, if they are one
+		for (int preset = 0; preset < kEqPresets; preset++) {
+			bool same = true;
+			for (int i = 0; i < kEqBands; i++)
+				same &= fFaders[i]->Value() == (int32)lroundf(kEqPresetValues[preset][i] * 2);
+			fPresets->ItemAt(preset)->SetMarked(same);
+		}
+		fPresetField->Invalidate();
+	}
+
+	void Tell()
+	{
+		BMessage message(kMsgEqChanged);
+		message.AddBool("on", fEnable->Value() == B_CONTROL_ON);
+		for (int i = 0; i < kEqBands; i++)
+			message.AddFloat("band", fFaders[i]->Value() / 2.0f);
+		fMixer.SendMessage(&message);
+	}
+
+	BMessenger		fMixer;
+	FlatCheck*		fEnable;
+	BPopUpMenu*		fPresets;
+	FlatMenu*		fPresetField;
+	Fader*			fFaders[kEqBands];
+	Label*			fValues[kEqBands];
+};
+
+
 class MixerWindow : public BWindow {
 public:
 	MixerWindow()
 		:
-		BWindow(BRect(80, 80, 900, 640), "hRecord Mixer", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
+		BWindow(BRect(80, 60, 1060, 880), "hRecord Mixer", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
 		fRecording(false),
 		fStopping(false),
 		fSeconds(0),
 		fTick(NULL)
 	{
-		fRecord = new BButton("record", "Record", new BMessage(kMsgRecord));
-		fStop = new BButton("stop", "Stop", new BMessage(kMsgStop));
-		fStop->SetEnabled(false);
-		fScreen = new BCheckBox("screen", "Record the screen too", NULL);
-		fRealtime = new BCheckBox("realtime", "Real-time (low latency)", NULL);
 		fStreamConfig.Load();
-		fStream = new BCheckBox("stream", "Stream live", new BMessage(kMsgStreamToggle));
-		fStreamSettings = new BButton("streamsettings", "Stream settings" B_UTF8_ELLIPSIS, new BMessage(kMsgStreamConfigure));
-		fQualityMenu = new BPopUpMenu("quality");
-		fQualityMenu->AddItem(new BMenuItem("Low", NULL));
-		fQualityMenu->AddItem(new BMenuItem("Medium", NULL));
-		fQualityMenu->AddItem(new BMenuItem("High", NULL));
-		fQualityMenu->ItemAt(2)->SetMarked(true);		// High: the default
-		fQuality = new BMenuField("quality", "Screen quality:", fQualityMenu);
-		fTime = new BStringView("time", "00:00");
-		BFont big;
-		fTime->GetFont(&big);
-		big.SetSize(big.Size() * 1.6f);
-		fTime->SetFont(&big);
 
-		fStripsGroup = new BView("strips", B_WILL_DRAW);
-		fStripsGroup->SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
-		BGroupLayout* stripsLayout = new BGroupLayout(B_HORIZONTAL, 6);
+		// the controls
+		fRecord = new FlatButton("record", "Start Recording", new BMessage(kMsgRecord), theme::kDock, theme::kAccent);
+		fStream = new FlatCheck("stream", "Stream live", new BMessage(kMsgStreamToggle), theme::kDock);
+		fStreamSettings = new FlatButton("streamsettings", "Stream settings" B_UTF8_ELLIPSIS,
+			new BMessage(kMsgStreamConfigure), theme::kDock);
+		static const char* const kQualities[] = { "Low", "Medium", "High" };
+		fQuality = new Segments("quality", kQualities, 3, 2, theme::kDock);		// High: the default
+		fRealtime = new FlatCheck("realtime", "Real-time (low latency)", NULL, theme::kDock);
+		fShowPreview = new FlatCheck("showpreview", "Show preview", new BMessage(kMsgPreviewToggle), theme::kDock);
+		fShowPreview->SetValue(fStreamConfig.preview ? B_CONTROL_ON : B_CONTROL_OFF);
+		fShowPreview->SetToolTip("The preview takes some processor time.");
+		fShowLog = new FlatCheck("showlog", "Show log", new BMessage(kMsgShowLog), theme::kDock);
+		fShowLog->SetValue(fStreamConfig.showLog ? B_CONTROL_ON : B_CONTROL_OFF);
+		fDebug = new FlatCheck("debug", "Advanced Options", new BMessage(kMsgDebug), theme::kDock);
+		fDebug->SetValue(fStreamConfig.debug ? B_CONTROL_ON : B_CONTROL_OFF);
+		fDebug->SetToolTip("Shows the Nodes page, and the settings for offering the mix and sharing the input with other "
+			"programs, which are on otherwise.");
+
+		Panel* controls = new Panel("controls", theme::kDock);
+		BLayoutBuilder::Group<>(controls, B_VERTICAL, 6)
+			.SetInsets(8, 8, 8, 8)
+			.Add(fRecord)
+			.Add(fStream)
+			.Add(fStreamSettings)
+			.Add(new Label("qualitytitle", "Screen quality", theme::kDock, theme::kDimText))
+			.Add(fQuality)
+			.Add(fRealtime)
+			.Add(fShowPreview)
+			.Add(fShowLog)
+			.Add(fDebug)
+			.AddGlue();
+
+		// the sources: what the video shows
+		fSources = new BListView("sources", B_SINGLE_SELECTION_LIST);
+		fSources->SetViewColor(theme::kInset);
+		fSources->SetLowColor(theme::kInset);
+		fSources->SetSelectionMessage(new BMessage(kMsgSource));
+		fSourceScroll = new BScrollView("sourcescroll", fSources, 0, false, true, B_NO_BORDER);
+		fSourceScroll->SetViewColor(theme::kDock);
+		fSourceScroll->SetExplicitMinSize(BSize(210, 120));
+		Panel* sources = new Panel("sourcespanel", theme::kDock);
+		BLayoutBuilder::Group<>(sources, B_VERTICAL, 0)
+			.SetInsets(6, 6, 6, 6)
+			.Add(fSourceScroll);
+		fSelectedSource = fStreamConfig.audioOnly ? kSourceAudioOnly : kSourceDesktop;
+		RefreshSources();
+
+		// the audio mixer: a strip for each program, and the whole mix
+		fStripsGroup = new Panel("strips", theme::kDock);
+		BGroupLayout* stripsLayout = new BGroupLayout(B_HORIZONTAL, 2);
 		fStripsGroup->SetLayout(stripsLayout);
-		fHint = new BStringView("hint", "Every program that plays sound is connected automatically and gets a strip here, as soon as it starts. Press Record to record.");
+		fStripsGroup->SetExplicitMinSize(BSize(236, B_SIZE_UNSET));
+		fHint = new Label("hint", "Nothing playing yet.", theme::kDock, theme::kDimText, true, 220);
 		stripsLayout->AddView(fHint);
 		stripsLayout->AddItem(BSpaceLayoutItem::CreateGlue());
 
-		// the master section: the whole mix and the limiter
-		fMixGain = new DbSlider("mixgain", new BMessage(kMsgMixGain), -12.0f, 12.0f, B_VERTICAL);
-		fMixGain->SetExplicitMinSize(BSize(60, 120));
-		fPreMeter = new StereoMeter("pre", kMeterMin, 6.0f);
+		fMixGain = new Fader("mixgain", new BMessage(kMsgMixGain), -24, 24, 0, 2, true, theme::kHeader);
+		fMixGainText = new Label("mixgaintext", "+0.0 dB", theme::kHeader, theme::kDimText, true, 84);
 		fPostMeter = new StereoMeter("post", kMeterMin, 6.0f);
-		fLimiter = new BCheckBox("limiter", "Limiter", new BMessage(kMsgLimiter));
+		fPostMeter->SetViewColor(theme::kHeader);
+		fPostMeter->SetToolTip("The level of the mix, after the limiter.");
+		fLimiter = new FlatCheck("limiter", "Limiter", new BMessage(kMsgLimiter), theme::kHeader);
 		fLimiter->SetValue(B_CONTROL_ON);
-		fMixHub = new BCheckBox("mixhub", "Offer the mix to programs that record", new BMessage(kMsgMixHub));
-		fMixHub->SetToolTip("Programs that record (Ardour) can take what is heard, with the effects of the programs that play (rakarrack), "
-			"as an input called \"hrecord Mix\".");
+		fCeiling = new Fader("ceiling", new BMessage(kMsgCeiling), -24, 0, -2, 1, false, theme::kHeader);
+		fCeiling->SetExplicitMinSize(BSize(130, 16));
+		fCeilingText = new Label("ceilingtext", "Ceiling: -1.0 dB", theme::kHeader, theme::kDimText);
+		fRelease = new Fader("release", new BMessage(kMsgRelease), 1, 50, 8, 1, false, theme::kHeader);
+		fReleaseText = new Label("releasetext", "Release: 80 ms", theme::kHeader, theme::kDimText);
+		fReduction = new LevelMeter("reduction", false, 0.0f, 12.0f, true);
+		fEqButton = new FlatButton("eqbutton", "EQ", new BMessage(kMsgEqOpen), theme::kHeader,
+			fStreamConfig.eqOn ? theme::kAccent : theme::kButton);
+		fEqButton->SetToolTip("The master equalizer of the mix.");
+		fReductionText = new Label("reductiontext", "Gain reduction: 0.0 dB", theme::kHeader, theme::kDimText);
+		fReductionText->SetExplicitMinSize(BSize(fReductionText->PreferredSize().width + 16, B_SIZE_UNSET));
+
+		fMixHub = new FlatCheck("mixhub", "Offer the mix to programs that record", new BMessage(kMsgMixHub), theme::kHeader);
+		fMixHub->SetToolTip("Programs that record (Ardour) can take what is heard, with the effects of the programs that play "
+			"(rakarrack), as an input called \"hrecord Mix\".");
 		fMixHub->SetValue(fStreamConfig.mixHubOn ? B_CONTROL_ON : B_CONTROL_OFF);
-		fMixHubLeaveOut = new BCheckBox("mixhubleaveout", "Leave out the recording program's own sound", new BMessage(kMsgMixHubSelf));
-		fMixHubLeaveOut->SetToolTip("A program that records the mix does not get what it plays itself (Ardour recording a second track "
-			"does not record the first one again). What you hear is not changed.");
+		fMixHubLeaveOut = new FlatCheck("mixhubleaveout", "Leave out the recording program's own sound",
+			new BMessage(kMsgMixHubSelf), theme::kHeader);
+		fMixHubLeaveOut->SetToolTip("A program that records the mix does not get what it plays itself (Ardour recording a "
+			"second track does not record the first one again). What you hear is not changed.");
 		fMixHubLeaveOut->SetValue(fStreamConfig.mixHubLeaveOut ? B_CONTROL_ON : B_CONTROL_OFF);
 		fMixHubLeaveOut->SetEnabled(fStreamConfig.mixHubOn);
-		fCeiling = new DbSlider("ceiling", new BMessage(kMsgCeiling), -12.0f, 0.0f, B_HORIZONTAL, -1.0f);
-		fRelease = new StepSlider("release", "Release", new BMessage(kMsgRelease), 10, 500, B_HORIZONTAL, 10);
-		fRelease->SetValue(80);
-		fRelease->SetModificationMessage(new BMessage(kMsgRelease));
-		fRelease->SetLimitLabels("10 ms", "500 ms");
-		fReduction = new LevelMeter("reduction", false, 0.0f, 12.0f, true);
-		fReductionText = new BStringView("reductiontext", "Gain reduction: 0.0 dB");
+		fDebugBox = new Panel("debugbox", theme::kHeader);
+		BLayoutBuilder::Group<>(fDebugBox, B_VERTICAL, 4)
+			.Add(fMixHub)
+			.Add(fMixHubLeaveOut);
+		if (!fStreamConfig.debug)
+			fDebugBox->Hide();
 
-		BStringView* ceilingTitle = new BStringView("ceilingtitle", "Ceiling");
-		BStringView* mixTitle = new BStringView("mixtitle", "Mix");
-		BStringView* preTitle = new BStringView("pretitle", "Before");
-		BStringView* postTitle = new BStringView("posttitle", "After");
-
-		BView* master = new BView("master", B_WILL_DRAW);
-		master->SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+		Panel* master = new Panel("master", theme::kHeader);
 		BLayoutBuilder::Group<>(master, B_VERTICAL, 4)
-			.SetInsets(8, 6, 8, 6)
-			.Add(mixTitle)
-			.AddGroup(B_HORIZONTAL, 6)
-				.Add(fMixGain)
-				.AddGroup(B_VERTICAL, 2)
-					.Add(preTitle)
-					.Add(fPreMeter)
+			.SetInsets(8, 4, 8, 6)
+			.AddGroup(B_HORIZONTAL, 12)
+				.AddGroup(B_VERTICAL, 4)
+					.Add(new Label("mixtitle", "Master", theme::kHeader, theme::kText, true, 84))
+					.Add(fMixGainText)
+					.AddGroup(B_HORIZONTAL, 6)
+						.AddGlue()
+						.Add(fPostMeter)
+						.Add(fMixGain)
+						.AddGlue()
+					.End()
 				.End()
-				.AddGroup(B_VERTICAL, 2)
-					.Add(postTitle)
-					.Add(fPostMeter)
+				.AddGroup(B_VERTICAL, 4)
+					.Add(fLimiter)
+					.Add(fCeilingText)
+					.Add(fCeiling)
+					.Add(fReleaseText)
+					.Add(fRelease)
+					.Add(fReductionText)
+					.Add(fReduction)
+					.AddStrut(4)
+					.Add(fEqButton)
+					.AddGlue()
 				.End()
 			.End()
-			.AddStrut(6)
-			.Add(fLimiter)
-			.Add(fMixHub)
-			.Add(fMixHubLeaveOut)
-			.Add(ceilingTitle)
-			.Add(fCeiling)
-			.Add(fRelease)
-			.Add(fReductionText)
-			.Add(fReduction);
+			.Add(fDebugBox);
 
-		fStatus = new BStringView("status", "Ready.");
+		Panel* mixer = new Panel("mixer", theme::kDock);
+		BLayoutBuilder::Group<>(mixer, B_HORIZONTAL, 6)
+			.SetInsets(6, 6, 6, 6)
+			.Add(fStripsGroup, 1.0f)
+			.Add(master, 0.0f);
+		mixer->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
+		fStripsGroup->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
+		controls->SetExplicitMaxSize(BSize(260, B_SIZE_UNLIMITED));
+
+		fPreviewView = new PreviewView();
+		fTime = new Label("time", "REC 00:00", theme::kWindow, theme::kDimText, false, 90);
+		fSourceName = new Label("sourcename", "", theme::kWindow, theme::kDimText);
+		fStatus = new Label("status", "Ready.", theme::kWindow, theme::kText, false, B_SIZE_UNLIMITED);
 		fLog = new BTextView("log");
 		fLog->MakeEditable(false);
 		fLog->SetWordWrap(true);
-		fShowLog = new BCheckBox("showlog", "Show log", new BMessage(kMsgShowLog));
-		fShowLog->SetValue(fStreamConfig.showLog ? B_CONTROL_ON : B_CONTROL_OFF);
-		BScrollView* logScroll = new BScrollView("logscroll", fLog, 0, false, true);
+		fLog->SetViewColor(theme::kInset);
+		fLog->SetLowColor(theme::kInset);
+		fLog->SetFontAndColor(be_plain_font, B_FONT_ALL, &theme::kText);
+		BScrollView* logScroll = new BScrollView("logscroll", fLog, 0, false, true, B_NO_BORDER);
 		fLogScroll = logScroll;
+		logScroll->SetViewColor(theme::kWindow);
 		logScroll->SetExplicitMinSize(BSize(200, 70));
 		logScroll->SetExplicitPreferredSize(BSize(400, 90));
 
-		BView* mainTab = new BView("Main", 0);
-		BLayoutBuilder::Group<>(mainTab, B_VERTICAL, B_USE_DEFAULT_SPACING)
-			.SetInsets(B_USE_WINDOW_INSETS)
-			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
-				.Add(fRecord)
-				.Add(fStop)
-				.Add(fScreen)
-				.Add(fQuality)
-				.Add(fRealtime)
-				.AddGroup(B_VERTICAL, 2)
-					.Add(fStream)
-					.Add(fStreamSettings)
-				.End()
-				.AddGlue()
+		Panel* mainTab = new Panel("Main", theme::kWindow);
+		BLayoutBuilder::Group<>(mainTab, B_VERTICAL, 6)
+			.SetInsets(6, 6, 6, 6)
+			.Add(fPreviewView, 10.0f)
+			.Add(fSourceName)
+			.AddGroup(B_HORIZONTAL, 6, 0.0f)
+				.Add(MakeDock("Sources", sources), 1.0f)
+				.Add(MakeDock("Audio Mixer", mixer), 2.0f)
+				.Add(MakeDock("Controls", controls), 0.0f)
+			.End()
+			.AddGroup(B_HORIZONTAL, 6, 0.0f)
+				.Add(fStatus)
 				.Add(fTime)
 			.End()
-			.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
-				.Add(fStripsGroup, 3.0f)
-				.Add(master, 1.0f)
-			.End()
-			.AddGroup(B_HORIZONTAL)
-				.Add(fStatus)
-				.AddGlue()
-				.Add(fShowLog)
-			.End()
-			.Add(logScroll);
+			.Add(logScroll, 0.0f);
 
-		// two tabs: the mixer, and the nodes that make sound and how they are connected
+		// two pages: the mixer, and the nodes that make sound and how they are connected
 		fNodes = new NodesTab(BMessenger(this), &fStreamConfig);
-		fTabs = new BTabView("tabs", B_WIDTH_FROM_LABEL);
-		fTabs->AddTab(mainTab);
-		fTabs->AddTab(fNodes);
+		fMixerButton = new FlatButton("showmixer", "Mixer", new BMessage(kMsgShowMixer), theme::kWindow, theme::kAccent);
+		fNodesButton = new FlatButton("shownodes", "Nodes", new BMessage(kMsgShowNodes), theme::kWindow);
+		Panel* bar = new Panel("bar", theme::kWindow);
+		BLayoutBuilder::Group<>(bar, B_HORIZONTAL, 4)
+			.SetInsets(6, 6, 6, 0)
+			.Add(fMixerButton)
+			.Add(fNodesButton)
+			.AddGlue();
+		fPageBar = bar;
+		if (!fStreamConfig.debug)
+			bar->Hide();		// there is only the mixer then
+		BView* pages = new BView("pages", 0);
+		fPages = new BCardLayout();
+		pages->SetLayout(fPages);
+		fPages->AddView(mainTab);
+		fNodes->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
+		mainTab->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
+		pages->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
+		fPages->AddView(fNodes);
+		fPages->SetVisibleItem((int32)0);
+		pages->SetViewColor(theme::kWindow);
 		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
 			.SetInsets(0, 0, 0, 0)
-			.Add(fTabs);
+			.Add(bar, 0.0f)
+			.Add(pages);
 
 		RefreshRealtime();
 		RefreshStream();
 		if (!fStreamConfig.showLog)
 			fLogScroll->Hide();
+		if (!fStreamConfig.preview)
+			fPreviewView->SetPicture(NULL, "The preview is off.");
 		PostMessage(kMsgStartEngine);
+
+		// a roomy window to begin with, as far as the screen has room for it
+		const BRect screen = BScreen(this).Frame();
+		ResizeTo(std::min(1080.0f, screen.Width() - 100), std::min(860.0f, screen.Height() - 100));
+
+		fPreview.source = fSelectedSource;
+		fPreview.enabled = fStreamConfig.preview;
+		fPreview.Start(BMessenger(this));
+		BMessage refresh(kMsgSourceList);
+		fSourceRunner = new BMessageRunner(this, &refresh, 1000000);
+		ShowSourceName();
+		// the item in the Deskbar's tray, made anew (one left by an earlier run may be of another version)
+		BDeskbar deskbar;
+		if (deskbar.HasItem(HRECORD_TRAY_NAME))
+			deskbar.RemoveItem(HRECORD_TRAY_NAME);
+		AddTrayItem();
+	}
+
+	// A program in the background has no place in the Deskbar to bring a minimized window back from: minimizing hides it to
+	// the tray instead.
+	void Minimize(bool minimize)
+	{
+		if (!minimize) {
+			BWindow::Minimize(false);
+			return;
+		}
+		if (!IsHidden()) {
+			CloseEqWindow();
+			Hide();
+			UpdatePreviewState();
+		}
 	}
 
 	bool QuitRequested()
@@ -1989,6 +2200,12 @@ public:
 			if (alert->Go() != 1)
 				return false;
 		}
+		delete fSourceRunner;
+		fSourceRunner = NULL;
+		BDeskbar deskbar;
+		if (deskbar.HasItem(HRECORD_TRAY_NAME))
+			deskbar.RemoveItem(HRECORD_TRAY_NAME);
+		fPreview.Stop();
 		if (fEngine.Running()) {
 			// hrecord ends the recording (if there is one) and puts every program back on the Mixer, which takes a moment
 			fQuitting = true;
@@ -2023,14 +2240,139 @@ public:
 				break;
 			}
 			case kMsgShowNodes:
-				fTabs->Select(1);
+				if (fStreamConfig.debug)
+					ShowPage(1);
+				break;
+			case kMsgShowMixer:
+				ShowPage(0);
+				break;
+			case kMsgSource:
+			{
+				SourceItem* item = (SourceItem*)fSources->ItemAt(fSources->CurrentSelection());
+				if (item == NULL) {
+					SelectSource(fSelectedSource);		// something is always chosen
+					break;
+				}
+				if (fRecording || fRefreshingSources)
+					break;
+				if (item->Source() == kSourceAudioOnly && StreamWanted()) {
+					SetStatus("Streaming sends the screen: pick the desktop or a window.");
+					SelectSource(fSelectedSource);
+					break;
+				}
+				fSelectedSource = item->Source();
+				if (fSelectedSource < 0) {
+					fStreamConfig.audioOnly = fSelectedSource == kSourceAudioOnly;
+					fStreamConfig.Save();
+				}
+				fPreview.source = fSelectedSource;
+				if (fStreamConfig.preview)
+					fPreviewView->SetPicture(NULL, "");		// the old picture was of something else
+				ShowSourceName();
+				break;
+			}
+			case kMsgSourceByName:
+			{
+				// the first source whose line holds this text
+				const char* text;
+				if (message->FindString("name", &text) != B_OK)
+					break;
+				for (int32 i = 0; i < fSources->CountItems(); i++) {
+					if (((SourceItem*)fSources->ItemAt(i))->Text().IFindFirst(text) >= 0) {
+						fSources->Select(i);
+						break;
+					}
+				}
+				break;
+			}
+			case kMsgSourceList:
+				RefreshSources();
+				UpdatePreviewState();
+				if (++fTrayTicks >= 5) {
+					// (the Deskbar may have been started again)
+					fTrayTicks = 0;
+					AddTrayItem();
+				}
+				break;
+			case kTrayAsk:
+			{
+				BMessage state(kTrayState);
+				state.AddBool("recording", fRecording);
+				state.AddBool("hidden", IsHidden() || IsMinimized());
+				message->SendReply(&state, (BHandler*)NULL, 100000);
+				break;
+			}
+			case kTrayRecord:
+				StartRecording();
+				break;
+			case kTrayStop:
+				StopRecording();
+				break;
+			case kTrayShow:
+				ShowFromTray();
+				break;
+			case kTrayHide:
+				if (!IsHidden()) {
+					CloseEqWindow();
+					Hide();
+					UpdatePreviewState();
+				}
+				break;
+			case kMsgPreview:
+			{
+				BBitmap* bitmap = NULL;
+				const char* note = "";
+				int32 source = kSourceDesktop;
+				message->FindPointer("bitmap", (void**)&bitmap);
+				message->FindString("note", &note);
+				message->FindInt32("source", &source);
+				// (a note without a picture keeps the picture there is, unless the window it showed is gone)
+				if (source != fSelectedSource || !fStreamConfig.preview || fSelectedSource == kSourceAudioOnly)
+					delete bitmap;
+				else if (bitmap != NULL)
+					fPreviewView->SetPicture(bitmap, note);
+				else
+					fPreviewView->SetNote(note);
+				fPreview.pending = false;
+				UpdatePreviewState();
+				break;
+			}
+			case kMsgPreviewToggle:
+				fStreamConfig.preview = fShowPreview->Value() == B_CONTROL_ON;
+				fStreamConfig.Save();
+				fPreview.enabled = fStreamConfig.preview;
+				ShowSourceName();
+				break;
+			case kMsgDebug:
+				fStreamConfig.debug = fDebug->Value() == B_CONTROL_ON;
+				fStreamConfig.Save();
+				if (fStreamConfig.debug == fDebugBox->IsHidden(fDebugBox)) {
+					if (fStreamConfig.debug)
+						fDebugBox->Show();
+					else
+						fDebugBox->Hide();
+				}
+				if (fStreamConfig.debug == fPageBar->IsHidden(fPageBar)) {
+					if (fStreamConfig.debug)
+						fPageBar->Show();
+					else {
+						ShowPage(0);
+						fPageBar->Hide();
+					}
+				}
+				SendCommand("mixhubself %d\n", fStreamConfig.LeaveOutWanted() ? 0 : 1);
+				SendCommand("mixhub %d\n", fStreamConfig.MixHubWanted() ? 1 : 0);
+				fNodes->ApplyDebug();
 				break;
 			case kMsgTestAction:
 			{
 				const char* what = "";
 				message->FindString("what", &what);
-				if (strcmp(what, "main") == 0)
-					fTabs->Select(0);
+				if (strcmp(what, "debug") == 0) {
+					fDebug->SetValue(fDebug->Value() == B_CONTROL_ON ? B_CONTROL_OFF : B_CONTROL_ON);
+					PostMessage(kMsgDebug);
+				} else if (strcmp(what, "main") == 0)
+					ShowPage(0);
 				else
 					fNodes->MessageReceived(message);
 				break;
@@ -2077,14 +2419,11 @@ public:
 			case kMsgGain:
 			{
 				int32 source;
-				DbSlider* slider = NULL;
-				if (message->FindInt32("source", &source) == B_OK && message->FindPointer("source", (void**)&slider) != B_OK) {
-					// the value comes from the strip's fader
+				if (message->FindInt32("source", &source) == B_OK) {
 					for (size_t i = 0; i < fStrips.size(); i++) {
 						if (fStrips[i]->Index() == source) {
-							DbSlider* fader = (DbSlider*)fStrips[i]->FindView("fader");
-							if (fader != NULL)
-								SendCommand("gain %d %.1f\n", (int)source + 1, fader->Db());
+							fStrips[i]->ShowGain();
+							SendCommand("gain %d %.1f\n", (int)source + 1, fStrips[i]->Gain());
 						}
 					}
 				}
@@ -2095,8 +2434,10 @@ public:
 				int32 source;
 				if (message->FindInt32("source", &source) == B_OK) {
 					for (size_t i = 0; i < fStrips.size(); i++) {
-						if (fStrips[i]->Index() == source)
+						if (fStrips[i]->Index() == source) {
+							fStrips[i]->ShowGain();
 							SendCommand("pan %d %.2f\n", (int)source + 1, fStrips[i]->Pan());
+						}
 					}
 				}
 				break;
@@ -2104,8 +2445,6 @@ public:
 			case kMsgMute:
 			case kMsgSolo:
 			{
-				// the strip knows whether its box is ticked (the message itself does not say: BControl adds its own
-				// "source" pointer to it, which cannot go next to the strip's number of that name)
 				int32 source;
 				if (message->FindInt32("source", &source) == B_OK) {
 					for (size_t i = 0; i < fStrips.size(); i++) {
@@ -2118,13 +2457,16 @@ public:
 				break;
 			}
 			case kMsgMixGain:
-				SendCommand("mixgain %.1f\n", fMixGain->Db());
+				ShowMasterValues();
+				SendCommand("mixgain %.1f\n", fMixGain->Value() / 2.0f);
 				break;
 			case kMsgCeiling:
-				SendCommand("ceiling %.1f\n", fCeiling->Db());
+				ShowMasterValues();
+				SendCommand("ceiling %.1f\n", fCeiling->Value() / 2.0f);
 				break;
 			case kMsgRelease:
-				SendCommand("release %d\n", (int)fRelease->Value());
+				ShowMasterValues();
+				SendCommand("release %d\n", (int)fRelease->Value() * 10);
 				break;
 			case kMsgStreamToggle:
 				if (!fStreamAddon)
@@ -2176,6 +2518,27 @@ public:
 				fStreamConfig.Save();
 				SendCommand("mixhubself %d\n", fStreamConfig.mixHubLeaveOut ? 0 : 1);
 				break;
+			case kMsgEqOpen:
+				if (fEqWindow.IsValid())
+					fEqWindow.SendMessage(kTrayShow);
+				else {
+					EqWindow* window = new EqWindow(BMessenger(this), fStreamConfig, Frame());
+					fEqWindow = BMessenger(window);
+					window->Show();
+				}
+				break;
+			case kMsgEqChanged:
+			{
+				bool on = false;
+				message->FindBool("on", &on);
+				fStreamConfig.eqOn = on;
+				for (int i = 0; i < kEqBands; i++)
+					message->FindFloat("band", i, &fStreamConfig.eqBands[i]);
+				fStreamConfig.Save();
+				fEqButton->SetColor(on ? theme::kAccent : theme::kButton);
+				SendEq();
+				break;
+			}
 			case kMsgLimiter:
 				SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
 				fCeiling->SetEnabled(fLimiter->Value() == B_CONTROL_ON);
@@ -2258,11 +2621,16 @@ private:
 			fStreamSettings->SetToolTip("Available when the H.264 add-on (the hrecord_stream package) is installed.");
 		}
 		// streaming sends the screen, so the screen is always recorded with it
-		const bool streaming = fStreamAddon && fStreamConfig.enabled;
-		if (streaming)
-			fScreen->SetValue(B_CONTROL_ON);
-		fScreen->SetEnabled(idle && !streaming);
+		if (idle && StreamWanted() && fSelectedSource == kSourceAudioOnly) {
+			fSelectedSource = kSourceDesktop;
+			fPreview.source = fSelectedSource;
+			SelectSource(fSelectedSource);
+			ShowSourceName();
+		}
+		EnableSources(idle);
 	}
+
+	bool StreamWanted() const { return fStreamAddon && fStreamConfig.enabled; }
 
 	// hrecord runs as long as this window is open: it connects to every audio source at once, so that the levels show and a
 	// recording starts at once, and it puts the programs back on the Mixer when it ends.
@@ -2290,12 +2658,13 @@ private:
 		fEngineReady = false;
 		SetStatus("Connecting to the audio sources...");
 		// what is set in the window goes to hrecord as soon as it runs
-		SendCommand("mixgain %.1f\n", fMixGain->Db());
-		SendCommand("ceiling %.1f\n", fCeiling->Db());
-		SendCommand("release %d\n", (int)fRelease->Value());
+		SendCommand("mixgain %.1f\n", fMixGain->Value() / 2.0f);
+		SendCommand("ceiling %.1f\n", fCeiling->Value() / 2.0f);
+		SendCommand("release %d\n", (int)fRelease->Value() * 10);
 		SendCommand("limiter %d\n", fLimiter->Value() == B_CONTROL_ON ? 1 : 0);
-		SendCommand("mixhubself %d\n", fStreamConfig.mixHubLeaveOut ? 0 : 1);
-		if (fStreamConfig.mixHubOn)
+		SendEq();
+		SendCommand("mixhubself %d\n", fStreamConfig.LeaveOutWanted() ? 0 : 1);
+		if (fStreamConfig.MixHubWanted())
 			SendCommand("mixhub 1\n");
 	}
 
@@ -2323,9 +2692,13 @@ private:
 				kStreamPresets[fStreamConfig.preset], fStreamConfig.keyintSeconds, fStreamConfig.Url().c_str());
 		} else
 			SendCommand("nostream\n");
-		BMenuItem* marked = fQualityMenu->FindMarked();
-		const int quality = marked != NULL ? fQualityMenu->IndexOf(marked) : 2;
-		SendCommand("record %d %d\n", (fScreen->Value() == B_CONTROL_ON || streaming) ? 1 : 0, (int)quality);
+		if (streaming && fSelectedSource == kSourceAudioOnly) {
+			fSelectedSource = kSourceDesktop;
+			fPreview.source = fSelectedSource;
+			SelectSource(fSelectedSource);
+		}
+		SendCommand("capwindow %d\n", fSelectedSource >= 0 ? (int)fSelectedSource : -1);
+		SendCommand("record %d %d\n", fSelectedSource != kSourceAudioOnly ? 1 : 0, (int)fQuality->Value());
 
 		fStreamingNow = false;
 		fRecording = true;
@@ -2335,9 +2708,9 @@ private:
 		BMessage tick(kMsgTick);
 		delete fTick;
 		fTick = new BMessageRunner(this, &tick, 1000000);
-		fRecord->SetEnabled(false);
-		fStop->SetEnabled(true);
-		fScreen->SetEnabled(false);
+		ShowRecordButton();
+		fPreview.recording = true;
+		EnableSources(false);
 		fRealtime->SetEnabled(false);
 		fStream->SetEnabled(false);
 		fStreamSettings->SetEnabled(false);
@@ -2353,7 +2726,7 @@ private:
 		if (!fRecording || fStopping)
 			return;
 		fStopping = true;
-		fStop->SetEnabled(false);
+		ShowRecordButton();
 		SetStatus("Stopping: finishing the file...");
 		SendCommand("stoprecord\n");
 	}
@@ -2366,8 +2739,9 @@ private:
 		fStreamingNow = false;
 		delete fTick;
 		fTick = NULL;
-		fRecord->SetEnabled(true);
-		fStop->SetEnabled(false);
+		ShowRecordButton();
+		ShowTime();
+		fPreview.recording = false;
 		fQuality->SetEnabled(true);
 		RefreshRealtime();
 		RefreshStream();
@@ -2396,11 +2770,9 @@ private:
 		if (fRecording)
 			RecordingEnded();
 		ClearStrips();
-		fPreMeter->SetLevels(kMeterMin, kMeterMin);
 		fPostMeter->SetLevels(kMeterMin, kMeterMin);
 		fReduction->SetLevel(0.0f);
-		fRecord->SetEnabled(true);
-		fStop->SetEnabled(false);
+		ShowRecordButton();
 		RefreshRealtime();
 		RefreshStream();
 		if (!fQuitting) {
@@ -2491,7 +2863,6 @@ private:
 		const char* mix = strstr(line, "| mix before");
 		if (mix != NULL && sscanf(mix, "| mix before %f %f after %f %f dBFS | limiter %f dB", &beforeL, &beforeR,
 				&afterL, &afterR, &limiter) == 5) {
-			fPreMeter->SetLevels(beforeL, beforeR);
 			fPostMeter->SetLevels(afterL, afterR);
 			float reduction = -limiter;
 			if (reduction < 0.0f)
@@ -2541,7 +2912,7 @@ private:
 			break;
 		}
 		if (fStrips.empty() && fEngineReady) {
-			fHint->SetText("No source is playing now. A program that starts playing joins the recording by itself.");
+			fHint->SetText("Nothing playing now.");
 			ShowHint(true);
 		}
 	}
@@ -2553,15 +2924,245 @@ private:
 			delete fStrips[i];
 		}
 		fStrips.clear();
-		fHint->SetText("Every program that plays sound is connected automatically and gets a strip here, as soon as it starts. Press Record to record.");
+		fHint->SetText("Nothing playing yet.");
 		ShowHint(true);
 	}
 
 	void ShowTime()
 	{
-		char text[16];
-		snprintf(text, sizeof(text), "%02d:%02d", (int)(fSeconds / 60), (int)(fSeconds % 60));
+		char text[24];
+		snprintf(text, sizeof(text), "REC %02d:%02d", (int)(fSeconds / 60), (int)(fSeconds % 60));
 		fTime->SetText(text);
+	}
+
+	void ShowPage(int32 page)
+	{
+		fPages->SetVisibleItem(page);
+		fMixerButton->SetColor(page == 0 ? theme::kAccent : theme::kButton);
+		fNodesButton->SetColor(page == 1 ? theme::kAccent : theme::kButton);
+		UpdatePreviewState();
+	}
+
+	void ShowFromTray()
+	{
+		SetWorkspaces(B_CURRENT_WORKSPACE);
+		while (IsHidden())
+			Show();
+		if (IsMinimized())
+			Minimize(false);
+		Activate();
+		UpdatePreviewState();
+	}
+
+	// hrecord_tray: beside this program (a build), or in the add-ons of an installed package.
+	static bool FindTrayFile(entry_ref& ref)
+	{
+		std::vector<std::string> places;
+		app_info info;
+		if (be_app->GetAppInfo(&info) == B_OK) {
+			BPath path(&info.ref);
+			if (path.InitCheck() == B_OK && path.GetParent(&path) == B_OK)
+				places.push_back(std::string(path.Path()) + "/" HRECORD_TRAY_FILE);
+		}
+		// (the packages' own add-ons folder: B_..._ADDONS_DIRECTORY is another one, add-ons/x86, for a 32-bit program of the
+		// newer compiler, as this one is)
+		const directory_which directories[] = { B_USER_NONPACKAGED_DIRECTORY, B_USER_CONFIG_DIRECTORY,
+			B_SYSTEM_NONPACKAGED_DIRECTORY, B_SYSTEM_DIRECTORY };
+		for (int i = 0; i < 4; i++) {
+			BPath path;
+			if (find_directory(directories[i], &path) == B_OK)
+				places.push_back(std::string(path.Path()) + "/add-ons/hrecord/" HRECORD_TRAY_FILE);
+		}
+		for (size_t i = 0; i < places.size(); i++) {
+			BEntry entry(places[i].c_str(), true);
+			if (entry.Exists() && entry.GetRef(&ref) == B_OK)
+				return true;
+		}
+		return false;
+	}
+
+	void AddTrayItem()
+	{
+		BDeskbar deskbar;
+		entry_ref ref;
+		if (!deskbar.IsRunning() || deskbar.HasItem(HRECORD_TRAY_NAME) || !FindTrayFile(ref))
+			return;
+		const status_t status = deskbar.AddItem(&ref);
+		if (status != B_OK) {
+			BString text("The tray icon could not be added: ");
+			text << strerror(status);
+			Log(text.String());
+		}
+	}
+
+	void SendEq()
+	{
+		for (int i = 0; i < kEqBands; i++)
+			SendCommand("eqband %d %.1f\n", i + 1, fStreamConfig.eqBands[i]);
+		SendCommand("eq %d\n", fStreamConfig.eqOn ? 1 : 0);
+	}
+
+	void CloseEqWindow()
+	{
+		if (fEqWindow.IsValid())
+			fEqWindow.SendMessage(B_QUIT_REQUESTED);
+	}
+
+	void ShowRecordButton()
+	{
+		fRecord->SetLabel(fRecording ? "Stop Recording" : "Start Recording");
+		fRecord->SetMessage(new BMessage(fRecording ? kMsgStop : kMsgRecord));
+		fRecord->SetColor(fRecording ? theme::kRecord : theme::kAccent);
+		fRecord->SetEnabled(!fStopping);
+	}
+
+	void ShowMasterValues()
+	{
+		char text[48];
+		FaderText(fMixGain, text, sizeof(text));
+		fMixGainText->SetText(text);
+		snprintf(text, sizeof(text), "Ceiling: %.1f dB", fCeiling->Value() / 2.0f);
+		fCeilingText->SetText(text);
+		snprintf(text, sizeof(text), "Release: %d ms", (int)fRelease->Value() * 10);
+		fReleaseText->SetText(text);
+	}
+
+	// The preview is read only while it can be seen, and in the size there is room for.
+	void UpdatePreviewState()
+	{
+		fPreview.visible = !IsMinimized() && !IsHidden() && fPages->VisibleIndex() == 0;
+		const BRect bounds = fPreviewView->Bounds();
+		if (bounds.IsValid()) {
+			fPreview.width = std::max((int32)64, bounds.IntegerWidth() + 1);
+			fPreview.height = std::max((int32)36, bounds.IntegerHeight() + 1);
+		}
+	}
+
+	void ShowSourceName()
+	{
+		BString text;
+		SourceItem* item = (SourceItem*)fSources->ItemAt(fSources->CurrentSelection());
+		if (item != NULL)
+			text << "Recording shows: " << item->Text();
+		fSourceName->SetText(text.String());
+		if (fSelectedSource == kSourceAudioOnly)
+			fPreviewView->SetPicture(NULL, "Sound only: there is no picture.");
+		else if (!fStreamConfig.preview)
+			fPreviewView->SetPicture(NULL, "The preview is off.");
+	}
+
+	void EnableSources(bool enable)
+	{
+		fSourcesEnabled = enable;
+		for (int32 i = 0; i < fSources->CountItems(); i++)
+			fSources->ItemAt(i)->SetEnabled(enable || ((SourceItem*)fSources->ItemAt(i))->Source() == fSelectedSource);
+		fSources->Invalidate();
+	}
+
+	void SelectSource(int32 source)
+	{
+		const bool refreshing = fRefreshingSources;
+		fRefreshingSources = true;
+		for (int32 i = 0; i < fSources->CountItems(); i++) {
+			if (((SourceItem*)fSources->ItemAt(i))->Source() != source)
+				continue;
+			fSources->ItemAt(i)->SetEnabled(true);
+			if (fSources->CurrentSelection() != i)
+				fSources->Select(i);
+		}
+		fRefreshingSources = refreshing;
+	}
+
+	// The windows that are open, for the list of sources: the ordinary ones of every program but this one and the desktop's own
+	// (the Deskbar, a dock).
+	static void OpenWindows(std::vector<std::pair<int32, std::string> >& windows)
+	{
+		int32 count = 0;
+		int32* tokens = get_token_list(-1, &count);
+		if (tokens == NULL)
+			return;
+		team_info own;
+		get_team_info(B_CURRENT_TEAM, &own);
+		for (int32 i = 0; i < count; i++) {
+			client_window_info* info = get_window_info(tokens[i]);
+			if (info == NULL)
+				continue;
+			if (info->team != own.team && info->feel == B_NORMAL_WINDOW_FEEL && info->name[0] != '\0'
+				&& (info->is_mini || info->show_hide_level <= 0)
+				&& info->window_right > info->window_left && info->window_bottom > info->window_top
+				&& info->window_right > -1000) {
+				app_info app;
+				std::string text;
+				if (be_roster->GetRunningAppInfo(info->team, &app) == B_OK) {
+					if (strcasecmp(app.signature, "application/x-vnd.Be-TSKB") != 0
+						&& strcasestr(app.signature, "hdesktop") == NULL)
+						text = app.ref.name;
+					else
+						text = "";
+				} else
+					text = "?";
+				if (!text.empty()) {
+					if (text != info->name) {
+						text += ": ";
+						text += info->name;
+					}
+					if (info->is_mini)
+						text += " (minimized)";
+					const int32 token = info->server_token;	// (the struct is packed)
+					windows.push_back(std::make_pair(token, text));
+				}
+			}
+			free(info);
+		}
+		free(tokens);
+		std::sort(windows.begin(), windows.end());		// by token: the order they were opened in, which does not jump about
+	}
+
+	void RefreshSources()
+	{
+		if (fRecording)
+			return;
+		std::vector<std::pair<int32, std::string> > entries;
+		entries.push_back(std::make_pair(kSourceDesktop, std::string("Entire desktop")));
+		entries.push_back(std::make_pair(kSourceAudioOnly, std::string("Sound only (no screen)")));
+		std::vector<std::pair<int32, std::string> > windows;
+		OpenWindows(windows);
+		for (size_t i = 0; i < windows.size(); i++)
+			entries.push_back(std::make_pair(windows[i].first, "Window - " + windows[i].second));
+
+		bool same = (int32)entries.size() == fSources->CountItems();
+		for (size_t i = 0; same && i < entries.size(); i++) {
+			SourceItem* item = (SourceItem*)fSources->ItemAt(i);
+			same = item->Source() == entries[i].first && entries[i].second == item->Text().String();
+		}
+		if (same)
+			return;
+
+		bool present = false;
+		for (size_t i = 0; i < entries.size(); i++)
+			present |= entries[i].first == fSelectedSource;
+		const bool lost = !present;
+		if (lost) {
+			fSelectedSource = kSourceDesktop;
+			fPreview.source = fSelectedSource;
+		}
+
+		fRefreshingSources = true;
+		const BPoint scrolled = fSources->Bounds().LeftTop();
+		while (fSources->CountItems() > 0)
+			delete fSources->RemoveItem((int32)0);
+		for (size_t i = 0; i < entries.size(); i++) {
+			SourceItem* item = new SourceItem(entries[i].first, entries[i].second.c_str());
+			fSources->AddItem(item);
+		}
+		SelectSource(fSelectedSource);
+		fSources->ScrollTo(scrolled);
+		fRefreshingSources = false;
+		if (fSourceName != NULL) {
+			ShowSourceName();
+			if (lost)
+				SetStatus("The chosen window was closed: the entire desktop is chosen now.");
+		}
 	}
 
 	void SetStatus(const char* text) { fStatus->SetText(text); }
@@ -2577,9 +3178,30 @@ private:
 	Engine				fEngine;
 	bool				fRecording;
 	bool				fHintVisible = true;
-	BTabView*			fTabs;
+	BCardLayout*		fPages;
+	FlatButton*			fMixerButton;
+	FlatButton*			fNodesButton;
+	FlatButton*			fEqButton;
+	BMessenger			fEqWindow;
+	int					fTrayTicks = 0;
+	BView*				fPageBar;
+	BListView*			fSources;
+	BScrollView*		fSourceScroll;
+	int32				fSelectedSource = kSourceDesktop;
+	bool				fRefreshingSources = false;
+	bool				fSourcesEnabled = true;
+	BMessageRunner*		fSourceRunner = NULL;
+	Preview				fPreview;
+	PreviewView*		fPreviewView = NULL;
+	Label*				fSourceName = NULL;
+	Panel*				fDebugBox;
+	Label*				fMixGainText;
+	Label*				fCeilingText;
+	Label*				fReleaseText;
+	FlatCheck*			fShowPreview;
+	FlatCheck*			fDebug;
 	NodesTab*			fNodes;
-	BCheckBox*			fShowLog;
+	FlatCheck*			fShowLog;
 	BScrollView*		fLogScroll;
 	float				fLogHeight = 100;
 	bool				fEngineReady = false;		// hrecord is connected to the sources
@@ -2590,32 +3212,28 @@ private:
 	int					fSeconds;
 	BMessageRunner*		fTick;
 
-	BButton*			fRecord;
-	BButton*			fStop;
-	BCheckBox*			fScreen;
-	BCheckBox*			fRealtime;
-	BCheckBox*			fStream;
-	BButton*			fStreamSettings;
+	FlatButton*			fRecord;
+	FlatCheck*			fRealtime;
+	FlatCheck*			fStream;
+	FlatButton*			fStreamSettings;
 	StreamConfig		fStreamConfig;
 	bool				fStreamAddon = false;
 	bool				fStreamingNow = false;
-	BPopUpMenu*			fQualityMenu;
-	BMenuField*			fQuality;
-	BStringView*		fTime;
+	Segments*			fQuality;
+	Label*				fTime;
 	BView*				fStripsGroup;
-	BStringView*		fHint;
+	Label*				fHint;
 	std::vector<SourceStrip*> fStrips;
-	DbSlider*			fMixGain;
-	StereoMeter*		fPreMeter;
+	Fader*				fMixGain;
 	StereoMeter*		fPostMeter;
-	BCheckBox*			fLimiter;
-	BCheckBox*			fMixHub;
-	BCheckBox*			fMixHubLeaveOut;
-	DbSlider*			fCeiling;
-	BSlider*			fRelease;
+	FlatCheck*			fLimiter;
+	FlatCheck*			fMixHub;
+	FlatCheck*			fMixHubLeaveOut;
+	Fader*				fCeiling;
+	Fader*				fRelease;
 	LevelMeter*			fReduction;
-	BStringView*		fReductionText;
-	BStringView*		fStatus;
+	Label*				fReductionText;
+	Label*				fStatus;
 	BTextView*			fLog;
 	std::string			fOutputFile;
 };
@@ -2635,6 +3253,10 @@ public:
 				fShowStream = true;
 			else if (strcmp(argv[i], "--stream-toggle") == 0)
 				fToggleStream = true;
+			else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc)
+				fSource = argv[++i];
+			else if (strcmp(argv[i], "--stop-after") == 0 && i + 1 < argc)
+				fStopAfter = atoi(argv[++i]);
 			else if (strcmp(argv[i], "--nodes") == 0)
 				fShowNodes = true;
 			else if (strcmp(argv[i], "--click") == 0 && i + 1 < argc)
@@ -2644,12 +3266,47 @@ public:
 		}
 	}
 
+	// the tray item's messages go to the window; starting the mixer again shows a hidden window
+	void MessageReceived(BMessage* message)
+	{
+		switch (message->what) {
+			case kTrayAsk:
+			case kTrayRecord:
+			case kTrayStop:
+			case kTrayShow:
+			case kTrayHide:
+				if (fWindow.IsValid())
+					fWindow.SendMessage(message, message->ReturnAddress());
+				break;
+			case kTrayQuit:
+				if (fWindow.IsValid())
+					fWindow.SendMessage(B_QUIT_REQUESTED);
+				break;
+			case B_SILENT_RELAUNCH:
+				if (fWindow.IsValid())
+					fWindow.SendMessage(kTrayShow);
+				break;
+			default:
+				BApplication::MessageReceived(message);
+		}
+	}
+
 	void ReadyToRun()
 	{
 		MixerWindow* window = new MixerWindow();
+		fWindow = BMessenger(window);
 		window->Show();
+		if (!fSource.empty()) {
+			BMessage choose(kMsgSourceByName);
+			choose.AddString("name", fSource.c_str());
+			window->PostMessage(&choose);
+		}
 		if (fAutoRecord)
 			window->PostMessage(kMsgRecord);
+		if (fStopAfter > 0) {
+			BMessage stop(kMsgStop);
+			new BMessageRunner(BMessenger(window), &stop, (bigtime_t)fStopAfter * 1000000, 1);
+		}
 		if (fShowStream)
 			window->PostMessage(kMsgStreamConfigure);
 		if (fToggleStream)
@@ -2677,6 +3334,9 @@ private:
 	bool	fToggleStream;
 	bool	fShowNodes;
 	std::vector<std::string>	fClicks;
+	std::string					fSource;
+	BMessenger					fWindow;
+	int							fStopAfter = 0;
 };
 
 

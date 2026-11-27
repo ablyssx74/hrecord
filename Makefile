@@ -62,10 +62,30 @@ CXXFLAGS += $(shell $(PKG_CONFIG_CMD) --cflags libavformat libavcodec libavutil 
 
 LIBS = $(LIB_PATH) $(EXTRA_LIBS) $(HAIKU_LIBS)
 
-.PHONY: all clean gui
+.PHONY: all clean gui tray
+
+# The mixer's item in the Deskbar's tray. It runs inside the Deskbar, so on 32-bit it is built with the compiler the Deskbar
+# is built with (gcc 2), unlike the rest. It carries the mixer's icon.
+ifeq ($(UNAME_M), BePC)
+    TRAY_CXX = g++
+else
+    TRAY_CXX = $(CXX)
+endif
+TRAY_TARGET = hrecord_tray
+
+tray: $(TRAY_TARGET)
+
+$(TRAY_TARGET): tray.cpp tray.h hrecord_mixer.rdef
+	$(TRAY_CXX) -O2 -Wall -I./compat -o $(TRAY_TARGET) tray.cpp -lbe
+	( echo 'resource app_signature "application/x-vnd.hrecord-mixer-tray";'; \
+	  echo 'resource app_flags B_SINGLE_LAUNCH | B_BACKGROUND_APP;'; \
+	  sed -n '/^resource vector_icon/,$$p' hrecord_mixer.rdef ) > tray.version.rdef
+	rc -o tray.rsrc tray.version.rdef
+	xres -o $(TRAY_TARGET) tray.rsrc
+	mimeset -f $(TRAY_TARGET)
 
 # The mixer window: runs hrecord as its engine
-gui: hrecord_gui.cpp hrecord_mixer.rdef VERSION
+gui: tray hrecord_gui.cpp window_capture.h mixer_widgets.h preview.h tray.h eq.h hrecord_mixer.rdef VERSION
 	$(CXX) -std=c++17 -O2 -Wall -I./compat $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lmedia -lroot -lnetwork
 	sed -e 's/@V_MAJOR@/$(V_MAJOR)/' -e 's/@V_MINOR@/$(V_MINOR)/' -e 's/@V_MIDDLE@/$(V_MIDDLE)/' -e 's/@VERSION@/$(VERSION)/' hrecord_mixer.rdef > hrecord_mixer.version.rdef
 	rc -o hrecord_mixer.rsrc hrecord_mixer.version.rdef
@@ -88,7 +108,7 @@ $(GUI_RSRCS): hrecord.rdef VERSION
 	rc -o $@ hrecord.version.rdef
 
 # The version is compiled in: a new VERSION means a new build of the file that has it
-hrecord.o: VERSION
+hrecord.o: VERSION window_capture.h eq.h
 
 # General object file compilation hooks
 %.o: %.cpp
@@ -96,7 +116,7 @@ hrecord.o: VERSION
 
 # Deep system cleaning target
 clean:
-	rm -f *.o stream/*.o *.rsrc *.version.rdef *.hpkg $(GUI_TARGET) hrecord_mixer stream/hrecord_x264 
+	rm -f *.o stream/*.o *.rsrc *.version.rdef *.hpkg $(GUI_TARGET) hrecord_mixer hrecord_tray stream/hrecord_x264 
 	rm -rf build
 
 
@@ -111,6 +131,8 @@ release: all gui stream-release
 	cp $(GUI_TARGET) $(PACKAGE_DIR)/bin/$(GUI_TARGET)
 	mkdir -p $(PACKAGE_DIR)/apps $(PACKAGE_DIR)/data/deskbar/menu/Applications
 	cp hrecord_mixer $(PACKAGE_DIR)/apps/hrecord_mixer
+	mkdir -p $(PACKAGE_DIR)/add-ons/hrecord
+	cp hrecord_tray $(PACKAGE_DIR)/add-ons/hrecord/hrecord_tray
 	ln -s ../../../../apps/hrecord_mixer "$(PACKAGE_DIR)/data/deskbar/menu/Applications/hRecord Mixer"
 	package create -C $(PACKAGE_DIR) $(GUI_TARGET)-$(VERSION)-1-$(ARCH).hpkg	
 

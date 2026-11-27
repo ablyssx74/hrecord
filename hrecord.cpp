@@ -7,6 +7,8 @@
 #include <DirectWindow.h> // BDirectWindow -- see --direct-tiled-capture/SetupDirectCapture()
 #include <WindowInfo.h> // Private Window Kit API -- see EnumerateVisibleWindows()
 #include <AppServerLink.h> // Private: the screen observer of a composited desktop (RenkuOS) -- see SetupScreenObserver()
+#include "window_capture.h" // reading one window (--window, "capwindow")
+#include "eq.h" // the master equalizer ("eq", "eqband")
 #include <dlfcn.h> // dlsym() -- is_composited_desktop()
 #include <StorageKit.h>
 #include <Path.h> // BPath -- DetectRealtimeAudioSettings' own settings-dir resolution
@@ -3366,6 +3368,35 @@ private:
 
 MixLimiter g_mixLimiter;
 
+// The master equalizer, ahead of the limiter. The control channel sets these; the mixing callback makes its filters from them.
+std::atomic<bool> g_eqOn(false);
+std::atomic<float> g_eqGain[kEqBands];           // dB; zero until set
+std::atomic<uint32_t> g_eqGeneration(1);         // raised by every change
+
+// One for the mix that is heard and recorded, and one for each of the mix hub's own mixes (each remembers its own sound).
+static void EqualizeMix(float* samples, int frames, int which) {
+    static Equalizer equalizers[5];
+    static uint32_t made[5] = { 0, 0, 0, 0, 0 };
+    static float rate[5] = { 0, 0, 0, 0, 0 };
+    if (!g_eqOn.load()) {
+        if (made[which] != 0)
+            equalizers[which].Reset();
+        made[which] = 0;
+        return;
+    }
+    const uint32_t generation = g_eqGeneration.load();
+    const float now = (float)g_mixBusRate;
+    if (made[which] != generation || rate[which] != now) {
+        float gains[kEqBands];
+        for (int i = 0; i < kEqBands; i++)
+            gains[i] = g_eqGain[i].load();
+        equalizers[which].Set(gains, now);
+        made[which] = generation;
+        rate[which] = now;
+    }
+    equalizers[which].Process(samples, frames);
+}
+
 std::atomic<bool> g_meterStop(false);
 std::thread g_meterThread;
 
@@ -3421,6 +3452,7 @@ struct RecordingSetup {
     bool logFps = false;
     bool wantStream = false;
     StreamSettings stream;
+    int32 windowToken = -1;     // the app_server token of the one window to record; -1: the whole desktop
 };
 
 bool g_standby = false;          // --standby
@@ -3431,6 +3463,7 @@ RecordingSetup g_pendingSetup;
 bool g_recordRequested = false;
 StreamSettings g_pendingStream;
 bool g_pendingStreamOn = false;
+int32 g_pendingWindowToken = -1; // "capwindow": what the next recording shows
 
 // What the control channel's source commands do (defined with the sources of the mix, below).
 void EngineRoute(int nodeId, bool stereo, bool left, bool right);
@@ -3445,6 +3478,7 @@ extern std::atomic<bool> g_mixHubExclude;
 //   gain <n> <dB>     the n-th source's gain          mute <n> <0|1>     mute a source
 //   solo <n> <0|1>    solo a source                   mixgain <dB>       the whole mix
 //   ceiling <dB>      the limiter's ceiling           release <ms>       the limiter's release
+//   eq <0|1>          the master equalizer on or off  eqband <n> <dB>    the n-th of its 15 bands (1 first), -15..15
 //   pan <n> <-1..1>   a source's balance, left to right
 //   limiter <0|1>     the limiter on or off           quit               stop recording (and, in --standby, end hrecord)
 //   route <node> <stereo 0|1> <left 0|1> <right 0|1>   what the mix takes from a source (the program or input device with that Media
@@ -3459,6 +3493,7 @@ extern std::atomic<bool> g_mixHubExclude;
 //                     a program that plays (rakarrack) are in it, as the speakers get them. Only with --allaudio
 //   detach <node>     the program with that node id is put back on the Mixer and left alone (until "attach")
 //   attach <node>     it may be tapped again
+//   capwindow <token>   the next recording shows only the window with that app_server token (-1: the whole desktop)
 //   record <screen 0|1> <quality 0|1|2>     --standby only: start a recording (the screen too, and its quality: low, medium, high)
 //   stoprecord        --standby only: end the recording; the sources stay connected
 //   stream <video kbps> <audio kbps> <preset> <key frame seconds> <address>   the next recording is streamed too (--standby)
@@ -3478,6 +3513,12 @@ void ControlLoop() {
         } else if (sscanf(line, "solo %d %d", &n, &v) == 2 && n >= 1 && n <= kMeterMaxSources) {
             if (v != 0) g_soloMask.fetch_or(1u << (n - 1));
             else g_soloMask.fetch_and(~(1u << (n - 1)));
+        } else if (sscanf(line, "eqband %d %f", &n, &f) == 2 && n >= 1 && n <= kEqBands) {
+            g_eqGain[n - 1] = std::max(-kEqRange, std::min(kEqRange, f));
+            g_eqGeneration++;
+        } else if (sscanf(line, "eq %d", &v) == 1) {
+            g_eqOn = (v != 0);
+            g_eqGeneration++;
         } else if (sscanf(line, "mixgain %f", &f) == 1) {
             g_mixGainDb = f;
         } else if (sscanf(line, "ceiling %f", &f) == 1) {
@@ -3493,7 +3534,10 @@ void ControlLoop() {
             g_pendingSetup.profile = &kVideoProfiles[v < 0 ? 0 : (v > 2 ? 2 : v)];
             g_pendingSetup.wantStream = g_pendingStreamOn;
             g_pendingSetup.stream = g_pendingStream;
+            g_pendingSetup.windowToken = g_pendingWindowToken;
             g_recordRequested = true;
+        } else if (sscanf(line, "capwindow %d", &n) == 1) {
+            g_pendingWindowToken = n;
         } else if (strncmp(line, "stoprecord", 10) == 0 && g_standby) {
             g_running = false;
         } else if (strncmp(line, "nostream", 8) == 0) {
@@ -3681,6 +3725,13 @@ void MixedPlaybackCallback(void* cookie, void* buffer, size_t size,
             AtomicMax(g_mixMeter.srcPeakAll[index], peak);
             g_mixMeter.srcNear[index].fetch_add(near, std::memory_order_relaxed);
         }
+    }
+
+    // the master equalizer
+    if (kMixBusChannels == 2 && g_mixBusRate > 0) {
+        EqualizeMix(out, (int)(sampleCount / 2), 0);
+        for (int k = 0; k < hubTeamCount; k++)
+            EqualizeMix(hubMix[k].data(), (int)(sampleCount / 2), k + 1);
     }
 
     // the mix before the limiter
@@ -4686,6 +4737,95 @@ static int32 BackgroundUpdateChecker(void* data) {
 static AllAudioHandles g_allAudioTap;
 static media_raw_audio_format g_standbyNegotiated;
 
+// Where the picture of a recording of one window comes from (--window, "capwindow"): the compositor's buffer for the window
+// where app_server hands it out, which has the whole window also while others cover it; the part of the screen the window
+// covers everywhere else, with whatever is on top of it. While the window is minimized or on another workspace the last
+// picture stays; once it is closed the video is black.
+class WindowSource {
+public:
+    bool Open(int32 token, BRect screenFrame) {
+        fToken = token;
+        client_window_info* info = get_window_info(token);
+        if (info == nullptr)
+            return false;
+        fName = info->name;
+        const BRect outer = WindowOuterRect(*info);
+        fStartWidth = outer.IntegerWidth() + 1;
+        fStartHeight = outer.IntegerHeight() + 1;
+        // room for the window to grow while it is recorded (the compositor's buffer is scaled down into it beyond that)
+        fMaxWidth = std::min(8192, std::max((int)screenFrame.IntegerWidth() + 1, fStartWidth) + 128);
+        fMaxHeight = std::min(8192, std::max((int)screenFrame.IntegerHeight() + 1, fStartHeight) + 128);
+        if (!info->is_mini && fPicture.Read(token, fMaxWidth, fMaxHeight) == B_OK) {
+            fServerRead = true;
+            fStartWidth = fPicture.Width();
+            fStartHeight = fPicture.Height();
+        } else
+            fServerRead = fPicture.Available();
+        free(info);
+        return true;
+    }
+
+    bool ServerRead() const { return fServerRead; }
+    const std::string& Name() const { return fName; }
+    int StartWidth() const { return fStartWidth; }
+    int StartHeight() const { return fStartHeight; }
+
+    // The current picture (BGRA), or NULL when there is none.
+    const uint8* Grab(BScreen& screen, BBitmap* screenBitmap, int screenWidth, int screenHeight, int* _width,
+            int* _height, int* _bytesPerRow) {
+        client_window_info* info = fClosed ? nullptr : get_window_info(fToken);
+        if (info == nullptr) {
+            if (!fClosed)
+                std::cout << "[i] The window being recorded was closed; the video is black from here on." << std::endl;
+            fClosed = true;
+            return nullptr;
+        }
+        const bool visible = !info->is_mini && info->show_hide_level <= 0
+            && (info->workspaces & (1u << current_workspace())) != 0;
+        const BRect outer = WindowOuterRect(*info);
+        free(info);
+
+        if (fServerRead) {
+            // (with no picture yet, a window that is out of sight is asked for the small one app_server keeps of it)
+            if (visible || fPicture.Bits() == nullptr)
+                fPicture.Read(fToken, fMaxWidth, fMaxHeight);
+            fServerRead = fPicture.Available();
+            if (fServerRead) {
+                *_width = fPicture.Width();
+                *_height = fPicture.Height();
+                *_bytesPerRow = fPicture.BytesPerRow();
+                return fPicture.Bits();
+            }
+        }
+
+        if (visible) {
+            BRect rect = outer & BRect(0, 0, screenWidth - 1, screenHeight - 1);
+            if (rect.IsValid()) {
+                RefreshScreenRegionTiled(rect, screen, screenBitmap, screenWidth, screenHeight);
+                fRect = rect;
+            }
+        }
+        // (the screen may have got smaller since the rectangle was taken)
+        if (!fRect.IsValid() || fRect.right >= screenWidth || fRect.bottom >= screenHeight)
+            return nullptr;
+        *_width = fRect.IntegerWidth() + 1;
+        *_height = fRect.IntegerHeight() + 1;
+        *_bytesPerRow = screenBitmap->BytesPerRow();
+        return (const uint8*)screenBitmap->Bits() + (size_t)fRect.top * screenBitmap->BytesPerRow()
+            + (size_t)fRect.left * 4;
+    }
+
+private:
+    int32 fToken = -1;
+    std::string fName;
+    WindowPicture fPicture;
+    bool fServerRead = false;
+    bool fClosed = false;
+    BRect fRect;
+    int fStartWidth = 0, fStartHeight = 0;
+    int fMaxWidth = 0, fMaxHeight = 0;
+};
+
 static int RunRecording(const RecordingSetup& setup) {
     bool audioOnly = setup.audioOnly;
     bool allAudio = setup.allAudio;
@@ -4699,6 +4839,8 @@ static int RunRecording(const RecordingSetup& setup) {
     BRect screenFrame;
     int width = 0, height = 0;   // native screen size -- what's actually captured
     int outWidth = 0, outHeight = 0; // encode size -- what the profile scales down to
+    const int32 windowToken = audioOnly ? -1 : setup.windowToken; // -1: the whole desktop
+    WindowSource windowSource;
     if (!audioOnly) {
         if (!screen.IsValid()) {
             std::cerr << "[-] Error: Failed to initialize Haiku native BScreen handler." << std::endl;
@@ -4710,11 +4852,22 @@ static int RunRecording(const RecordingSetup& setup) {
 
         outWidth = width;
         outHeight = height;
-        int longEdge = std::max(width, height);
+        if (windowToken >= 0) {
+            if (!windowSource.Open(windowToken, screenFrame)) {
+                std::cerr << "[-] Error: The window to record is not open any more." << std::endl;
+                return -1;
+            }
+            outWidth = windowSource.StartWidth();
+            outHeight = windowSource.StartHeight();
+            std::cout << "[+] Recording the window \"" << windowSource.Name() << "\" (" << outWidth << "x" << outHeight
+                << (windowSource.ServerRead() ? ", from the compositor"
+                    : ", from the screen: what covers it is recorded too") << ")." << std::endl;
+        }
+        int longEdge = std::max(outWidth, outHeight);
         if (profile.maxDimension > 0 && longEdge > profile.maxDimension) {
             double scale = (double)profile.maxDimension / longEdge;
-            outWidth = (int)(width * scale);
-            outHeight = (int)(height * scale);
+            outWidth = (int)(outWidth * scale);
+            outHeight = (int)(outHeight * scale);
         }
         // YUV420 needs even dimensions for its chroma subsampling.
         outWidth -= outWidth % 2;
@@ -4724,9 +4877,11 @@ static int RunRecording(const RecordingSetup& setup) {
 
         // A composited desktop (RenkuOS) gives a BDirectWindow no view of the screen: its own screen observer is used there.
         bool screenObserver = false;
-        if (g_directTiledCapture || g_directRawCapture)
+        // (a window read from the compositor needs no view of the screen at all)
+        const bool screenNeeded = windowToken < 0 || !windowSource.ServerRead();
+        if (screenNeeded && (g_directTiledCapture || g_directRawCapture))
             screenObserver = SetupScreenObserver(width, height);
-        if ((g_directTiledCapture || g_directRawCapture) && !screenObserver) {
+        if (screenNeeded && (g_directTiledCapture || g_directRawCapture) && !screenObserver) {
             SetupDirectCapture();
         }
     }
@@ -5035,6 +5190,9 @@ static int RunRecording(const RecordingSetup& setup) {
         int dstW = outWidth, dstH = outHeight;
         uint8_t* dstData[4] = { encodingFrame->data[0], encodingFrame->data[1], encodingFrame->data[2], encodingFrame->data[3] };
         bigtime_t lastResolutionCheck = system_time();
+        int windowFitWidth = 0, windowFitHeight = 0; // the size of the window's picture that its place in the video is for
+        int windowDstW = 0, windowDstH = 0;
+        uint8_t* windowDstData[4] = { nullptr, nullptr, nullptr, nullptr };
 
         // --logfps diagnostics: how many frames actually got written each
         // wall-clock second, versus this profile's own target, plus how many
@@ -5113,6 +5271,7 @@ static int RunRecording(const RecordingSetup& setup) {
                     rcserverNeedsSeed = true;
                     rcserverFallbackFramesRemaining = 0;
                     g_lastCursorPos = BPoint(-1, -1);
+                    windowFitWidth = windowFitHeight = 0;
 
                     // fit the screen into the (unchanged) size of the video, keeping its proportions
                     double scale = std::min((double)outWidth / width, (double)outHeight / height);
@@ -5136,7 +5295,56 @@ static int RunRecording(const RecordingSetup& setup) {
                 g_captureGeneration = directGeneration;
             }
 
-            if (g_experimentalScreenCapture || g_hybridCapture) {
+            if (windowToken >= 0) {
+                int sourceWidth = 0, sourceHeight = 0, sourceBytesPerRow = 0;
+                const uint8* source = windowSource.Grab(screen, screenBitmap, width, height, &sourceWidth, &sourceHeight,
+                    &sourceBytesPerRow);
+                captureElapsed = system_time() - loopIterationStart; // --logfps
+
+                if (source == nullptr || sourceWidth != windowFitWidth || sourceHeight != windowFitHeight) {
+                    // black (full-range YUV: Y 0, U and V 128), then the window goes in the middle, keeping its proportions
+                    memset(encodingFrame->data[0], 0, (size_t)encodingFrame->linesize[0] * outHeight);
+                    memset(encodingFrame->data[1], 128, (size_t)encodingFrame->linesize[1] * (outHeight / 2));
+                    memset(encodingFrame->data[2], 128, (size_t)encodingFrame->linesize[2] * (outHeight / 2));
+                    windowFitWidth = windowFitHeight = 0;
+                    if (source != nullptr) {
+                        windowFitWidth = sourceWidth;
+                        windowFitHeight = sourceHeight;
+                        double scale = std::min((double)outWidth / sourceWidth, (double)outHeight / sourceHeight);
+                        windowDstW = std::max(2, (int)(sourceWidth * scale + 0.5) & ~1);
+                        windowDstH = std::max(2, (int)(sourceHeight * scale + 0.5) & ~1);
+                        windowDstW = std::min(windowDstW, outWidth);
+                        windowDstH = std::min(windowDstH, outHeight);
+                        int dstX = ((outWidth - windowDstW) / 2) & ~1;
+                        int dstY = ((outHeight - windowDstH) / 2) & ~1;
+                        windowDstData[0] = encodingFrame->data[0] + (size_t)dstY * encodingFrame->linesize[0] + dstX;
+                        windowDstData[1] = encodingFrame->data[1] + (size_t)(dstY / 2) * encodingFrame->linesize[1] + dstX / 2;
+                        windowDstData[2] = encodingFrame->data[2] + (size_t)(dstY / 2) * encodingFrame->linesize[2] + dstX / 2;
+                    }
+                }
+                if (source != nullptr) {
+                    swsCtx = sws_getCachedContext(swsCtx, sourceWidth, sourceHeight, AV_PIX_FMT_BGRA,
+                        windowDstW, windowDstH, videoCodecCtx->pix_fmt,
+                        profile.swsFlags, nullptr, nullptr, nullptr);
+                    const uint8_t* srcData[] = { source, nullptr, nullptr, nullptr };
+                    int srcLinesize[] = { sourceBytesPerRow, 0, 0, 0 };
+                    sws_scale(swsCtx, srcData, srcLinesize, 0, sourceHeight, windowDstData, encodingFrame->linesize);
+                }
+
+                bigtime_t currentPresentationTime = system_time() - recordingStartTime;
+                encodingFrame->pts = currentPresentationTime;
+
+                std::lock_guard<std::mutex> lock(g_muxMutex);
+                if (SendVideoFrame(videoCodecCtx, encodingFrame) == 0) {
+                    frameWritten = true; // --logfps: see its own declaration above the loop
+                    while (avcodec_receive_packet(videoCodecCtx, pkt) == 0) {
+                        av_packet_rescale_ts(pkt, videoCodecCtx->time_base, videoStream->time_base);
+                        pkt->stream_index = videoStream->index;
+                        av_interleaved_write_frame(fmtCtx, pkt);
+                        av_packet_unref(pkt);
+                    }
+                }
+            } else if (g_experimentalScreenCapture || g_hybridCapture) {
                 std::vector<TrackedWindowRect> currentWindows;
                 EnumerateVisibleWindows(&currentWindows);
 
@@ -5748,6 +5956,7 @@ int main(int argc, char* argv[]) {
     bool logFps = false;
     StreamSettings streamSettings; // --stream <url> and --stream-* : see hrecord_stream.h
     int profileIndex = 1; // default: medium
+    int32 captureWindowToken = -1; // --window
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "stop") == 0) {
@@ -5825,6 +6034,8 @@ int main(int argc, char* argv[]) {
                 std::cout << "--source-gain takes <n>=<dB>, for example 2=-6" << std::endl;
                 return 0;
             }
+        } else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
+            captureWindowToken = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--low") == 0) {
             profileIndex = 0;
         } else if (strcmp(argv[i], "--medium") == 0) {
@@ -5839,7 +6050,7 @@ int main(int argc, char* argv[]) {
                 "[--list-audio-inputs] [--logfps] [--meter] [--no-limiter] [--ceiling <dB>] "
                 "[--mix-gain <dB>] [--source-gain <n>=<dB>] [--meter-ms <n>] [--control] "
                 "[--standby] [--stream <rtmp[s]://... | rtsp://...> | --stream-env] [--stream-bitrate <kbps>] [--stream-audio-bitrate <kbps>] "
-                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--detect-realtime] [--detect-stream] [--stop-reapers]" << std::endl;
+                "[--stream-preset <x264 preset>] [--stream-keyint <seconds>] [--window <app_server window token>] [--detect-realtime] [--detect-stream] [--stop-reapers]" << std::endl;
             std::cout << "  --stop-reapers  ends the small \"hrecord --reap\" helpers that stay after streaming an app's audio\n"
                 "                  (each waits for that app to quit, then removes its leftover Mixer entry)." << std::endl;
             return 0;
@@ -6176,6 +6387,8 @@ int main(int argc, char* argv[]) {
     setup.logFps = logFps;
     setup.wantStream = g_wantStream;
     setup.stream = streamSettings;
+    setup.windowToken = captureWindowToken;
+    g_pendingWindowToken = captureWindowToken;
     g_baseSetup = setup;
 
     int result = (g_standby && allAudio) ? RunStandby() : RunRecording(setup);

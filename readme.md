@@ -16,7 +16,7 @@ make release
 ## Usage
 
 ```
-hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] [--list-audio-inputs] [--logfps]
+hrecord [start|stop] [--low|--medium|--high] [--audioonly] [--allaudio] [--realtime] [--experimental-screen-capture] [--screen-capture-rcserver-method] [--hybrid-capture] [--tiled-capture] [--direct-tiled-capture] [--direct-raw-capture] [--raw-capture] [--list-audio-inputs] [--logfps] [--window <token>]
 ```
 
 - `hrecord` / `hrecord start` — records the screen (MJPEG in a `.mkv`
@@ -158,28 +158,73 @@ mixer window, a click on **Stream live** without the add-on opens the download p
 ## hRecord Mixer (window)
 
 `make gui` builds `hrecord_mixer`, a window that runs `hrecord --allaudio` as its engine
-(keep the two programs in the same folder). Press Record and every tapped source gets a
-strip with a level meter, a volume fader, left/right balance, mute and solo; the master
-section has a mix fader, before/after limiter meters, the limiter's on/off, ceiling and
-release, and a gain-reduction bar. A right-click on a fader or balance slider resets it.
+(keep the two programs in the same folder). It is laid out like OBS Studio. With **Advanced Options** ticked it has two
+pages, **Mixer** and **Nodes**.
+
+The **Mixer** page has a preview of what will be recorded and three docks under it:
+
+- **Sources**: what the video shows. **Entire desktop**, **Sound only (no screen)**, or one of the open windows.
+- **Audio Mixer**: every program that plays gets a strip with a level meter, a volume fader, left/right balance,
+  mute and solo; the master section has a mix fader, a level meter (after the limiter), the limiter's on/off, ceiling and
+  release, and a gain-reduction bar. A right-click on a fader or balance slider resets it.
+- **Controls**: Start/Stop Recording, Stream live and its settings, the screen quality, and boxes for the preview, the
+  log and the advanced options.
+
+### The master equalizer
+
+The **EQ** button in the master section opens a 15-band equalizer for the whole mix, with the bands (50 Hz to 20 kHz, one
+octave wide, -15 to +15 dB) and the presets (Flat, Rock, Jazz, Bass Boost) of the one in hTV. It sits ahead of the limiter,
+so it is in what you hear, in the recording and in the stream. The button is blue while the equalizer is on. On the control
+channel: `eq <0|1>` and `eqband <n> <dB>` (n from 1 to 15).
+
+### The tray icon
+
+The mixer and the hrecord it runs are background programs: neither the Deskbar nor a dock lists them. Minimizing the window
+hides it, as **Hide** does. (An hrecord started from a Terminal is not listed either: Ctrl+C or `hrecord stop` ends it.)
+
+While the mixer runs it has an icon in the Deskbar's tray, with a red dot on it while it records. A click on it opens a
+menu: **Record**, **Stop**, **Show**, **Hide** and **Quit**. A hidden mixer goes on working (and recording); **Show**, or
+starting the mixer again, brings its window back. Closing the window quits the mixer, as before. The icon is the program
+`hrecord_tray`, which has to be beside `hrecord_mixer` (the package puts it in `add-ons/hrecord`).
+
+### Recording one window
+
+On a composited desktop whose app_server can hand out a window's pixels (a RenkuOS change that is not part of every
+build), the whole window is recorded, also while other windows cover it. Everywhere else the part of the screen the window
+covers is recorded, with whatever is on top of it. The video has the size the window had when the recording began; a window
+that is resized is fitted into it. While the window is minimized or on another workspace the last picture stays, and once it
+is closed the video is black. The mouse pointer and the window's menus and pop-ups are not in the picture when it comes from
+the compositor. On the command line: `--window <app_server window token>`; on the control channel: `capwindow <token>`
+(-1: the whole desktop) before `record`.
+
+### The preview
+
+The preview can be switched off (**Show preview**) to save processor time. Where there is no composited desktop it is read
+from the screen about once a second, and rests while a recording runs.
+
 The window shows whether real-time audio is set on the sound driver (`hrecord --detect-realtime`);
 the box can be changed only for a driver hrecord has no profile for.
 
 The window starts `hrecord --allaudio --standby --control`: the sources are connected as soon as
-it opens (before Record) and put back when it closes. Its **Nodes** tab shows the audio nodes and
+it opens (before Record) and put back when it closes. Its **Nodes** page shows the audio nodes and
 their connections: select a box to disconnect or reconnect it, take a program off the mix, or send
-it into the mix as Stereo, Left or Right (hardware inputs have L and R boxes). Ticking **Share this
-input with programs** makes hrecord the system's audio input (the input hub), so several programs
-(for example Guitarix and rakarrack) can use one line-in, each getting Stereo, Left or Right.
+it into the mix as Stereo, Left or Right (hardware inputs have L and R boxes).
 
-Ticking **Offer the mix to programs that record** (under Limiter, in the master section) adds a
-second node, **hrecord Mix**, that hands out what is heard: the mix of everything that plays, with the
-effects of a program such as rakarrack in it. A program that records can take it as an input of its own
-(Wine 11.20-69 and later list it in Windows programs such as Ardour as "What you hear (hrecord mix)").
-A program that records the mix does not get what it plays itself (Ardour recording a second track
-does not record the first one again), unless you untick **Leave out the recording program's own
-sound**; what you hear is not changed. On the control channel: `mixhub 1` (and `mixhub 0`), and
-`mixhubself 1` to let the recording program hear its own sound in the mix (`mixhubself 0` leaves it out, the default).
+### Sharing with other programs (on by default)
+
+Three things are on, and their boxes (and the Nodes page) are shown only while **Advanced Options** is ticked (unticking it
+turns them on again):
+
+- **Share this input with programs** (Nodes page): hrecord is the system's audio input (the input hub), so several programs
+  (for example Guitarix and rakarrack) can use one line-in, each getting Stereo, Left or Right.
+- **Offer the mix to programs that record** (master section): a second node, **hrecord Mix**, hands out what is heard: the mix
+  of everything that plays, with the effects of a program such as rakarrack in it. A program that records can take it as an
+  input of its own (Wine 11.20-69 and later list it in Windows programs such as Ardour as "What you hear (hrecord mix)").
+- **Leave out the recording program's own sound**: a program that records the mix does not get what it plays itself (Ardour
+  recording a second track does not record the first one again); what you hear is not changed.
+
+On the control channel: `hub 1` (and `hub 0`), `mixhub 1` (and `mixhub 0`), and `mixhubself 1` to let the recording program
+hear its own sound in the mix (`mixhubself 0` leaves it out, the default).
 
 ## Apps that were recorded no longer linger in Media preferences
 

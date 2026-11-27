@@ -10,7 +10,8 @@ resource app_version {
     long_info = "A mixer window for hrecord: levels, volume, balance, mute, solo and a limiter"
 };
 
-resource app_flags B_SINGLE_LAUNCH;
+// (a background program: neither the Deskbar nor a dock lists it; its icon in the tray stands for it)
+resource app_flags B_SINGLE_LAUNCH | B_BACKGROUND_APP;
 
 resource vector_icon {
 	$"6E636966070100000028010000005503262A340346C85A03F0CD3203E8403403"

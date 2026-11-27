@@ -11,7 +11,8 @@ resource app_version {
 };
 
 
-resource app_flags B_SINGLE_LAUNCH | B_ARGV_ONLY;
+// (a background program: neither the Deskbar nor a dock lists it; "hrecord stop" or Ctrl+C ends a recording)
+resource app_flags B_SINGLE_LAUNCH | B_ARGV_ONLY | B_BACKGROUND_APP;
 
 resource vector_icon {
 	$"6E6369660C0500040162020016033BA4183C4D91BF23523E7B044AED1246F2E8"
