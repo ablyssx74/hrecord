@@ -85,8 +85,10 @@ $(TRAY_TARGET): tray.cpp tray.h hrecord_mixer.rdef
 	mimeset -f $(TRAY_TARGET)
 
 # The mixer window: runs hrecord as its engine
-gui: tray hrecord_gui.cpp window_capture.h mixer_widgets.h preview.h tray.h eq.h hrecord_mixer.rdef VERSION
-	$(CXX) -std=c++17 -O2 -Wall -I./compat $(INCLUDES) hrecord_gui.cpp -o hrecord_mixer -lbe -lmedia -lroot -lnetwork
+gui: tray hrecord_gui.cpp window_capture.h mixer_widgets.h preview.h tray.h eq.h addon_window.h hrecord_mixer.rdef VERSION
+	$(CXX) -std=c++17 -O2 -Wall -DHRECORD_VERSION=\"v$(VERSION)\" -I./compat $(INCLUDES) \
+		-I/boot/system/develop/headers/private/shared hrecord_gui.cpp -o hrecord_mixer $(LIB_PATH) -lbe -lmedia -lroot -lnetwork \
+		-lcurl -lshared
 	sed -e 's/@V_MAJOR@/$(V_MAJOR)/' -e 's/@V_MINOR@/$(V_MINOR)/' -e 's/@V_MIDDLE@/$(V_MIDDLE)/' -e 's/@VERSION@/$(VERSION)/' hrecord_mixer.rdef > hrecord_mixer.version.rdef
 	rc -o hrecord_mixer.rsrc hrecord_mixer.version.rdef
 	xres -o hrecord_mixer hrecord_mixer.rsrc

@@ -153,7 +153,10 @@ small add-on, `stream/` (`make` there; needs the `x264_devel` package), that is 
 package, `hrecord_stream` (it is GPL, hrecord stays MIT), and that hrecord loads from
 `/boot/system/add-ons/hrecord/`, `~/config/non-packaged/add-ons/hrecord/` or
 `~/config/add-ons/hrecord/` when it is installed. `hrecord --detect-stream` tells whether it is. In the
-mixer window, a click on **Stream live** without the add-on opens the download page of the newest release.
+mixer window, a click on **Stream live** without the add-on asks whether to download it. The download window fetches the
+package for your system from hrecord's release on GitHub (the release of the same version, or the newest one), shows its
+progress, and compares the file's SHA-256 checksum with the one GitHub gives for it; a file that does not match is thrown
+away. **Install** then installs it with `pkgman` (which also fetches x264 if it is missing).
 
 ## hRecord Mixer (window)
 

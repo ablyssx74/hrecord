@@ -29,7 +29,6 @@
 #include <MediaNode.h>
 #include <MediaRoster.h>
 #include <Message.h>
-#include <Url.h>
 #include <MessageRunner.h>
 #include <Messenger.h>
 #include <Path.h>
@@ -66,6 +65,7 @@
 #include "preview.h"
 #include "tray.h"
 #include "eq.h"
+#include "addon_window.h"
 
 
 static const char* kAppSignature = HRECORD_MIXER_SIGNATURE;
@@ -106,7 +106,9 @@ enum {
 	kMsgEqChanged		= 'eqc!',		// the EQ window to the mixer: "on" (bool) and 15 "band" (float)
 	kMsgEqEnable		= 'eqe!',		// inside the EQ window
 	kMsgEqBand			= 'eqb!',
-	kMsgEqPreset		= 'eqp!'
+	kMsgEqPreset		= 'eqp!',
+	kMsgAddonAnswer		= 'ada!',		// the answer to "download the add-on?"
+	kMsgAddonDownload	= 'adl!'		// open the download window
 };
 
 static const float kFaderMin = -60.0f, kFaderMax = 12.0f;		// dB, on a fader
@@ -540,9 +542,6 @@ static const int kStreamServiceCount = sizeof(kStreamServices) / sizeof(kStreamS
 static_assert(sizeof(kStreamServices) / sizeof(kStreamServices[0]) == 6, "StreamConfig keeps 6 services");
 static const int kServiceCustomRtmp = 4;
 static const int kServiceRtsp = 5;
-
-// where the add-on is downloaded from (the hrecord_stream package, in the release list)
-static const char* kAddonDownloadUrl = "https://github.com/ablyssx74/hrecord/releases/latest";
 
 static const char* kStreamPresets[] = { "ultrafast", "superfast", "veryfast", "faster", "fast", "medium" };
 static const int kStreamPresetCount = sizeof(kStreamPresets) / sizeof(kStreamPresets[0]);
@@ -2472,18 +2471,48 @@ public:
 				if (!fStreamAddon)
 					RefreshStream();		// perhaps it was installed just now
 				if (!fStreamAddon) {
-					// streaming needs the H.264 add-on: take the user to where it is downloaded
+					// streaming needs the H.264 add-on: ask whether to fetch it
 					fStream->SetValue(B_CONTROL_OFF);
-					SetStatus("Streaming needs the H.264 add-on (the hrecord_stream package). Opening its download page...");
-					BString address(kAddonDownloadUrl);
-					BUrl url;
-					url.SetUrlString(address, true);
-					url.OpenWithPreferredApplication();
+					if (fAddonWindow.IsValid()) {
+						fAddonWindow.SendMessage(B_SILENT_RELAUNCH);
+						break;
+					}
+					BAlert* alert = new BAlert("addon", "Streaming needs the H.264 add-on (the hrecord_stream package), which is "
+						"not installed.\n\nDownload it from hrecord's releases on GitHub? Its checksum is checked, and it is installed "
+						"only when you say so.", "Cancel", "Download", NULL, B_WIDTH_AS_USUAL, B_INFO_ALERT);
+					alert->SetShortcut(0, B_ESCAPE);
+					alert->Go(new BInvoker(new BMessage(kMsgAddonAnswer), this));
 					break;
 				}
 				fStreamConfig.enabled = fStream->Value() == B_CONTROL_ON;
 				fStreamConfig.Save();
 				ApplyStreamState();
+				break;
+			case kMsgAddonAnswer:
+			{
+				int32 which = 0;
+				if (message->FindInt32("which", &which) != B_OK || which != 1)
+					break;
+			}
+			// fall through
+			case kMsgAddonDownload:
+				if (fAddonWindow.IsValid())
+					fAddonWindow.SendMessage(B_SILENT_RELAUNCH);
+				else {
+					AddonWindow* window = new AddonWindow(BMessenger(this), Frame());
+					fAddonWindow = BMessenger(window);
+					window->Show();
+				}
+				break;
+			case kMsgAddonInstalled:
+				RefreshStream();
+				if (fStreamAddon && !fRecording) {
+					// it was wanted for streaming
+					fStreamConfig.enabled = true;
+					fStreamConfig.Save();
+					ApplyStreamState();
+					SetStatus("The H.264 add-on is installed: Stream live is on. Set the server in Stream settings.");
+				}
 				break;
 			case kMsgStreamConfigure:
 				(new StreamSettingsWindow(BMessenger(this), fStreamConfig))->Show();
@@ -2609,7 +2638,7 @@ private:
 	void ApplyStreamState()
 	{
 		const bool idle = !fRecording;
-		fStream->SetEnabled(idle);		// without the add-on a click opens its download page
+		fStream->SetEnabled(idle);		// without the add-on a click offers to download it
 		fStreamSettings->SetEnabled(fStreamAddon && idle);
 		if (fStreamAddon) {
 			fStream->SetValue(fStreamConfig.enabled ? B_CONTROL_ON : B_CONTROL_OFF);
@@ -2617,7 +2646,7 @@ private:
 		} else {
 			fStream->SetValue(B_CONTROL_OFF);
 			fStream->SetToolTip("Streaming needs the H.264 add-on (the hrecord_stream package), which is not installed. "
-				"Click to open its download page.");
+				"Click to download it.");
 			fStreamSettings->SetToolTip("Available when the H.264 add-on (the hrecord_stream package) is installed.");
 		}
 		// streaming sends the screen, so the screen is always recorded with it
@@ -3183,6 +3212,7 @@ private:
 	FlatButton*			fNodesButton;
 	FlatButton*			fEqButton;
 	BMessenger			fEqWindow;
+	BMessenger			fAddonWindow;
 	int					fTrayTicks = 0;
 	BView*				fPageBar;
 	BListView*			fSources;
