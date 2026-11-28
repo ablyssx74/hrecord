@@ -1215,7 +1215,7 @@ static bool WindowLayoutChanged(const std::vector<TrackedWindowRect>& a,
 // bitmap's own origin or at the requested rectangle's absolute screen
 // position. With an exact-sized destination those two possibilities are
 // identical, so it doesn't matter which one is actually true.
-static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* screenBitmap,
+static void CopyScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* screenBitmap,
         int nativeWidth, int nativeHeight) {
     int srcX = (int)floor(srcRectNative.left);
     int srcY = (int)floor(srcRectNative.top);
@@ -1298,6 +1298,46 @@ static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* s
     }
 
     delete regionBitmap;
+}
+
+// --cursor, "cursor": the mouse pointer in the picture
+std::atomic<bool> g_showCursor(false);
+PointerEraser g_pointerEraser;
+
+// Every read of the screen into the captured picture goes through here. On some video drivers app_server draws the pointer
+// into the screen's own memory, so that every read has it: while it is not wanted it is taken out of what was read.
+template<typename Read>
+static void ReadScreenPart(BBitmap* screenBitmap, int nativeWidth, int nativeHeight, int left, int top, int right,
+        int bottom, const Read& read) {
+    if (g_showCursor.load(std::memory_order_relaxed)) {
+        g_pointerEraser.Forget();
+        read();
+        return;
+    }
+    g_pointerEraser.Around((uint8*)screenBitmap->Bits(), screenBitmap->BytesPerRow(), nativeWidth, nativeHeight, left,
+        top, right, bottom, read);
+}
+
+static void RefreshScreenRegion(BRect srcRectNative, BScreen& screen, BBitmap* screenBitmap,
+        int nativeWidth, int nativeHeight) {
+    const int left = std::max(0, (int)floor(srcRectNative.left));
+    const int top = std::max(0, (int)floor(srcRectNative.top));
+    const int right = std::min(nativeWidth, (int)ceil(srcRectNative.right) + 1);
+    const int bottom = std::min(nativeHeight, (int)ceil(srcRectNative.bottom) + 1);
+    if (right <= left || bottom <= top)
+        return;
+    ReadScreenPart(screenBitmap, nativeWidth, nativeHeight, left, top, right, bottom, [&]() {
+        CopyScreenRegion(srcRectNative, screen, screenBitmap, nativeWidth, nativeHeight);
+    });
+}
+
+static status_t ReadWholeScreen(BScreen& screen, BBitmap* screenBitmap, BRect* screenFrame, int nativeWidth,
+        int nativeHeight) {
+    status_t status = B_ERROR;
+    ReadScreenPart(screenBitmap, nativeWidth, nativeHeight, 0, 0, nativeWidth, nativeHeight, [&]() {
+        status = screen.ReadBitmap(screenBitmap, false, screenFrame);
+    });
+    return status;
 }
 
 // Remembers where the cursor was last frame, for RefreshCursorRegion below
@@ -1396,7 +1436,7 @@ static void RefreshScreenRegionTiled(BRect srcRectNative, BScreen& screen,
 // a memcmp, not zero. Returns true if the tile's pixels differed and
 // screenBitmap was updated, false if the tile was degenerate (fully
 // off-screen) or genuinely unchanged.
-static bool RefreshScreenTileIfChanged(BRect tileRectNative, BScreen& screen,
+static bool CopyScreenTileIfChanged(BRect tileRectNative, BScreen& screen,
         BBitmap* screenBitmap, int nativeWidth, int nativeHeight) {
     int srcX = (int)tileRectNative.left;
     int srcY = (int)tileRectNative.top;
@@ -1447,6 +1487,21 @@ static bool RefreshScreenTileIfChanged(BRect tileRectNative, BScreen& screen,
     }
 
     delete tileBitmap;
+    return changed;
+}
+
+static bool RefreshScreenTileIfChanged(BRect tileRectNative, BScreen& screen,
+        BBitmap* screenBitmap, int nativeWidth, int nativeHeight) {
+    const int left = std::max(0, (int)tileRectNative.left);
+    const int top = std::max(0, (int)tileRectNative.top);
+    const int right = std::min(nativeWidth, (int)tileRectNative.right + 1);
+    const int bottom = std::min(nativeHeight, (int)tileRectNative.bottom + 1);
+    if (right <= left || bottom <= top)
+        return false;
+    bool changed = false;
+    ReadScreenPart(screenBitmap, nativeWidth, nativeHeight, left, top, right, bottom, [&]() {
+        changed = CopyScreenTileIfChanged(tileRectNative, screen, screenBitmap, nativeWidth, nativeHeight);
+    });
     return changed;
 }
 
@@ -3237,7 +3292,6 @@ const int kMeterMaxSources = 32;
 bool g_meter = false;                           // --meter
 std::atomic<int> g_meterMs(1000);               // --meter-ms <n>: how often --meter reports
 bool g_control = false;                         // --control: commands are read from stdin
-std::atomic<bool> g_showCursor(false);        // --cursor, "cursor": the mouse pointer in the picture
 std::atomic<bool> g_limiterOn(true);            // --no-limiter turns it off
 std::atomic<float> g_ceilingDb(-1.0f);          // --ceiling <dB>
 std::atomic<float> g_releaseMs(80.0f);          // the limiter's release
@@ -4865,14 +4919,13 @@ static void ScaleCapture(SwsContext* context, const uint8* bits, int bytesPerRow
         float originY, float scale, uint8_t* const* dstData, const int* dstLinesize) {
     static CursorOverlay cursor; // (only the capture loop comes here)
     static bool told = false;
-    const bool show = g_showCursor.load(std::memory_order_relaxed);
-    // (also while it is not wanted, until it is known whether this screen's picture has it anyway)
-    if (show || !cursor.ScreenHasPointer())
-        cursor.Draw(const_cast<uint8*>(bits), bytesPerRow, width, height, originX, originY, scale, show);
-    if (!told && cursor.ScreenHasPointer()) {
+    // (a screen that has the pointer in its picture, as reading it without the pointer found, gets none drawn on it)
+    if (g_showCursor.load(std::memory_order_relaxed) && !g_pointerEraser.Found())
+        cursor.Draw(const_cast<uint8*>(bits), bytesPerRow, width, height, originX, originY, scale);
+    if (!told && g_pointerEraser.Found()) {
         told = true;
-        std::cout << "[i] On this video driver the mouse pointer is part of the screen's picture: it is recorded whether "
-            "it is asked for or not." << std::endl;
+        std::cout << "[i] On this video driver the mouse pointer is part of the screen's picture: while it is not wanted "
+            "it is taken out, and what lies under it is filled in." << std::endl;
     }
     const uint8_t* srcData[] = { bits, nullptr, nullptr, nullptr };
     int srcLinesize[] = { bytesPerRow, 0, 0, 0 };
@@ -4881,6 +4934,8 @@ static void ScaleCapture(SwsContext* context, const uint8* bits, int bytesPerRow
 }
 
 static int RunRecording(const RecordingSetup& setup) {
+    // (its thread ends with the recording, while the application is still there)
+    struct EraserEnds { ~EraserEnds() { g_pointerEraser.Stop(); } } eraserEnds;
     bool audioOnly = setup.audioOnly;
     bool allAudio = setup.allAudio;
     const VideoProfile& profile = *setup.profile;
@@ -5417,7 +5472,7 @@ static int RunRecording(const RecordingSetup& setup) {
                     // paid here when the window layout actually changes,
                     // not every single frame. No conversion yet; that
                     // happens once below, after the per-region refreshes.
-                    screen.ReadBitmap(screenBitmap, false, &screenFrame);
+                    ReadWholeScreen(screen, screenBitmap, &screenFrame, width, height);
                     lastTrackedWindows = currentWindows;
                     backgroundNeedsRebuild = false;
                 }
@@ -5483,14 +5538,14 @@ static int RunRecording(const RecordingSetup& setup) {
                     // cost the other two paths also pay on their own first
                     // frame (--experimental-screen-capture's own first
                     // background build; the default path's every frame).
-                    screen.ReadBitmap(screenBitmap, false, &screenFrame);
+                    ReadWholeScreen(screen, screenBitmap, &screenFrame, width, height);
                     rcserverNeedsSeed = false;
                 } else if (rcserverFallbackFramesRemaining > 0) {
                     // See rcserverFallbackFramesRemaining's own comment:
                     // near-everything is changing right now, so one big
                     // read costs less overall than the many small reads
                     // tiling would need to cover the same ground.
-                    screen.ReadBitmap(screenBitmap, false, &screenFrame);
+                    ReadWholeScreen(screen, screenBitmap, &screenFrame, width, height);
                     rcserverFallbackFramesRemaining--;
                 } else {
                     int tilesX = (width + kRcserverTileSize - 1) / kRcserverTileSize;
@@ -5639,7 +5694,7 @@ static int RunRecording(const RecordingSetup& setup) {
                         screenBitmap, width, height);
                     captured = true;
                 } else {
-                    captured = screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK;
+                    captured = ReadWholeScreen(screen, screenBitmap, &screenFrame, width, height) == B_OK;
                 }
 
                 // A failed capture just skips encoding for this iteration --
@@ -5669,7 +5724,7 @@ static int RunRecording(const RecordingSetup& setup) {
                         }
                     }
                 }
-            } else if (g_rawCapture && screen.ReadBitmap(screenBitmap, false, &screenFrame) == B_OK) {
+            } else if (g_rawCapture && ReadWholeScreen(screen, screenBitmap, &screenFrame, width, height) == B_OK) {
                 // The original default: one plain full-screen read, every
                 // frame, no tiling -- see g_rawCapture's own comment for
                 // why this is still here as an explicit opt-in.

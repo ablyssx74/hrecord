@@ -209,8 +209,9 @@ the compositor. On the command line: `--window <app_server window token>`; on th
 while a recording runs. In a recording of one window the pointer is there while it is over the window's area. On the command
 line the pointer is left out unless `--cursor` is given; on the control channel: `cursor <0|1>`.
 
-Without a compositor, some video drivers (for example Intel graphics on Haiku) have the pointer in every reading of the
-screen. There it is recorded whether **Show cursor** is on or not, and the log says so.
+Without a compositor, some video drivers on Haiku have the pointer in every reading of the screen. There, with **Show
+cursor** off, hrecord takes it out of the picture itself: what lies under the pointer is filled in from what was there before
+or from around it, so small details right under a moving or resting pointer can look smeared. The log says when this is so.
 
 ### The preview
 

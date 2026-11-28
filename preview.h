@@ -199,6 +199,7 @@ private:
 		WindowPicture window;
 		ScreenFollower follower;
 		PictureOrigin origin;
+		PointerEraser eraser;
 		while (!fQuit) {
 			const int32 shown = source.load();
 			if (!enabled || !visible || shown == kSourceAudioOnly || pending) {
@@ -279,6 +280,11 @@ private:
 				&& (whole->ColorSpace() == B_RGB32 || whole->ColorSpace() == B_RGBA32)) {
 				const int32 w = std::min(whole->Bounds().IntegerWidth() + 1, part.IntegerWidth() + 1);
 				const int32 h = std::min(whole->Bounds().IntegerHeight() + 1, part.IntegerHeight() + 1);
+				// (on some video drivers the screen's picture has the pointer in it)
+				if (cursor)
+					eraser.Stop();
+				else
+					eraser.Erase((uint8*)whole->Bits(), whole->BytesPerRow(), w, h, part.LeftTop());
 				_Send(_AddCursor(_Shrink((const uint8*)whole->Bits(), whole->BytesPerRow(), w, h),
 						BRect(part.left, part.top, part.left + w - 1, part.top + h - 1)),
 					shown >= 0 ? "Seen from the screen: what covers the window is recorded too." : "");
